@@ -2189,7 +2189,13 @@ with tab_fit:
 with tab6:
     st.markdown("Compare jusqu'à 6 pilotes en visu radar. Idéal pour repérer des archétypes opposés.")
 
-    default_radar = [d for d in [d1, d2, "NOR", "HAM", "ALO"] if d in drivers_in_session][:5]
+    # FIX : si d1/d2 est NOR, HAM ou ALO, la liste par défaut contenait un doublon
+    # → index dupliqué après set_index("Pilote") → df_n.loc[drv] renvoyait un
+    # DataFrame (pas de .tolist()) → AttributeError. dict.fromkeys déduplique
+    # en préservant l'ordre.
+    default_radar = list(dict.fromkeys(
+        d for d in [d1, d2, "NOR", "HAM", "ALO"] if d in drivers_in_session
+    ))[:5]
     drivers_radar = st.multiselect(
         "Pilotes",
         options=drivers_in_session,
@@ -2197,6 +2203,7 @@ with tab6:
         max_selections=6,
         format_func=lambda x: driver_full.get(x, x),
     )
+    drivers_radar = list(dict.fromkeys(drivers_radar))  # ceinture + bretelles
 
     if len(drivers_radar) < 2:
         st.warning("Sélectionne au moins 2 pilotes.")
