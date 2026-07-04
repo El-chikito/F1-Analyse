@@ -14,6 +14,11 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- NOUVEAU mode 📱 Affichage compact : auto-détecté via user-agent (forçable
+  dans la sidebar). Libère le scroll tactile sur les graphiques (dragmode
+  désactivé — sinon Plotly capture le geste et bloque le défilement de la
+  page), masque la modebar, empile la vue circuit et le recap tour par tour,
+  et allège la feuille des temps (codes pilotes, colonnes essentielles).
 - NOUVEAU onglet 📋 Feuille des temps (façon écran de timing) : meilleurs
   tours + meilleurs secteurs individuels (violet = record session, vert =
   record perso), tour théorique et Δ vs réel, vitesses de pointe, et recap
@@ -338,6 +343,29 @@ CIRCUITS_INFO = {
 }
 
 # ============== HELPERS GÉNÉRIQUES ==============
+def _detect_mobile():
+    """Détection mobile via le user-agent (st.context, Streamlit >= 1.37).
+    'Mobi' couvre iPhone/Android ; iPad se présente comme desktop → traité
+    comme grand écran, ce qui est le bon choix."""
+    try:
+        ua = st.context.headers.get("User-Agent") or st.context.headers.get("user-agent") or ""
+    except Exception:
+        ua = ""
+    return ("Mobi" in ua) or ("Android" in ua)
+
+
+def plot(fig):
+    """Affichage Plotly adapté au mode compact. Sur mobile, un graphique Plotly
+    interactif capture le geste tactile (pan/zoom) et empêche de faire défiler
+    la page → dragmode=False rend le scroll à la page tout en gardant le hover
+    au tap. La modebar est masquée (elle mange de la place pour rien au doigt)."""
+    if MOBILE:
+        fig.update_layout(dragmode=False)
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    else:
+        st.plotly_chart(fig, width="stretch")  # noqa: appel direct voulu (helper)
+
+
 def hex_to_rgb_str(h):
     h = h.lstrip("#")
     return f"rgb({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)})"
@@ -642,6 +670,13 @@ st.markdown("""
 
 # ============== SIDEBAR — CONTRÔLES ==============
 st.sidebar.markdown("## 🎛️ Paramètres")
+
+MOBILE = st.sidebar.toggle(
+    "📱 Affichage compact",
+    value=_detect_mobile(),
+    help="Activé automatiquement sur mobile. Empile les vues côte à côte, "
+         "allège la feuille des temps et rend le scroll tactile aux graphiques.",
+)
 
 year = st.sidebar.selectbox(
     "Saison",
@@ -1050,7 +1085,7 @@ with tab_sheet:
 
         disp = pd.DataFrame({
             "Pos": dft.index + 1,
-            "Pilote": dft["Pilote"],
+            "Pilote": dft["Code"] if MOBILE else dft["Pilote"],
             "Équipe": dft["Équipe"],
             "Meilleur tour": dft["best_td"].apply(_fmt_lap),
             "Écart": ["—"] + [f"+{t - leader:.3f}" for t in dft["_best"].iloc[1:]],
@@ -1086,6 +1121,12 @@ with tab_sheet:
                 for c in disp.columns:
                     cur = styles.loc[mask, c].iloc[0]
                     styles.loc[mask, c] = (cur + "; " if cur else "") + f"background-color: {colr}30"
+
+        # Mode compact : colonnes essentielles seulement (le tableau complet
+        # reste à un toggle de distance dans la sidebar)
+        if MOBILE:
+            keep = ["Pos", "Pilote", "Meilleur tour", "Écart", "S1", "S2", "S3", "Δ théo", "Pneu"]
+            disp, styles = disp[keep], styles[keep]
 
         st.dataframe(
             disp.style.apply(lambda _: styles, axis=None),
@@ -1167,13 +1208,19 @@ with tab_sheet:
                 height=min(38 * (len(rec) + 1) + 3, 560),
             )
 
-        col_l, col_r = st.columns(2)
-        with col_l:
+        if MOBILE:
             st.markdown(f"##### {d1}")
             _render_laps_recap(d1)
-        with col_r:
             st.markdown(f"##### {d2}")
             _render_laps_recap(d2)
+        else:
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown(f"##### {d1}")
+                _render_laps_recap(d1)
+            with col_r:
+                st.markdown(f"##### {d2}")
+                _render_laps_recap(d2)
 
 # --- TAB 1 : OVERLAY ---
 with tab1:
@@ -1216,7 +1263,7 @@ with tab1:
         margin=dict(t=40, b=20, l=20, r=20),
     )
     fig.update_xaxes(title_text="Virage" if corners_df is not None else "Distance (m)", row=4, col=1)
-    st.plotly_chart(fig, width="stretch")
+    plot(fig)
 
 # --- TAB MAP : VUE CIRCUIT ---
 with tab_map:
@@ -1241,12 +1288,22 @@ with tab_map:
     vmax = float(max(vals1.max(), vals2.max()))
     colorscale = "Plasma" if color_by == "Speed" else "Viridis"
 
-    fig_map = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
-        horizontal_spacing=0.04,
-    )
+    # Côte à côte sur desktop, empilés en mode compact (sinon chaque tracé
+    # devient un timbre-poste sur un écran de téléphone)
+    if MOBILE:
+        fig_map = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
+            vertical_spacing=0.06,
+        )
+    else:
+        fig_map = make_subplots(
+            rows=1, cols=2,
+            subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
+            horizontal_spacing=0.04,
+        )
     for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
+        r, c = (i, 1) if MOBILE else (1, i)
         fig_map.add_trace(go.Scatter(
             x=tel["X"], y=tel["Y"],
             mode="markers",
@@ -1263,17 +1320,19 @@ with tab_map:
             ),
             showlegend=False,
             hovertemplate=f"{color_by}: %{{marker.color:.0f}}<extra></extra>",
-        ), row=1, col=i)
+        ), row=r, col=c)
     # Aspect ratio égal pour ne pas déformer le tracé
-    for col in (1, 2):
-        fig_map.update_xaxes(scaleanchor=f"y{col if col > 1 else ''}", scaleratio=1,
+    # (le subplot i utilise les axes x{i}/y{i} quelle que soit l'orientation)
+    for i in (1, 2):
+        r, c = (i, 1) if MOBILE else (1, i)
+        fig_map.update_xaxes(scaleanchor=f"y{i if i > 1 else ''}", scaleratio=1,
                              showticklabels=False, showgrid=False, zeroline=False,
-                             row=1, col=col)
+                             row=r, col=c)
         fig_map.update_yaxes(showticklabels=False, showgrid=False, zeroline=False,
-                             row=1, col=col)
-    fig_map.update_layout(height=550, template="plotly_dark",
+                             row=r, col=c)
+    fig_map.update_layout(height=850 if MOBILE else 550, template="plotly_dark",
                           margin=dict(t=50, b=20, l=20, r=80))
-    st.plotly_chart(fig_map, width="stretch")
+    plot(fig_map)
 
     # --- Battle map : qui est plus rapide à chaque endroit du tracé ---
     st.markdown("---")
@@ -1320,7 +1379,7 @@ with tab_map:
     fig_battle.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
     fig_battle.update_layout(height=600, template="plotly_dark",
                              margin=dict(t=20, b=20, l=20, r=80))
-    st.plotly_chart(fig_battle, width="stretch")
+    plot(fig_battle)
 
     with st.expander("💡 Comment lire la battle map vitesse"):
         st.markdown(f"""
@@ -1389,7 +1448,7 @@ with tab_map:
         fig_heat.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
         fig_heat.update_layout(height=600, template="plotly_dark",
                                margin=dict(t=20, b=20, l=20, r=80))
-        st.plotly_chart(fig_heat, width="stretch")
+        plot(fig_heat)
 
         # Top zones de gain — dédupliquées (>=150 m entre deux zones), avec le
         # virage le plus proche pour se repérer
@@ -1470,7 +1529,7 @@ with tab2:
             hovermode="x unified",
             legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
         )
-        st.plotly_chart(fig, width="stretch")
+        plot(fig)
     except Exception as e:
         st.warning(f"Impossible de calculer le delta time : {e}")
 
@@ -1580,7 +1639,7 @@ with tab_corners:
             fig_c.add_hline(y=0, line=dict(color="white", width=0.8), row=2, col=1)
             fig_c.update_layout(height=550, template="plotly_dark", showlegend=False,
                                 margin=dict(t=60, b=20, l=20, r=20))
-            st.plotly_chart(fig_c, width="stretch")
+            plot(fig_c)
 
             # --- Tableau détaillé ---
             disp = pd.DataFrame({
@@ -1684,7 +1743,7 @@ with tab_gg:
         fig_gg.update_layout(height=700, template="plotly_dark",
                              legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center"),
                              margin=dict(t=30, b=20, l=20, r=20))
-        st.plotly_chart(fig_gg, width="stretch")
+        plot(fig_gg)
 
         # --- Métriques dérivées ---
         def gg_metrics(gg):
@@ -1811,7 +1870,7 @@ with tab4:
     fig.update_layout(height=600, template="plotly_dark", hovermode="x unified",
                       title=f"{z_label} ({z_start}-{z_end} m)")
     fig.update_xaxes(title_text="Distance (m)", row=3, col=1)
-    st.plotly_chart(fig, width="stretch")
+    plot(fig)
 
 # --- TAB 5 : SECTEURS ---
 with tab5:
@@ -1851,7 +1910,7 @@ with tab5:
             yaxis_title=f"Δ {d1} − {d2} (s)",
             title=f"Écart par secteur ({d2 if df_sec['Δ'].sum() > 0 else d1} plus rapide au total)",
         )
-        st.plotly_chart(fig, width="stretch")
+        plot(fig)
 
 # --- TAB STINT : ÉVOLUTION COURSE ---
 with tab_stint:
@@ -1930,7 +1989,7 @@ with tab_stint:
             hovermode="closest",
             legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
         )
-        st.plotly_chart(fig_stint, width="stretch")
+        plot(fig_stint)
 
         # Légende des compounds visible
         with st.expander("🛞 Légende des compounds", expanded=False):
@@ -2024,7 +2083,7 @@ with tab_stint:
                     yaxis_title=f"Δ {d1} − {d2} (s)",
                     title=f"Barres positives = {d2} plus rapide · Barres négatives = {d1} plus rapide",
                 )
-                st.plotly_chart(fig_delta_stint, width="stretch")
+                plot(fig_delta_stint)
 
 # --- TAB CRAFT : ATTAQUE / DÉFENSE ---
 with tab_craft:
@@ -2081,7 +2140,7 @@ with tab_craft:
                     yaxis=dict(autorange="reversed", dtick=1),
                     legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
                 )
-                st.plotly_chart(fig_p, width="stretch")
+                plot(fig_p)
 
                 # Métriques attaque / défense
                 def pct(a, b):
@@ -2168,7 +2227,7 @@ with tab_fit:
             xaxis_title="Type de virage",
             legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
         )
-        st.plotly_chart(fig_f, width="stretch")
+        plot(fig_f)
         for v in verdicts:
             st.markdown(v)
 
@@ -2251,7 +2310,7 @@ with tab6:
                 polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False)),
                 title="Signatures de style — comparaison normalisée",
             )
-            st.plotly_chart(fig, width="stretch")
+            plot(fig)
 
             with st.expander("Valeurs brutes"):
                 st.dataframe(df_m.round(2), width="stretch")
