@@ -644,6 +644,49 @@ def load_session(year, gp, session_type):
     return s
 
 
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def season_points_before(year, round_number, session_type):
+    """Points cumulés par pilote AVANT la session courante (courses + sprints
+    des manches précédentes, plus le sprint du même week-end si la session
+    analysée est la course), et countback réglementaire : décompte des
+    positions d'arrivée en course [nb de P1, nb de P2, ...] pour départager
+    les égalités de points comme la F1. Ne charge que les feuilles de
+    résultats (laps/télémétrie exclus) → rapide, puis caches disque + app."""
+    sched = fastf1.get_event_schedule(year, include_testing=False)
+    pts, cb = {}, {}
+    for _, ev_row in sched.iterrows():
+        rnd = int(ev_row["RoundNumber"])
+        if rnd > round_number:
+            continue
+        is_sprint_we = "sprint" in str(ev_row.get("EventFormat", "")).lower()
+        ses_list = []
+        if rnd < round_number:
+            if is_sprint_we:
+                ses_list.append("S")
+            ses_list.append("R")
+        elif session_type == "R" and is_sprint_we:
+            ses_list.append("S")
+        for ses in ses_list:
+            try:
+                s = fastf1.get_session(year, rnd, ses)
+                s.load(laps=False, telemetry=False, weather=False, messages=False)
+                res = s.results
+                if res is None:
+                    continue
+                for _, r in res.iterrows():
+                    code = str(r["Abbreviation"])
+                    p = r.get("Points")
+                    if pd.notna(p):
+                        pts[code] = pts.get(code, 0.0) + float(p)
+                    if ses == "R":
+                        pos = r.get("Position")
+                        if pd.notna(pos) and 1 <= int(pos) <= 22:
+                            cb.setdefault(code, [0] * 22)[int(pos) - 1] += 1
+            except Exception:
+                continue  # manche pas encore courue / résultats absents
+    return pts, cb
+
+
 def safe_circuit_info(sess):
     """get_circuit_info() peut lever KeyError si le pilote du tour de référence n'a pas
     son flux position complet. On dégrade proprement vers None au lieu de faire planter l'app."""
@@ -2462,8 +2505,8 @@ def page_timing():
         dfr = dfr.sort_values("best_s")
     dfr = dfr.reset_index(drop=True)
 
-    # Écarts au leader et intervalles
-    gaps, intervals = [], []
+    # Écarts au leader et intervalles (+ version numérique pour le schéma)
+    gaps, intervals, gap_num = [], [], []
     if is_race and dfr["res_pos"].notna().any():
         # Time FastF1 : durée totale pour le vainqueur, écart pour les autres.
         # NaT (tours de retard, abandon) → on affiche le statut officiel.
@@ -2487,14 +2530,21 @@ def page_timing():
                 intervals.append(f"+{gap_s[i] - gap_s[i - 1]:.3f}")
             else:
                 intervals.append(gaps[i])
+        gap_num = gap_s
     else:
         leader_best = dfr["best_s"].iloc[0]
         for i, r in dfr.iterrows():
             if i == 0:
                 gaps.append("Leader")
                 intervals.append("Interval")
+                gap_num.append(0.0)
             else:
-                gaps.append(f"+{r['best_s'] - leader_best:.3f}" if np.isfinite(r["best_s"]) else "—")
+                if np.isfinite(r["best_s"]):
+                    gaps.append(f"+{r['best_s'] - leader_best:.3f}")
+                    gap_num.append(r["best_s"] - leader_best)
+                else:
+                    gaps.append("—")
+                    gap_num.append(np.nan)
                 prev = dfr["best_s"].iloc[i - 1]
                 intervals.append(f"+{r['best_s'] - prev:.3f}"
                                  if np.isfinite(r["best_s"]) and np.isfinite(prev) else "—")
@@ -2560,6 +2610,123 @@ def page_timing():
         "les tours supprimés (track limits) sont exclus des records. "
         + ("Écarts et statuts issus du classement officiel." if is_race
            else "Classement par meilleur tour.")
+    )
+
+    # --- Schéma des écarts au leader ---
+    st.markdown("---")
+    st.markdown("#### ⏱️ Écarts à l'arrivée" if is_race else "#### ⏱️ Écarts au meilleur tour")
+    plotted = [(dfr["drv"].iloc[i], gap_num[i]) for i in range(len(dfr))
+               if gap_num[i] is not None and np.isfinite(gap_num[i])]
+    if len(plotted) < 2:
+        st.info("Pas assez d'écarts chiffrés pour tracer le schéma.")
+    else:
+        codes = [c for c, _ in plotted]
+        xs = [g for _, g in plotted]
+        fig_gap = go.Figure()
+        fig_gap.add_trace(go.Scatter(  # ligne de fond
+            x=[min(xs), max(xs)], y=[0, 0], mode="lines",
+            line=dict(color="rgba(255,255,255,0.25)", width=3),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig_gap.add_trace(go.Scatter(
+            x=xs, y=[0] * len(xs), mode="markers+text",
+            marker=dict(size=36, color=[driver_color(c) for c in codes],
+                        line=dict(color="rgba(255,255,255,0.9)", width=1.5)),
+            text=codes, textposition="middle center",
+            textfont=dict(size=10, color="white"),
+            hovertemplate="%{text} : +%{x:.3f} s<extra></extra>",
+            cliponaxis=False, showlegend=False,
+        ))
+        pad = max((max(xs) - min(xs)) * 0.04, 0.5)
+        fig_gap.update_xaxes(title="Écart au leader (s)", showgrid=False, zeroline=False,
+                             range=[min(xs) - pad, max(xs) + pad])
+        fig_gap.update_yaxes(visible=False, range=[-1, 1], fixedrange=True)
+        fig_gap.update_layout(height=180, template="plotly_dark",
+                              margin=dict(t=10, b=40, l=20, r=20))
+        plot(fig_gap)
+        missing = [dfr["drv"].iloc[i] for i in range(len(dfr))
+                   if not (gap_num[i] is not None and np.isfinite(gap_num[i]))]
+        if missing:
+            st.caption("Non représentés (écart non chiffré — tour(s) de retard ou abandon) : "
+                       + ", ".join(missing))
+
+    # --- Championnat pilotes : impact de la session ---
+    if not is_race:
+        return
+    st.markdown("---")
+    st.markdown("#### 🏆 Championnat pilotes — impact de la session")
+    with st.spinner("Calcul des points de la saison (long au premier chargement, ensuite en cache)…"):
+        pts_before, cb_before = season_points_before(
+            st.session_state.year, int(ev["RoundNumber"]), st.session_state.session_type
+        )
+    pts_session = {}
+    if results is not None:
+        for _, r in results.iterrows():
+            p = r.get("Points")
+            pts_session[str(r["Abbreviation"])] = float(p) if pd.notna(p) else 0.0
+    all_drv = set(pts_before) | set(pts_session)
+    if not all_drv:
+        st.info("Points indisponibles pour cette session.")
+        return
+    after = {d: pts_before.get(d, 0.0) + pts_session.get(d, 0.0) for d in all_drv}
+
+    # Countback après : les positions de CETTE course s'ajoutent au décompte
+    # (les sprints ne comptent pas dans le départage réglementaire)
+    cb_after = {d: list(cb_before.get(d, [0] * 22)) for d in all_drv}
+    if st.session_state.session_type == "R" and results is not None:
+        for _, r in results.iterrows():
+            code = str(r["Abbreviation"])
+            pos = r.get("Position")
+            if code in cb_after and pd.notna(pos) and 1 <= int(pos) <= 22:
+                cb_after[code][int(pos) - 1] += 1
+
+    def _ranks(pts, cb):
+        def key(k):
+            return (-pts[k],) + tuple(-c for c in cb.get(k, [0] * 22)) + (k,)
+        return {k: i + 1 for i, k in enumerate(sorted(pts, key=key))}
+
+    rk_b = _ranks({d: pts_before.get(d, 0.0) for d in all_drv},
+                  {d: cb_before.get(d, [0] * 22) for d in all_drv})
+    rk_a = _ranks(after, cb_after)
+
+    def _full_name(drv):
+        try:
+            return session.get_driver(drv)["FullName"]
+        except Exception:
+            return drv
+
+    rows_c = []
+    for d in sorted(all_drv, key=lambda k: rk_a[k]):
+        delta = rk_b[d] - rk_a[d]
+        rows_c.append({
+            "Pos": rk_a[d],
+            "Pilote": _full_name(d),
+            "_code": d,
+            "Points": f"{after[d]:g}",
+            "+ Session": f"+{pts_session.get(d, 0):g}" if pts_session.get(d, 0) else "–",
+            "Δ Pos": (f"+{delta}" if delta > 0 else f"−{abs(delta)}") if delta else "–",
+            "_delta": delta,
+        })
+    dcp = pd.DataFrame(rows_c)
+    disp_c = dcp[["Pos", "Pilote", "Points", "+ Session", "Δ Pos"]]
+    styles_c = pd.DataFrame("", index=disp_c.index, columns=disp_c.columns)
+    for i in disp_c.index:
+        styles_c.loc[i, "Pilote"] = (f"background-color: {driver_color(dcp['_code'].iloc[i])}; "
+                                     f"color: #FFFFFF; font-weight: bold; border-radius: 6px")
+        dlt = dcp["_delta"].iloc[i]
+        if dlt > 0:
+            styles_c.loc[i, "Δ Pos"] = "color: #4ADE80; font-weight: bold"
+        elif dlt < 0:
+            styles_c.loc[i, "Δ Pos"] = "color: #F87171; font-weight: bold"
+    show_table(disp_c.style.apply(lambda _: styles_c, axis=None),
+               height=min(40 * (len(disp_c) + 1) + 3, 780),
+               force_html=True, mono=True)
+    st.caption(
+        "Points cumulés courses + sprints, recalculés depuis les feuilles de résultats "
+        "FastF1 · **+ Session** = points marqués dans cette session · **Δ Pos** = places "
+        "gagnées/perdues au général grâce à cette session. Les égalités de points sont "
+        "départagées comme au règlement : décompte des meilleures positions d'arrivée "
+        "en course (les sprints ne comptent pas dans le départage)."
     )
 
 
