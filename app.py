@@ -14,6 +14,10 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX  Tableaux flous sur mobile : st.dataframe dessine dans un canvas
+       (Glide Data Grid) → rendu baveux sur écrans Retina. En mode compact,
+       la feuille des temps et le recap tour par tour sont rendus en HTML
+       natif (texte net), avec en-têtes collants et conteneur scrollable.
 - NOUVEAU mode 📱 Affichage compact : auto-détecté via user-agent (forçable
   dans la sidebar). Libère le scroll tactile sur les graphiques (dragmode
   désactivé — sinon Plotly capture le geste et bloque le défilement de la
@@ -366,6 +370,25 @@ def plot(fig):
         st.plotly_chart(fig, width="stretch")  # noqa: appel direct voulu (helper)
 
 
+def show_table(styler, height=None):
+    """Affichage d'un tableau stylé, adapté au mode compact.
+
+    st.dataframe dessine les cellules dans un canvas (Glide Data Grid) →
+    texte flou sur les écrans Retina des téléphones, surtout après un zoom.
+    En mode compact, on rend le Styler en HTML natif (texte net) dans un
+    conteneur scrollable avec en-têtes collants. Sur desktop, on garde
+    st.dataframe (tri, redimensionnement des colonnes). Les styles inline du
+    Styler (violet/vert, surlignage, barré) sont préservés dans les deux cas."""
+    if not MOBILE:
+        st.dataframe(styler, width="stretch", hide_index=True, height=height)
+        return
+    html = styler.hide(axis="index").to_html()
+    st.markdown(
+        f'<div class="tbl-wrap" style="max-height:{int(height or 520)}px">{html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def hex_to_rgb_str(h):
     h = h.lstrip("#")
     return f"rgb({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)})"
@@ -677,6 +700,23 @@ MOBILE = st.sidebar.toggle(
     help="Activé automatiquement sur mobile. Empile les vues côte à côte, "
          "allège la feuille des temps et rend le scroll tactile aux graphiques.",
 )
+
+if MOBILE:
+    # CSS des tableaux HTML natifs (voir show_table) : thème sombre, chiffres
+    # tabulaires alignés, en-têtes collants au scroll
+    st.markdown("""
+    <style>
+    .tbl-wrap {overflow: auto; border: 1px solid rgba(255,255,255,.15);
+               border-radius: 8px; margin-bottom: 0.6rem;}
+    .tbl-wrap table {border-collapse: collapse; width: 100%;
+                     font-size: 0.85rem; font-variant-numeric: tabular-nums;}
+    .tbl-wrap th {position: sticky; top: 0; z-index: 1; background: #262730;
+                  color: #FAFAFA; text-align: left; padding: 6px 8px;
+                  font-weight: 600; white-space: nowrap;}
+    .tbl-wrap td {padding: 6px 8px; color: #FAFAFA; white-space: nowrap;
+                  border-top: 1px solid rgba(255,255,255,.08);}
+    </style>
+    """, unsafe_allow_html=True)
 
 year = st.sidebar.selectbox(
     "Saison",
@@ -1128,9 +1168,8 @@ with tab_sheet:
             keep = ["Pos", "Pilote", "Meilleur tour", "Écart", "S1", "S2", "S3", "Δ théo", "Pneu"]
             disp, styles = disp[keep], styles[keep]
 
-        st.dataframe(
+        show_table(
             disp.style.apply(lambda _: styles, axis=None),
-            width="stretch", hide_index=True,
             height=min(38 * (len(disp) + 1) + 3, 700),
         )
         st.caption(
@@ -1202,9 +1241,8 @@ with tab_sheet:
                 for c in rec.columns:
                     sty.loc[deleted, c] = sty.loc[deleted, c] + "; text-decoration: line-through; opacity: 0.45"
 
-            st.dataframe(
+            show_table(
                 rec.style.apply(lambda _: sty, axis=None),
-                width="stretch", hide_index=True,
                 height=min(38 * (len(rec) + 1) + 3, 560),
             )
 
