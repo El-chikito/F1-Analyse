@@ -2658,19 +2658,10 @@ def page_timing():
     else:
         codes = [c for c, _ in plotted]
         xs = [g for _, g in plotted]
-        # Anti-chevauchement : 3 rangées en quinconce. Chaque bulle prend la
-        # première rangée où elle ne recouvre pas la précédente ; à défaut,
-        # la rangée libérée depuis le plus longtemps.
         span = (max(xs) - min(xs)) or 1.0
-        min_sep = span * 0.06
-        levels = [0.0, 0.65, -0.65]
-        last_at = {lv: -1e12 for lv in levels}
-        ys = []
-        for x in xs:
-            free = [lv for lv in levels if x - last_at[lv] >= min_sep]
-            lv = free[0] if free else min(levels, key=lambda l: last_at[l])
-            ys.append(lv)
-            last_at[lv] = x
+        # Une seule ligne, façon livetiming : les bulles se chevauchent en
+        # escalier dans les grappes serrées, le tap/hover donne le détail.
+        b_size, f_size = (18, 7) if MOBILE else (22, 8)
         fig_gap = go.Figure()
         fig_gap.add_trace(go.Scatter(  # ligne de fond
             x=[min(xs), max(xs)], y=[0, 0], mode="lines",
@@ -2678,19 +2669,19 @@ def page_timing():
             hoverinfo="skip", showlegend=False,
         ))
         fig_gap.add_trace(go.Scatter(
-            x=xs, y=ys, mode="markers+text",
-            marker=dict(size=27, color=[driver_color(c) for c in codes],
-                        line=dict(color="rgba(255,255,255,0.9)", width=1.2)),
+            x=xs, y=[0] * len(xs), mode="markers+text",
+            marker=dict(size=b_size, color=[driver_color(c) for c in codes],
+                        line=dict(color="rgba(255,255,255,0.85)", width=1)),
             text=codes, textposition="middle center",
-            textfont=dict(size=8, color="white"),
+            textfont=dict(size=f_size, color="white"),
             hovertemplate="%{text} : +%{x:.3f} s<extra></extra>",
             cliponaxis=False, showlegend=False,
         ))
-        pad = max(span * 0.05, 0.5)
+        pad = max(span * 0.04, 0.5)
         fig_gap.update_xaxes(title="Écart au leader (s)", showgrid=False, zeroline=False,
                              range=[min(xs) - pad, max(xs) + pad])
-        fig_gap.update_yaxes(visible=False, range=[-1.3, 1.3], fixedrange=True)
-        fig_gap.update_layout(height=200, template="plotly_dark",
+        fig_gap.update_yaxes(visible=False, range=[-1, 1], fixedrange=True)
+        fig_gap.update_layout(height=140, template="plotly_dark",
                               margin=dict(t=10, b=40, l=20, r=20))
         plot(fig_gap)
         missing = [dfr["drv"].iloc[i] for i in range(len(dfr))
