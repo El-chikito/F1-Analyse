@@ -2480,8 +2480,9 @@ def page_timing():
         rows.append({
             "drv": drv,
             "res_pos": float(res["Position"]) if res is not None and pd.notna(res.get("Position")) else np.nan,
-            "res_time": res.get("Time") if res is not None else pd.NaT,
             "res_status": str(res.get("Status", "")) if res is not None else "",
+            "fin_laps": int(last["LapNumber"]),
+            "fin_t": last["Time"].total_seconds() if pd.notna(last.get("Time")) else np.nan,
             "best": best_td,
             "best_s": best_td.total_seconds() if pd.notna(best_td) else np.inf,
             "last_lap": last["LapTime"],
@@ -2501,36 +2502,48 @@ def page_timing():
     # Ordre : positions officielles si dispo, sinon meilleur tour
     if is_race and dfr["res_pos"].notna().any():
         dfr = dfr.sort_values(["res_pos", "best_s"], na_position="last")
+    elif is_race:
+        dfr = dfr.sort_values(["fin_laps", "fin_t"], ascending=[False, True], na_position="last")
     else:
         dfr = dfr.sort_values("best_s")
     dfr = dfr.reset_index(drop=True)
 
     # Écarts au leader et intervalles (+ version numérique pour le schéma)
     gaps, intervals, gap_num = [], [], []
-    if is_race and dfr["res_pos"].notna().any():
-        # Time FastF1 : durée totale pour le vainqueur, écart pour les autres.
-        # NaT (tours de retard, abandon) → on affiche le statut officiel.
-        gap_s = []
+    if is_race:
+        # FIX : results["Time"] (écart officiel) est vide pour les sessions
+        # Sprint côté FastF1 → tout ressortait NaT. On reconstruit l'écart à
+        # l'arrivée depuis les temps de passage de la ligne (laps), toujours
+        # présents : pilotes dans le même tour que le leader → différence des
+        # passages au dernier tour ; sinon "+N tour(s)" ou statut officiel.
+        lead_laps = dfr["fin_laps"].iloc[0]
+        lead_t = dfr["fin_t"].iloc[0]
         for i, r in dfr.iterrows():
             if i == 0:
                 gaps.append("Leader")
-                gap_s.append(0.0)
-            elif pd.notna(r["res_time"]):
-                g = r["res_time"].total_seconds()
+                gap_num.append(0.0)
+            elif (pd.notna(r["fin_t"]) and pd.notna(lead_t)
+                  and pd.notna(r["fin_laps"]) and r["fin_laps"] == lead_laps):
+                g = r["fin_t"] - lead_t
                 gaps.append(f"+{g:.3f}")
-                gap_s.append(g)
+                gap_num.append(g)
             else:
                 status = r["res_status"]
-                gaps.append(status if status and status != "Finished" else "—")
-                gap_s.append(np.nan)
+                if status and status not in ("Finished", "Lapped", "nan", ""):
+                    gaps.append(status)
+                elif pd.notna(r["fin_laps"]) and pd.notna(lead_laps):
+                    diff = int(lead_laps - r["fin_laps"])
+                    gaps.append(f"+{diff} tour{'s' if diff > 1 else ''}")
+                else:
+                    gaps.append("—")
+                gap_num.append(np.nan)
         for i in range(len(dfr)):
             if i == 0:
                 intervals.append("Interval")
-            elif pd.notna(gap_s[i]) and pd.notna(gap_s[i - 1]):
-                intervals.append(f"+{gap_s[i] - gap_s[i - 1]:.3f}")
+            elif np.isfinite(gap_num[i]) and np.isfinite(gap_num[i - 1]):
+                intervals.append(f"+{gap_num[i] - gap_num[i - 1]:.3f}")
             else:
                 intervals.append(gaps[i])
-        gap_num = gap_s
     else:
         leader_best = dfr["best_s"].iloc[0]
         for i, r in dfr.iterrows():
