@@ -14,6 +14,15 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- REFONTE en deux pages via st.navigation (menu en haut de la sidebar ;
+  sur mobile, il s'ouvre par l'icône en haut à gauche) :
+  · 📊 Timing session (accueil) : tableau récap façon écran livetiming —
+    badges couleur équipe, intervalles/écarts (classement officiel en
+    course/sprint), pneus (âge + compound), best lap, dernier tour bouclé
+    + secteurs, meilleurs secteurs individuels ; fonds violet (record
+    session) / vert (record perso). Rendu HTML mono. Les mini-secteurs
+    n'existent pas en post-session (flux live SignalR) → non affichés.
+  · 🎨 Style de pilotage : tout l'existant (sélection pilotes + onglets).
 - FIX  Tableaux flous sur mobile : st.dataframe dessine dans un canvas
        (Glide Data Grid) → rendu baveux sur écrans Retina. En mode compact,
        la feuille des temps et le recap tour par tour sont rendus en HTML
@@ -370,23 +379,44 @@ def plot(fig):
         st.plotly_chart(fig, width="stretch")  # noqa: appel direct voulu (helper)
 
 
-def show_table(styler, height=None):
+def show_table(styler, height=None, force_html=False, mono=False):
     """Affichage d'un tableau stylé, adapté au mode compact.
 
     st.dataframe dessine les cellules dans un canvas (Glide Data Grid) →
     texte flou sur les écrans Retina des téléphones, surtout après un zoom.
-    En mode compact, on rend le Styler en HTML natif (texte net) dans un
-    conteneur scrollable avec en-têtes collants. Sur desktop, on garde
-    st.dataframe (tri, redimensionnement des colonnes). Les styles inline du
-    Styler (violet/vert, surlignage, barré) sont préservés dans les deux cas."""
-    if not MOBILE:
+    En mode compact (ou avec force_html=True, ex. page Timing dont les badges
+    colorés exigent un rendu maîtrisé), on rend le Styler en HTML natif dans
+    un conteneur scrollable avec en-têtes collants ; mono=True bascule en
+    police à chasse fixe façon écran de timing. Sur desktop sans force_html,
+    on garde st.dataframe (tri, redimensionnement des colonnes)."""
+    if not (MOBILE or force_html):
         st.dataframe(styler, width="stretch", hide_index=True, height=height)
         return
     html = styler.hide(axis="index").to_html()
+    cls = "tbl-wrap mono" if mono else "tbl-wrap"
     st.markdown(
-        f'<div class="tbl-wrap" style="max-height:{int(height or 520)}px">{html}</div>',
+        f'<div class="{cls}" style="max-height:{int(height or 520)}px">{html}</div>',
         unsafe_allow_html=True,
     )
+
+
+def _fmt_lap(td):
+    """Temps au tour 'm:ss.mmm', ou — si manquant."""
+    if pd.isna(td):
+        return "—"
+    s = td.total_seconds()
+    return f"{int(s // 60)}:{s % 60:06.3f}"
+
+
+def _fmt_sec(td):
+    """Temps de secteur 'ss.mmm', ou — si manquant."""
+    return f"{td.total_seconds():.3f}" if pd.notna(td) else "—"
+
+
+SESSION_LABELS = {
+    "Q": "Qualifications", "R": "Course", "SQ": "Sprint Shootout", "S": "Sprint",
+    "FP3": "Essais Libres 3", "FP2": "Essais Libres 2", "FP1": "Essais Libres 1",
+}
 
 
 def hex_to_rgb_str(h):
@@ -701,22 +731,25 @@ MOBILE = st.sidebar.toggle(
          "allège la feuille des temps et rend le scroll tactile aux graphiques.",
 )
 
-if MOBILE:
-    # CSS des tableaux HTML natifs (voir show_table) : thème sombre, chiffres
-    # tabulaires alignés, en-têtes collants au scroll
-    st.markdown("""
-    <style>
-    .tbl-wrap {overflow: auto; border: 1px solid rgba(255,255,255,.15);
-               border-radius: 8px; margin-bottom: 0.6rem;}
-    .tbl-wrap table {border-collapse: collapse; width: 100%;
-                     font-size: 0.85rem; font-variant-numeric: tabular-nums;}
-    .tbl-wrap th {position: sticky; top: 0; z-index: 1; background: #262730;
-                  color: #FAFAFA; text-align: left; padding: 6px 8px;
-                  font-weight: 600; white-space: nowrap;}
-    .tbl-wrap td {padding: 6px 8px; color: #FAFAFA; white-space: nowrap;
-                  border-top: 1px solid rgba(255,255,255,.08);}
-    </style>
-    """, unsafe_allow_html=True)
+# CSS des tableaux HTML natifs (voir show_table) : thème sombre, chiffres
+# tabulaires, en-têtes collants. Injecté inconditionnellement — la page
+# Timing rend en HTML même sur desktop (badges couleur équipe, fonds records).
+st.markdown("""
+<style>
+.tbl-wrap {overflow: auto; border: 1px solid rgba(255,255,255,.15);
+           border-radius: 8px; margin-bottom: 0.6rem;}
+.tbl-wrap table {border-collapse: collapse; width: 100%;
+                 font-size: 0.85rem; font-variant-numeric: tabular-nums;}
+.tbl-wrap th {position: sticky; top: 0; z-index: 1; background: #262730;
+              color: #FAFAFA; text-align: left; padding: 6px 8px;
+              font-weight: 600; white-space: nowrap;}
+.tbl-wrap td {padding: 6px 8px; color: #FAFAFA; white-space: nowrap;
+              border-top: 1px solid rgba(255,255,255,.08);}
+.tbl-wrap.mono table {font-family: ui-monospace, SFMono-Regular, Menlo,
+                      Consolas, monospace; font-size: 0.82rem;}
+.tbl-wrap.mono td {padding: 5px 9px;}
+</style>
+""", unsafe_allow_html=True)
 
 year = st.sidebar.selectbox(
     "Saison",
@@ -820,25 +853,10 @@ for d in drivers_in_session:
     except Exception:
         driver_full[d] = d
 
-# --- Sélection des pilotes ---
-st.sidebar.markdown("---")
-st.sidebar.markdown("### Pilotes à comparer")
-default_d1 = "VER" if "VER" in drivers_in_session else drivers_in_session[0]
-default_d2 = "LEC" if "LEC" in drivers_in_session else drivers_in_session[1]
-if default_d2 == default_d1:
-    default_d2 = next(x for x in drivers_in_session if x != default_d1)
-d1 = st.sidebar.selectbox(
-    "Pilote 1",
-    options=drivers_in_session,
-    index=drivers_in_session.index(default_d1),
-    format_func=lambda x: driver_full.get(x, x),
-)
-d2 = st.sidebar.selectbox(
-    "Pilote 2",
-    options=drivers_in_session,
-    index=drivers_in_session.index(default_d2),
-    format_func=lambda x: driver_full.get(x, x),
-)
+# ============== HEADER DE SESSION (commun aux pages) ==============
+ev = session.event
+st.markdown(f"### {ev['EventName']} {st.session_state.year} — {st.session_state.session_type}")
+st.caption(f"📍 {ev['Location']}, {ev['Country']} · {ev['EventDate'].strftime('%d %B %Y')}")
 
 
 def driver_color(drv):
@@ -849,238 +867,1538 @@ def driver_color(drv):
         return "#888888"
 
 
-c1, c2 = driver_color(d1), driver_color(d2)
-# S'assure que les deux couleurs sont différentes
-if c1 == c2:
-    c2 = "#FFD700"  # gold fallback
-
-# ============== SÉLECTION DU TOUR À ANALYSER ==============
-st.sidebar.markdown("---")
-st.sidebar.markdown("### Tour à analyser")
-
-
-def get_lap_options(drv):
-    """Retourne la liste des tours valides + descriptions + tour rapide pour le sélecteur."""
-    laps_drv = session.laps.pick_drivers(drv)
-    valid = laps_drv.loc[laps_drv["LapTime"].notna()].copy()
-    if valid.empty:
-        return [], {}, None
-    fastest = valid.pick_fastest()
-    fastest_num = int(fastest["LapNumber"])
-
-    options = []
-    descriptions = {}
-    for _, row in valid.iterrows():
-        n = int(row["LapNumber"])
-        lt = row["LapTime"].total_seconds()
-        compound = str(row.get("Compound", "—"))[:1] if pd.notna(row.get("Compound")) else "—"
-        is_fastest_marker = " ⚡" if n == fastest_num else ""
-        time_str = f"{int(lt // 60)}:{lt % 60:06.3f}"
-        options.append(n)
-        descriptions[n] = f"L{n:>2} — {time_str} ({compound}){is_fastest_marker}"
-    return options, descriptions, fastest_num
-
-
-opts1, desc1, fast1 = get_lap_options(d1)
-opts2, desc2, fast2 = get_lap_options(d2)
-
-if not opts1 or not opts2:
-    st.error("⚠️ Un des deux pilotes n'a pas de tour valide dans cette session.")
-    st.stop()
-
-lap_n1 = st.sidebar.selectbox(
-    f"Tour {d1}",
-    options=opts1,
-    index=opts1.index(fast1),
-    format_func=lambda n: desc1.get(n, f"L{n}"),
-    help="⚡ marque le tour le plus rapide. Tu peux choisir n'importe quel autre tour.",
-)
-lap_n2 = st.sidebar.selectbox(
-    f"Tour {d2}",
-    options=opts2,
-    index=opts2.index(fast2),
-    format_func=lambda n: desc2.get(n, f"L{n}"),
-)
-
-# Récupère l'objet Lap correspondant au tour choisi
-laps_d1_all = session.laps.pick_drivers(d1)
-laps_d2_all = session.laps.pick_drivers(d2)
-lap1 = laps_d1_all[laps_d1_all["LapNumber"] == lap_n1].iloc[0]
-lap2 = laps_d2_all[laps_d2_all["LapNumber"] == lap_n2].iloc[0]
-
-if pd.isna(lap1.get("LapTime")) or pd.isna(lap2.get("LapTime")):
-    st.error("⚠️ Données manquantes pour le tour sélectionné.")
-    st.stop()
-
-tel1 = lap1.get_car_data().add_distance()
-tel2 = lap2.get_car_data().add_distance()
-
-# ============== HEADER DE SESSION ==============
-ev = session.event
-st.markdown(f"### {ev['EventName']} {st.session_state.year} — {st.session_state.session_type}")
-st.caption(f"📍 {ev['Location']}, {ev['Country']} · {ev['EventDate'].strftime('%d %B %Y')}")
-
-
-# ============== CLASSEMENT DE LA SESSION ==============
-def build_leaderboard(sess):
-    """Construit le classement des meilleurs tours de la session."""
-    rows = []
-    for drv in sess.laps["Driver"].unique():
-        fast = sess.laps.pick_drivers(drv).pick_fastest()
-        if fast is None or pd.isna(fast.get("LapTime")):
-            continue
-        try:
-            info = sess.get_driver(drv)
-            team = info.get("TeamName", "—")
-            name = info.get("FullName", drv)
-        except Exception:
-            team = "—"
-            name = drv
-        lap_s = fast["LapTime"].total_seconds()
-        rows.append({
-            "Code": drv,
-            "Pilote": name,
-            "Équipe": team,
-            "_lap_seconds": lap_s,
-            "Meilleur tour": f"{int(lap_s // 60)}:{lap_s % 60:06.3f}",
-            "Pneu": fast.get("Compound", "—"),
-        })
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).sort_values("_lap_seconds").reset_index(drop=True)
-    leader = df["_lap_seconds"].iloc[0]
-    df["Écart"] = df["_lap_seconds"].apply(
-        lambda t: "—" if t == leader else f"+{t - leader:.3f}s"
+# ============== PAGE : ANALYSE DU STYLE ==============
+def page_style():
+    """Page d'analyse du style de pilotage : sélection de deux pilotes et de
+    leurs tours, puis les onglets d'analyse (overlay, delta, g-g, feuille des
+    temps, etc.). Les widgets sidebar de cette page (pilotes, tours) ne sont
+    créés que lorsqu'elle est active."""
+    # --- Sélection des pilotes ---
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Pilotes à comparer")
+    default_d1 = "VER" if "VER" in drivers_in_session else drivers_in_session[0]
+    default_d2 = "LEC" if "LEC" in drivers_in_session else drivers_in_session[1]
+    if default_d2 == default_d1:
+        default_d2 = next(x for x in drivers_in_session if x != default_d1)
+    d1 = st.sidebar.selectbox(
+        "Pilote 1",
+        options=drivers_in_session,
+        index=drivers_in_session.index(default_d1),
+        format_func=lambda x: driver_full.get(x, x),
     )
-    df.insert(0, "Pos", df.index + 1)
-    df = df.drop(columns="_lap_seconds")
-    return df
+    d2 = st.sidebar.selectbox(
+        "Pilote 2",
+        options=drivers_in_session,
+        index=drivers_in_session.index(default_d2),
+        format_func=lambda x: driver_full.get(x, x),
+    )
 
 
-with st.expander("🏁 Classement de la session — meilleurs tours", expanded=False):
-    leaderboard = build_leaderboard(session)
-    if leaderboard.empty:
-        st.info("Aucun tour valide enregistré.")
+    c1, c2 = driver_color(d1), driver_color(d2)
+    # S'assure que les deux couleurs sont différentes
+    if c1 == c2:
+        c2 = "#FFD700"  # gold fallback
+
+    # ============== SÉLECTION DU TOUR À ANALYSER ==============
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Tour à analyser")
+
+
+    def get_lap_options(drv):
+        """Retourne la liste des tours valides + descriptions + tour rapide pour le sélecteur."""
+        laps_drv = session.laps.pick_drivers(drv)
+        valid = laps_drv.loc[laps_drv["LapTime"].notna()].copy()
+        if valid.empty:
+            return [], {}, None
+        fastest = valid.pick_fastest()
+        fastest_num = int(fastest["LapNumber"])
+
+        options = []
+        descriptions = {}
+        for _, row in valid.iterrows():
+            n = int(row["LapNumber"])
+            lt = row["LapTime"].total_seconds()
+            compound = str(row.get("Compound", "—"))[:1] if pd.notna(row.get("Compound")) else "—"
+            is_fastest_marker = " ⚡" if n == fastest_num else ""
+            time_str = f"{int(lt // 60)}:{lt % 60:06.3f}"
+            options.append(n)
+            descriptions[n] = f"L{n:>2} — {time_str} ({compound}){is_fastest_marker}"
+        return options, descriptions, fastest_num
+
+
+    opts1, desc1, fast1 = get_lap_options(d1)
+    opts2, desc2, fast2 = get_lap_options(d2)
+
+    if not opts1 or not opts2:
+        st.error("⚠️ Un des deux pilotes n'a pas de tour valide dans cette session.")
+        st.stop()
+
+    lap_n1 = st.sidebar.selectbox(
+        f"Tour {d1}",
+        options=opts1,
+        index=opts1.index(fast1),
+        format_func=lambda n: desc1.get(n, f"L{n}"),
+        help="⚡ marque le tour le plus rapide. Tu peux choisir n'importe quel autre tour.",
+    )
+    lap_n2 = st.sidebar.selectbox(
+        f"Tour {d2}",
+        options=opts2,
+        index=opts2.index(fast2),
+        format_func=lambda n: desc2.get(n, f"L{n}"),
+    )
+
+    # Récupère l'objet Lap correspondant au tour choisi
+    laps_d1_all = session.laps.pick_drivers(d1)
+    laps_d2_all = session.laps.pick_drivers(d2)
+    lap1 = laps_d1_all[laps_d1_all["LapNumber"] == lap_n1].iloc[0]
+    lap2 = laps_d2_all[laps_d2_all["LapNumber"] == lap_n2].iloc[0]
+
+    if pd.isna(lap1.get("LapTime")) or pd.isna(lap2.get("LapTime")):
+        st.error("⚠️ Données manquantes pour le tour sélectionné.")
+        st.stop()
+
+    tel1 = lap1.get_car_data().add_distance()
+    tel2 = lap2.get_car_data().add_distance()
+
+    # ============== CLASSEMENT DE LA SESSION ==============
+    def build_leaderboard(sess):
+        """Construit le classement des meilleurs tours de la session."""
+        rows = []
+        for drv in sess.laps["Driver"].unique():
+            fast = sess.laps.pick_drivers(drv).pick_fastest()
+            if fast is None or pd.isna(fast.get("LapTime")):
+                continue
+            try:
+                info = sess.get_driver(drv)
+                team = info.get("TeamName", "—")
+                name = info.get("FullName", drv)
+            except Exception:
+                team = "—"
+                name = drv
+            lap_s = fast["LapTime"].total_seconds()
+            rows.append({
+                "Code": drv,
+                "Pilote": name,
+                "Équipe": team,
+                "_lap_seconds": lap_s,
+                "Meilleur tour": f"{int(lap_s // 60)}:{lap_s % 60:06.3f}",
+                "Pneu": fast.get("Compound", "—"),
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).sort_values("_lap_seconds").reset_index(drop=True)
+        leader = df["_lap_seconds"].iloc[0]
+        df["Écart"] = df["_lap_seconds"].apply(
+            lambda t: "—" if t == leader else f"+{t - leader:.3f}s"
+        )
+        df.insert(0, "Pos", df.index + 1)
+        df = df.drop(columns="_lap_seconds")
+        return df
+
+
+    with st.expander("🏁 Classement de la session — meilleurs tours", expanded=False):
+        leaderboard = build_leaderboard(session)
+        if leaderboard.empty:
+            st.info("Aucun tour valide enregistré.")
+        else:
+            # Surligne les 2 pilotes sélectionnés
+            def highlight_selected(row):
+                if row["Code"] == d1:
+                    return [f"background-color: {c1}30; font-weight: bold"] * len(row)
+                if row["Code"] == d2:
+                    return [f"background-color: {c2}30; font-weight: bold"] * len(row)
+                return [""] * len(row)
+
+            styled = leaderboard.style.apply(highlight_selected, axis=1)
+            st.dataframe(
+                styled,
+                width="stretch",
+                hide_index=True,
+                height=min(38 * (len(leaderboard) + 1) + 3, 600),
+                column_config={
+                    "Pos": st.column_config.NumberColumn("Pos", width="small"),
+                    "Code": st.column_config.TextColumn("Code", width="small"),
+                    "Pilote": st.column_config.TextColumn("Pilote", width="medium"),
+                    "Équipe": st.column_config.TextColumn("Équipe", width="medium"),
+                    "Meilleur tour": st.column_config.TextColumn("Meilleur tour", width="small"),
+                    "Écart": st.column_config.TextColumn("Écart", width="small"),
+                    "Pneu": st.column_config.TextColumn("Pneu", width="small"),
+                },
+            )
+            st.caption(
+                f"👉 Les lignes surlignées correspondent aux pilotes sélectionnés ({d1} et {d2}). "
+                f"Change-les dans la barre latérale pour voir une autre comparaison."
+            )
+
+    # ============== BRIEFING CIRCUIT ==============
+    event_name = ev["EventName"]
+    circuit_info_data = CIRCUITS_INFO.get(event_name)
+
+    if circuit_info_data:
+        with st.expander(f"📍 Briefing circuit — {ev['Location']}", expanded=True):
+            st.markdown(f"**{circuit_info_data['facts']}**")
+            st.markdown("")
+
+            # Tableau des zones intéressantes (distances reconstruites depuis les valeurs numériques)
+            zones_df = pd.DataFrame(
+                [(z[0], z[1], f"{z[2]}–{z[3]} m", z[4]) for z in circuit_info_data["zones"]],
+                columns=["Zone", "Virage(s)", "Distance approx.", "Pourquoi c'est intéressant"],
+            )
+            st.dataframe(
+                zones_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Zone": st.column_config.TextColumn("Zone", width="medium"),
+                    "Virage(s)": st.column_config.TextColumn("Virage(s)", width="small"),
+                    "Distance approx.": st.column_config.TextColumn("Distance approx.", width="small"),
+                    "Pourquoi c'est intéressant": st.column_config.TextColumn("Pourquoi c'est intéressant", width="large"),
+                },
+            )
+            st.caption(
+                "💡 Les distances sont indicatives — ces zones sont disponibles en **presets** "
+                "dans l'onglet **🔍 Zoom virage** pour les explorer directement."
+            )
     else:
-        # Surligne les 2 pilotes sélectionnés
-        def highlight_selected(row):
-            if row["Code"] == d1:
-                return [f"background-color: {c1}30; font-weight: bold"] * len(row)
-            if row["Code"] == d2:
-                return [f"background-color: {c2}30; font-weight: bold"] * len(row)
-            return [""] * len(row)
+        st.info(f"ℹ️ Pas encore de briefing détaillé pour **{event_name}** dans la base. "
+                f"Tu peux toujours explorer via les onglets ci-dessous.")
 
-        styled = leaderboard.style.apply(highlight_selected, axis=1)
-        st.dataframe(
-            styled,
-            width="stretch",
-            hide_index=True,
-            height=min(38 * (len(leaderboard) + 1) + 3, 600),
-            column_config={
-                "Pos": st.column_config.NumberColumn("Pos", width="small"),
-                "Code": st.column_config.TextColumn("Code", width="small"),
-                "Pilote": st.column_config.TextColumn("Pilote", width="medium"),
-                "Équipe": st.column_config.TextColumn("Équipe", width="medium"),
-                "Meilleur tour": st.column_config.TextColumn("Meilleur tour", width="small"),
-                "Écart": st.column_config.TextColumn("Écart", width="small"),
-                "Pneu": st.column_config.TextColumn("Pneu", width="small"),
-            },
+    # --- Métriques principales ---
+    col1, col2, col3, col4 = st.columns(4)
+    t1 = lap1["LapTime"].total_seconds()
+    t2 = lap2["LapTime"].total_seconds()
+    lap_label1 = f"L{lap_n1} {'⚡' if lap_n1 == fast1 else ''}"
+    lap_label2 = f"L{lap_n2} {'⚡' if lap_n2 == fast2 else ''}"
+    col1.metric(f"{d1} — {lap_label1}", f"{t1:.3f}s",
+                help=f"Tour {lap_n1} de {d1}" + (" (le plus rapide)" if lap_n1 == fast1 else ""))
+    col2.metric(f"{d2} — {lap_label2}", f"{t2:.3f}s",
+                help=f"Tour {lap_n2} de {d2}" + (" (le plus rapide)" if lap_n2 == fast2 else ""))
+    col3.metric("Écart", f"{abs(t1-t2):.3f}s",
+                delta=f"{d1 if t1 < t2 else d2} plus rapide", delta_color="off")
+    col4.metric("Circuit", f"{tel1['Distance'].max():.0f} m")
+
+    # ============== TABS ==============
+    tab_sheet, tab1, tab_map, tab2, tab_corners, tab3, tab_gg, tab4, tab5, tab_stint, tab_craft, tab_fit, tab6 = st.tabs([
+        "📋 Feuille des temps",
+        "🎯 Overlay télémétrie",
+        "🗺️ Vue circuit",
+        "⏱️ Delta time",
+        "🧠 Virage par virage",
+        "🎨 Signatures de style",
+        "⭕ Diagramme g-g",
+        "🔍 Zoom virage",
+        "📊 Secteurs",
+        "📈 Évolution course",
+        "🥊 Race craft",
+        "🏟️ Auto vs circuit",
+        "🕸️ Radar multi-pilotes",
+    ])
+
+    # --- TAB SHEET : FEUILLE DES TEMPS ---
+    with tab_sheet:
+        st.markdown(
+            "La feuille des temps de la session, façon écran de timing : meilleurs tours, "
+            "**meilleurs secteurs individuels** (pas forcément réalisés dans le même tour), "
+            "tour théorique et vitesses de pointe. "
+            "🟣 **Violet** = record de la session · 🟢 **vert** = record perso."
         )
+
+        PURPLE, GREEN = "#C77DFF", "#4ADE80"
+        _EPS = pd.Timedelta(milliseconds=1)
+
+        laps_all = session.laps
+        # Les tours supprimés (track limits) ne comptent pas pour les records
+        laps_ok = laps_all[laps_all["Deleted"] != True] if "Deleted" in laps_all.columns else laps_all
+
+        # Records absolus de la session (→ violet)
+        sess_best = {
+            "lap": laps_ok["LapTime"].min(),
+            "S1": laps_ok["Sector1Time"].min(),
+            "S2": laps_ok["Sector2Time"].min(),
+            "S3": laps_ok["Sector3Time"].min(),
+        }
+
+        rows = []
+        for drv in laps_all["Driver"].dropna().unique():
+            ld = laps_ok[laps_ok["Driver"] == drv]
+            timed = ld[ld["LapTime"].notna()]
+            if timed.empty:
+                continue
+            best = timed.loc[timed["LapTime"].idxmin()]
+            b1, b2, b3 = ld["Sector1Time"].min(), ld["Sector2Time"].min(), ld["Sector3Time"].min()
+            theo = b1 + b2 + b3 if (pd.notna(b1) and pd.notna(b2) and pd.notna(b3)) else pd.NaT
+            speed_cols = [c for c in ("SpeedST", "SpeedFL", "SpeedI1", "SpeedI2") if c in ld.columns]
+            if speed_cols and ld[speed_cols].notna().any().any():
+                vmax_drv = float(np.nanmax(ld[speed_cols].values.astype(float)))
+            else:
+                vmax_drv = np.nan
+            try:
+                info = session.get_driver(drv)
+                name, team = info.get("FullName", drv), info.get("TeamName", "—")
+            except Exception:
+                name, team = drv, "—"
+            rows.append({
+                "Code": drv, "Pilote": name, "Équipe": team,
+                "_best": best["LapTime"].total_seconds(),
+                "best_td": best["LapTime"],
+                "s1": b1, "s2": b2, "s3": b3, "theo": theo,
+                "vmax": vmax_drv,
+                "Pneu": best.get("Compound", "—") if pd.notna(best.get("Compound")) else "—",
+                "Tours": int(timed["LapNumber"].nunique()),
+            })
+
+        if not rows:
+            st.info("Aucun tour chronométré dans cette session.")
+        else:
+            dft = pd.DataFrame(rows).sort_values("_best").reset_index(drop=True)
+            leader = dft["_best"].iloc[0]
+
+            disp = pd.DataFrame({
+                "Pos": dft.index + 1,
+                "Pilote": dft["Code"] if MOBILE else dft["Pilote"],
+                "Équipe": dft["Équipe"],
+                "Meilleur tour": dft["best_td"].apply(_fmt_lap),
+                "Écart": ["—"] + [f"+{t - leader:.3f}" for t in dft["_best"].iloc[1:]],
+                "S1": dft["s1"].apply(_fmt_sec),
+                "S2": dft["s2"].apply(_fmt_sec),
+                "S3": dft["s3"].apply(_fmt_sec),
+                "Théorique": dft["theo"].apply(_fmt_lap),
+                "Δ théo": [f"+{(b - t.total_seconds()):.3f}" if pd.notna(t) else "—"
+                           for b, t in zip(dft["_best"], dft["theo"])],
+                "Vmax": [f"{v:.0f}" if pd.notna(v) else "—" for v in dft["vmax"]],
+                "Pneu": dft["Pneu"],
+                "Tours": dft["Tours"],
+            })
+
+            styles = pd.DataFrame("", index=disp.index, columns=disp.columns)
+            purple_css = f"color: {PURPLE}; font-weight: bold"
+
+            def _mark_purple(col_disp, series_td, best_td):
+                if pd.isna(best_td):
+                    return
+                m = series_td.notna() & ((series_td - best_td).abs() < _EPS)
+                styles.loc[m.values, col_disp] = purple_css
+
+            _mark_purple("S1", dft["s1"], sess_best["S1"])
+            _mark_purple("S2", dft["s2"], sess_best["S2"])
+            _mark_purple("S3", dft["s3"], sess_best["S3"])
+            _mark_purple("Meilleur tour", dft["best_td"], sess_best["lap"])
+
+            # Surligne les deux pilotes sélectionnés, comme le classement du haut
+            for drv_sel, colr in ((d1, c1), (d2, c2)):
+                mask = (dft["Code"] == drv_sel).values
+                if mask.any():
+                    for c in disp.columns:
+                        cur = styles.loc[mask, c].iloc[0]
+                        styles.loc[mask, c] = (cur + "; " if cur else "") + f"background-color: {colr}30"
+
+            # Mode compact : colonnes essentielles seulement (le tableau complet
+            # reste à un toggle de distance dans la sidebar)
+            if MOBILE:
+                keep = ["Pos", "Pilote", "Meilleur tour", "Écart", "S1", "S2", "S3", "Δ théo", "Pneu"]
+                disp, styles = disp[keep], styles[keep]
+
+            show_table(
+                disp.style.apply(lambda _: styles, axis=None),
+                height=min(38 * (len(disp) + 1) + 3, 700),
+            )
+            st.caption(
+                "**Théorique** = somme des meilleurs secteurs individuels du pilote · "
+                "**Δ théo** = temps laissé sur la table (meilleur tour réel − tour théorique) · "
+                "**Vmax** = vitesse de pointe max relevée (speed traps), en km/h. "
+                "Les tours supprimés (track limits) sont exclus des records."
+            )
+
+            # --- Recap tour par tour des deux pilotes sélectionnés ---
+            st.markdown("---")
+            st.markdown(f"#### 📜 Recap tour par tour — {d1} vs {d2}")
+            st.caption(
+                "🟣 Violet = record de la session · 🟢 vert = record perso · "
+                "OUT = sortie des stands, IN = rentre aux stands · ligne barrée = tour supprimé."
+            )
+
+            def _render_laps_recap(drv):
+                ld = laps_all[laps_all["Driver"] == drv].sort_values("LapNumber")
+                ld = ld[ld["LapTime"].notna()].reset_index(drop=True)
+                if ld.empty:
+                    st.info(f"Pas de tour chronométré pour {drv}.")
+                    return
+                deleted = (ld["Deleted"] == True).values if "Deleted" in ld.columns \
+                    else np.zeros(len(ld), dtype=bool)
+
+                # Records perso (hors tours supprimés)
+                ok = ld[~deleted]
+                pb = {
+                    "lap": ok["LapTime"].min() if len(ok) else pd.NaT,
+                    "S1": ok["Sector1Time"].min() if len(ok) else pd.NaT,
+                    "S2": ok["Sector2Time"].min() if len(ok) else pd.NaT,
+                    "S3": ok["Sector3Time"].min() if len(ok) else pd.NaT,
+                }
+
+                notes = []
+                for _, r in ld.iterrows():
+                    n = []
+                    if pd.notna(r.get("PitOutTime")):
+                        n.append("OUT")
+                    if pd.notna(r.get("PitInTime")):
+                        n.append("IN")
+                    notes.append("/".join(n))
+
+                rec = pd.DataFrame({
+                    "Tour": ld["LapNumber"].astype(int).values,
+                    "Temps": [_fmt_lap(t) for t in ld["LapTime"]],
+                    "S1": [_fmt_sec(t) for t in ld["Sector1Time"]],
+                    "S2": [_fmt_sec(t) for t in ld["Sector2Time"]],
+                    "S3": [_fmt_sec(t) for t in ld["Sector3Time"]],
+                    "Pneu": [str(c)[:1] if pd.notna(c) else "—" for c in ld["Compound"]],
+                    "Note": notes,
+                })
+
+                sty = pd.DataFrame("", index=rec.index, columns=rec.columns)
+                for col_disp, col_src, key in [("Temps", "LapTime", "lap"),
+                                               ("S1", "Sector1Time", "S1"),
+                                               ("S2", "Sector2Time", "S2"),
+                                               ("S3", "Sector3Time", "S3")]:
+                    s = ld[col_src]
+                    if pd.notna(pb[key]):
+                        m_pers = s.notna() & ((s - pb[key]).abs() < _EPS)
+                        sty.loc[m_pers.values, col_disp] = f"color: {GREEN}; font-weight: bold"
+                    if pd.notna(sess_best[key]):
+                        m_sess = s.notna() & ((s - sess_best[key]).abs() < _EPS)
+                        # le violet (record session) écrase le vert (record perso)
+                        sty.loc[m_sess.values, col_disp] = f"color: {PURPLE}; font-weight: bold"
+                if deleted.any():
+                    for c in rec.columns:
+                        sty.loc[deleted, c] = sty.loc[deleted, c] + "; text-decoration: line-through; opacity: 0.45"
+
+                show_table(
+                    rec.style.apply(lambda _: sty, axis=None),
+                    height=min(38 * (len(rec) + 1) + 3, 560),
+                )
+
+            if MOBILE:
+                st.markdown(f"##### {d1}")
+                _render_laps_recap(d1)
+                st.markdown(f"##### {d2}")
+                _render_laps_recap(d2)
+            else:
+                col_l, col_r = st.columns(2)
+                with col_l:
+                    st.markdown(f"##### {d1}")
+                    _render_laps_recap(d1)
+                with col_r:
+                    st.markdown(f"##### {d2}")
+                    _render_laps_recap(d2)
+
+    # --- TAB 1 : OVERLAY ---
+    with tab1:
+        st.markdown("Vitesse, throttle, frein et rapport superposés sur la distance — survole les courbes pour les valeurs précises.")
+
+        fig = make_subplots(
+            rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+            subplot_titles=("Vitesse (km/h)", "Throttle (%)", "Frein", "Rapport"),
+        )
+        channels = ["Speed", "Throttle", "Brake", "nGear"]
+        for i, ch in enumerate(channels, start=1):
+            fig.add_trace(go.Scatter(
+                x=tel1["Distance"], y=_chan(tel1, ch), name=d1,
+                line=dict(color=c1, width=1.8),
+                legendgroup=d1, showlegend=(i == 1),
+            ), row=i, col=1)
+            fig.add_trace(go.Scatter(
+                x=tel2["Distance"], y=_chan(tel2, ch), name=d2,
+                line=dict(color=c2, width=1.8),
+                legendgroup=d2, showlegend=(i == 1),
+            ), row=i, col=1)
+
+        # Lignes verticales aux virages
+        if corners_df is not None:
+            for _, corner in corners_df.iterrows():
+                for r in range(1, 5):
+                    fig.add_vline(x=corner["Distance"], line=dict(color="white", width=0.5, dash="dot"),
+                                  opacity=0.2, row=r, col=1)
+            # Annotations virages sur le subplot du bas
+            fig.update_xaxes(
+                tickvals=corners_df["Distance"].tolist(),
+                ticktext=[f"T{int(c['Number'])}{c['Letter']}" for _, c in corners_df.iterrows()],
+                row=4, col=1,
+            )
+
+        fig.update_layout(
+            height=750, template="plotly_dark",
+            hovermode="x unified",
+            legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
+            margin=dict(t=40, b=20, l=20, r=20),
+        )
+        fig.update_xaxes(title_text="Virage" if corners_df is not None else "Distance (m)", row=4, col=1)
+        plot(fig)
+
+    # --- TAB MAP : VUE CIRCUIT ---
+    with tab_map:
+        st.markdown("Le tracé du circuit, colorié selon le paramètre choisi. Repère **où** chaque pilote roule fort, où il freine, où il prend du temps.")
+
+        # Télémétrie complète avec X/Y (position GPS sur le tracé)
+        tel1_full = lap1.get_telemetry()
+        tel2_full = lap2.get_telemetry()
+
+        color_by = st.radio(
+            "Colorer par",
+            options=["Speed", "Throttle", "Brake", "nGear"],
+            format_func=lambda x: {"Speed": "Vitesse", "Throttle": "Throttle",
+                                   "Brake": "Frein", "nGear": "Rapport"}[x],
+            horizontal=True,
+            key="map_color_by",
+        )
+
+        # Échelle commune aux deux pilotes pour comparabilité
+        vals1, vals2 = _chan(tel1_full, color_by), _chan(tel2_full, color_by)
+        vmin = float(min(vals1.min(), vals2.min()))
+        vmax = float(max(vals1.max(), vals2.max()))
+        colorscale = "Plasma" if color_by == "Speed" else "Viridis"
+
+        # Côte à côte sur desktop, empilés en mode compact (sinon chaque tracé
+        # devient un timbre-poste sur un écran de téléphone)
+        if MOBILE:
+            fig_map = make_subplots(
+                rows=2, cols=1,
+                subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
+                vertical_spacing=0.06,
+            )
+        else:
+            fig_map = make_subplots(
+                rows=1, cols=2,
+                subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
+                horizontal_spacing=0.04,
+            )
+        for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
+            r, c = (i, 1) if MOBILE else (1, i)
+            fig_map.add_trace(go.Scatter(
+                x=tel["X"], y=tel["Y"],
+                mode="markers",
+                marker=dict(
+                    color=vals,
+                    colorscale=colorscale,
+                    cmin=vmin, cmax=vmax,
+                    size=4,
+                    showscale=(i == 2),
+                    colorbar=dict(
+                        title=dict(text=color_by, side="right"),
+                        thickness=12, x=1.02,
+                    ) if i == 2 else None,
+                ),
+                showlegend=False,
+                hovertemplate=f"{color_by}: %{{marker.color:.0f}}<extra></extra>",
+            ), row=r, col=c)
+        # Aspect ratio égal pour ne pas déformer le tracé
+        # (le subplot i utilise les axes x{i}/y{i} quelle que soit l'orientation)
+        for i in (1, 2):
+            r, c = (i, 1) if MOBILE else (1, i)
+            fig_map.update_xaxes(scaleanchor=f"y{i if i > 1 else ''}", scaleratio=1,
+                                 showticklabels=False, showgrid=False, zeroline=False,
+                                 row=r, col=c)
+            fig_map.update_yaxes(showticklabels=False, showgrid=False, zeroline=False,
+                                 row=r, col=c)
+        fig_map.update_layout(height=850 if MOBILE else 550, template="plotly_dark",
+                              margin=dict(t=50, b=20, l=20, r=80))
+        plot(fig_map)
+
+        # --- Battle map : qui est plus rapide à chaque endroit du tracé ---
+        st.markdown("---")
+        st.markdown("#### ⚔️ Battle map — qui est plus rapide à chaque point du tracé")
         st.caption(
-            f"👉 Les lignes surlignées correspondent aux pilotes sélectionnés ({d1} et {d2}). "
-            f"Change-les dans la barre latérale pour voir une autre comparaison."
+            f"Couleur {d1} = {d1} plus rapide à ce point · Couleur {d2} = {d2} plus rapide · "
+            f"Blanc = égalité. L'intensité de la couleur = ampleur de l'écart."
         )
 
-# ============== BRIEFING CIRCUIT ==============
-event_name = ev["EventName"]
-circuit_info_data = CIRCUITS_INFO.get(event_name)
-
-if circuit_info_data:
-    with st.expander(f"📍 Briefing circuit — {ev['Location']}", expanded=True):
-        st.markdown(f"**{circuit_info_data['facts']}**")
-        st.markdown("")
-
-        # Tableau des zones intéressantes (distances reconstruites depuis les valeurs numériques)
-        zones_df = pd.DataFrame(
-            [(z[0], z[1], f"{z[2]}–{z[3]} m", z[4]) for z in circuit_info_data["zones"]],
-            columns=["Zone", "Virage(s)", "Distance approx.", "Pourquoi c'est intéressant"],
+        # Interpole la vitesse de tel2 sur la grille de distance de tel1 pour pouvoir comparer
+        tel2_speed_aligned = np.interp(
+            tel1_full["Distance"].values,
+            tel2_full["Distance"].values,
+            tel2_full["Speed"].values,
         )
-        st.dataframe(
-            zones_df,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Zone": st.column_config.TextColumn("Zone", width="medium"),
-                "Virage(s)": st.column_config.TextColumn("Virage(s)", width="small"),
-                "Distance approx.": st.column_config.TextColumn("Distance approx.", width="small"),
-                "Pourquoi c'est intéressant": st.column_config.TextColumn("Pourquoi c'est intéressant", width="large"),
-            },
-        )
+        speed_delta = tel1_full["Speed"].values - tel2_speed_aligned
+
+        # Custom colorscale : c2 (négatif, d2 plus rapide) → blanc (0) → c1 (positif, d1 plus rapide)
+        custom_scale = [
+            [0.0, hex_to_rgb_str(c2)],
+            [0.5, "rgb(255,255,255)"],
+            [1.0, hex_to_rgb_str(c1)],
+        ]
+        # Échelle symétrique pour que 0 = blanc soit toujours au milieu
+        abs_max = float(np.percentile(np.abs(speed_delta), 95))  # robuste aux outliers
+
+        fig_battle = go.Figure(go.Scatter(
+            x=tel1_full["X"], y=tel1_full["Y"],
+            mode="markers",
+            marker=dict(
+                color=speed_delta,
+                colorscale=custom_scale,
+                cmin=-abs_max, cmax=abs_max,
+                size=6,
+                colorbar=dict(
+                    title=dict(text="Δ vitesse<br>(km/h)", side="right"),
+                    thickness=12,
+                ),
+            ),
+            hovertemplate=f"Δ vitesse ({d1}−{d2}): %{{marker.color:+.1f}} km/h<extra></extra>",
+        ))
+        fig_battle.update_xaxes(scaleanchor="y", scaleratio=1,
+                                showticklabels=False, showgrid=False, zeroline=False)
+        fig_battle.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+        fig_battle.update_layout(height=600, template="plotly_dark",
+                                 margin=dict(t=20, b=20, l=20, r=80))
+        plot(fig_battle)
+
+        with st.expander("💡 Comment lire la battle map vitesse"):
+            st.markdown(f"""
+            - **Zones colorées {d1}** : {d1} était plus rapide à cet endroit précis du tracé
+            - **Zones colorées {d2}** : {d2} était plus rapide
+            - **Zones blanches** : vitesses quasi identiques (égalité ou écart < 5 km/h)
+            - **L'intensité** : plus la couleur est saturée, plus l'écart est grand à cet endroit
+
+            ⚠️ **Attention** : la vitesse ne dit pas tout. Un pilote peut être plus rapide à un point précis mais avoir perdu du temps juste avant. Pour ça, regarde la heatmap de gain de temps ci-dessous.
+            """)
+
+        # --- Heatmap de gain/perte de temps ---
+        st.markdown("---")
+        st.markdown("#### 🌡️ Heatmap du gain de temps — qui prend du temps, où exactement")
         st.caption(
-            "💡 Les distances sont indicatives — ces zones sont disponibles en **presets** "
-            "dans l'onglet **🔍 Zoom virage** pour les explorer directement."
+            "Mesure le **gain de temps local** à chaque point du tracé (dérivée du delta time cumulé "
+            "par rapport à la distance, en ms par mètre). Bien plus parlant que la vitesse seule : "
+            "un pilote peut être plus rapide à un point mais avoir perdu du temps juste avant. "
+            "Ici on lit le **temps réellement gagné**, mètre par mètre."
         )
-else:
-    st.info(f"ℹ️ Pas encore de briefing détaillé pour **{event_name}** dans la base. "
-            f"Tu peux toujours explorer via les onglets ci-dessous.")
 
-# --- Métriques principales ---
-col1, col2, col3, col4 = st.columns(4)
-t1 = lap1["LapTime"].total_seconds()
-t2 = lap2["LapTime"].total_seconds()
-lap_label1 = f"L{lap_n1} {'⚡' if lap_n1 == fast1 else ''}"
-lap_label2 = f"L{lap_n2} {'⚡' if lap_n2 == fast2 else ''}"
-col1.metric(f"{d1} — {lap_label1}", f"{t1:.3f}s",
-            help=f"Tour {lap_n1} de {d1}" + (" (le plus rapide)" if lap_n1 == fast1 else ""))
-col2.metric(f"{d2} — {lap_label2}", f"{t2:.3f}s",
-            help=f"Tour {lap_n2} de {d2}" + (" (le plus rapide)" if lap_n2 == fast2 else ""))
-col3.metric("Écart", f"{abs(t1-t2):.3f}s",
-            delta=f"{d1 if t1 < t2 else d2} plus rapide", delta_color="off")
-col4.metric("Circuit", f"{tel1['Distance'].max():.0f} m")
+        try:
+            delta_t, ref_tel_dt, _ = delta_time(lap1, lap2)
+            dist_dt = np.asarray(ref_tel_dt["Distance"], dtype=float)
+            # Gain local en s/m : gradient PAR RAPPORT À LA DISTANCE — sinon un gain
+            # "par échantillon" est biaisé (un échantillon couvre plus de mètres à
+            # haute vitesse qu'à basse vitesse).
+            local_gain = np.gradient(np.asarray(delta_t, dtype=float), dist_dt)
+            local_gain = np.nan_to_num(local_gain, nan=0.0, posinf=0.0, neginf=0.0)
+            # Lissage léger pour atténuer le bruit
+            local_gain_smooth = uniform_filter1d(local_gain, size=15)
 
-# ============== TABS ==============
-tab_sheet, tab1, tab_map, tab2, tab_corners, tab3, tab_gg, tab4, tab5, tab_stint, tab_craft, tab_fit, tab6 = st.tabs([
-    "📋 Feuille des temps",
-    "🎯 Overlay télémétrie",
-    "🗺️ Vue circuit",
-    "⏱️ Delta time",
-    "🧠 Virage par virage",
-    "🎨 Signatures de style",
-    "⭕ Diagramme g-g",
-    "🔍 Zoom virage",
-    "📊 Secteurs",
-    "📈 Évolution course",
-    "🥊 Race craft",
-    "🏟️ Auto vs circuit",
-    "🕸️ Radar multi-pilotes",
-])
+            # FIX : delta_time() renvoie du car data SANS colonnes X/Y. Impossible de
+            # tracer ref_tel_dt["X"] directement (KeyError → l'ancienne version tombait
+            # systématiquement dans le except). On projette le gain sur la télémétrie
+            # complète de lap1, qui contient la position sur le tracé.
+            gain_ms = np.interp(tel1_full["Distance"].values, dist_dt, local_gain_smooth) * 1000
 
-# --- TAB SHEET : FEUILLE DES TEMPS ---
-with tab_sheet:
-    st.markdown(
-        "La feuille des temps de la session, façon écran de timing : meilleurs tours, "
-        "**meilleurs secteurs individuels** (pas forcément réalisés dans le même tour), "
-        "tour théorique et vitesses de pointe. "
-        "🟣 **Violet** = record de la session · 🟢 **vert** = record perso."
-    )
+            # Convention : delta = t(D2) − t(D1). delta > 0 = D1 devant (cumulé).
+            # gradient > 0 = l'avance de D1 grandit = D1 gagne du temps ici.
+            custom_scale_time = [
+                [0.0, hex_to_rgb_str(c2)],   # gradient < 0 = D2 gagne
+                [0.5, "rgb(255,255,255)"],
+                [1.0, hex_to_rgb_str(c1)],   # gradient > 0 = D1 gagne
+            ]
+            abs_max_gain = max(float(np.percentile(np.abs(gain_ms), 95)), 1e-3)  # garde-fou
 
-    PURPLE, GREEN = "#C77DFF", "#4ADE80"
+            fig_heat = go.Figure(go.Scatter(
+                x=tel1_full["X"], y=tel1_full["Y"],
+                mode="markers",
+                marker=dict(
+                    color=gain_ms,
+                    colorscale=custom_scale_time,
+                    cmin=-abs_max_gain, cmax=abs_max_gain,
+                    size=6,
+                    colorbar=dict(
+                        title=dict(text="Gain local<br>(ms/m)", side="right"),
+                        thickness=12,
+                        tickformat=".1f",
+                    ),
+                ),
+                hovertemplate="Gain local: %{marker.color:+.2f} ms/m<extra></extra>",
+            ))
+            fig_heat.update_xaxes(scaleanchor="y", scaleratio=1,
+                                  showticklabels=False, showgrid=False, zeroline=False)
+            fig_heat.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+            fig_heat.update_layout(height=600, template="plotly_dark",
+                                   margin=dict(t=20, b=20, l=20, r=80))
+            plot(fig_heat)
+
+            # Top zones de gain — dédupliquées (>=150 m entre deux zones), avec le
+            # virage le plus proche pour se repérer
+            gain_d1 = local_gain_smooth * 1000   # D1 gagne quand gradient > 0
+            gain_d2 = -gain_d1                   # D2 gagne quand gradient < 0
+            col_a, col_b = st.columns(2)
+            for col, drv, g in [(col_a, d1, gain_d1), (col_b, d2, gain_d2)]:
+                with col:
+                    st.markdown(f"**🔝 Top zones de gain pour {drv}**")
+                    idxs = _top_zones(g, dist_dt, k=3, min_sep=150.0)
+                    if not idxs:
+                        st.markdown("- Aucune zone de gain nette sur ce tour.")
+                    for i in idxs:
+                        st.markdown(
+                            f"- Distance {dist_dt[i]:.0f} m{_nearest_corner(dist_dt[i])} : "
+                            f"**+{g[i]:.1f} ms/m**"
+                        )
+
+            with st.expander("💡 Comment lire la heatmap de gain de temps"):
+                st.markdown(f"""
+                **C'est la visu la plus précise pour comprendre où la course se joue.**
+
+                - **Zone colorée {d1}** : {d1} **gagne du temps** sur ce mètre de circuit (que ce soit en étant plus rapide en vitesse ou en ayant un meilleur angle d'attaque qui ouvre la suite)
+                - **Zone colorée {d2}** : {d2} **gagne du temps** ici
+                - **Zone blanche** : ils sont à égalité sur ce micro-segment
+                - **Intensité** : ampleur du gain (en ms par **mètre** de circuit — comparable partout, y compris entre lignes droites et virages lents)
+
+                **Combo gagnant à analyser** :
+                1. Repère les **clusters** de couleur sur la heatmap (plusieurs dizaines de mètres consécutifs de même couleur)
+                2. Croise avec l'onglet **Overlay** pour comprendre **pourquoi** : freinage plus tardif ? throttle plus tôt ? vitesse mini plus haute ?
+                3. Ça te dit qu'à ce virage spécifique, ce pilote a un **avantage technique** précis
+
+                ⚠️ La différence fondamentale avec la battle map vitesse :
+                - **Battle map vitesse** : où chacun **roule plus vite** (peut être trompeur)
+                - **Heatmap gain temps** : où chacun **gagne réellement du temps** (la vérité au chrono)
+                """)
+        except Exception as e:
+            st.warning(f"Impossible de calculer la heatmap de gain : {e}")
+
+    # --- TAB 2 : DELTA TIME ---
+    with tab2:
+        st.markdown(
+            "Écart de temps cumulé le long du tour. **Courbe au-dessus de zéro = {} devant** "
+            "(plus rapide à cet instant du tour), en-dessous = {} devant.".format(d1, d2)
+        )
+
+        try:
+            delta, ref_tel, comp_tel = delta_time(lap1, lap2)
+            # Convention FastF1 : delta = t(lap2) - t(lap1) = t(D2) - t(D1).
+            # delta > 0  =>  D2 met plus de temps  =>  D1 devant.
+            delta_arr = np.asarray(delta, dtype=float)
+            xd = ref_tel["Distance"]
+
+            fig = go.Figure()
+            # Zone D1 devant (delta > 0)
+            fig.add_trace(go.Scatter(
+                x=xd, y=np.where(delta_arr >= 0, delta_arr, 0.0),
+                mode="lines", line=dict(width=0), fill="tozeroy",
+                fillcolor=hex_to_rgba(c1, 0.30), name=f"{d1} devant", hoverinfo="skip",
+            ))
+            # Zone D2 devant (delta < 0)
+            fig.add_trace(go.Scatter(
+                x=xd, y=np.where(delta_arr < 0, delta_arr, 0.0),
+                mode="lines", line=dict(width=0), fill="tozeroy",
+                fillcolor=hex_to_rgba(c2, 0.30), name=f"{d2} devant", hoverinfo="skip",
+            ))
+            # Courbe réelle
+            fig.add_trace(go.Scatter(
+                x=xd, y=delta_arr, mode="lines", line=dict(color="white", width=2),
+                name="Δt cumulé",
+                hovertemplate="%{x:.0f} m<br>Δt %{y:+.3f} s<extra></extra>",
+            ))
+            fig.add_hline(y=0, line=dict(color="grey", dash="dash"))
+            fig.update_layout(
+                height=450, template="plotly_dark",
+                xaxis_title="Distance (m)",
+                yaxis_title=f"Δt (s) · + = {d1} devant",
+                hovermode="x unified",
+                legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+            )
+            plot(fig)
+        except Exception as e:
+            st.warning(f"Impossible de calculer le delta time : {e}")
+
+    # --- TAB CORNERS : VIRAGE PAR VIRAGE ---
+    with tab_corners:
+        st.markdown(
+            f"Pour chaque virage : **où** chacun commence à freiner, à quelle intensité, et **quand** il remet "
+            f"les gaz. C'est ici qu'on voit objectivement qui freine tard et qui sort fort. "
+            f"Analyse basée sur les tours sélectionnés dans la barre latérale."
+        )
+        if corners_df is None:
+            st.info("FastF1 ne fournit pas la position des virages pour ce circuit.")
+        else:
+            cdf = corners_df
+            lap_len = float(min(tel1["Distance"].max(), tel2["Distance"].max()))
+            bounds = _corner_bounds(cdf["Distance"].tolist(), lap_len)
+
+            rows = []
+            for (pb, nb), (_, c) in zip(bounds, cdf.iterrows()):
+                r1 = analyze_corner(tel1, float(c["Distance"]), pb, nb)
+                r2 = analyze_corner(tel2, float(c["Distance"]), pb, nb)
+                if r1 is None or r2 is None:
+                    continue
+                rows.append({
+                    "Virage": f"T{int(c['Number'])}{c['Letter']}",
+                    "Type": corner_class(max(r1["vmin"], r2["vmin"])),
+                    "frein1": r1["brake_before"], "frein2": r2["brake_before"],
+                    "g1": r1["max_g"], "g2": r2["max_g"],
+                    "vmin1": r1["vmin"], "vmin2": r2["vmin"],
+                    "gaz1": r1["throttle_after"], "gaz2": r2["throttle_after"],
+                })
+
+            if not rows:
+                st.warning("Impossible d'analyser les virages sur ces tours.")
+            else:
+                dfc = pd.DataFrame(rows)
+                for col in ["frein1", "frein2", "g1", "g2", "vmin1", "vmin2", "gaz1", "gaz2"]:
+                    dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
+                dfc["dfrein"] = dfc["frein2"] - dfc["frein1"]   # > 0 = D1 freine plus tard
+                dfc["dgaz"] = dfc["gaz2"] - dfc["gaz1"]         # > 0 = D1 remet les gaz plus tôt
+
+                # --- Verdicts synthétiques ---
+                vf = dfc.dropna(subset=["dfrein"])
+                vg = dfc.dropna(subset=["dgaz"])
+                col_v1, col_v2 = st.columns(2)
+                with col_v1:
+                    st.markdown("##### 🛑 Freinage")
+                    if len(vf):
+                        l1 = int((vf["dfrein"] > 5).sum())
+                        l2 = int((vf["dfrein"] < -5).sum())
+                        m = vf["dfrein"].mean()
+                        leader = d1 if m > 0 else d2
+                        st.markdown(
+                            f"- **{d1}** freine plus tard sur **{l1}** virage(s), **{d2}** sur **{l2}** "
+                            f"(égalité ±5 m sur les autres)\n"
+                            f"- En moyenne, **{leader}** retarde son freinage de **{abs(m):.0f} m**"
+                        )
+                    else:
+                        st.markdown("Pas de virage freiné comparable.")
+                with col_v2:
+                    st.markdown("##### 🚀 Remise des gaz")
+                    if len(vg):
+                        e1 = int((vg["dgaz"] > 5).sum())
+                        e2 = int((vg["dgaz"] < -5).sum())
+                        m = vg["dgaz"].mean()
+                        leader = d1 if m > 0 else d2
+                        st.markdown(
+                            f"- **{d1}** remet les gaz plus tôt sur **{e1}** virage(s), **{d2}** sur **{e2}**\n"
+                            f"- En moyenne, **{leader}** repasse à fond **{abs(m):.0f} m** plus tôt"
+                        )
+                    else:
+                        st.markdown("Pas de remise des gaz comparable.")
+
+                # --- Agrégats par type de virage ---
+                agg = dfc.groupby("Type").agg(
+                    n=("Virage", "count"),
+                    d_frein_moy=("dfrein", "mean"),
+                    d_gaz_moy=("dgaz", "mean"),
+                ).reindex(["Lent", "Moyen", "Rapide"]).dropna(how="all")
+                agg = agg.rename(columns={
+                    "n": "Virages",
+                    "d_frein_moy": f"Δ frein moy (m, + = {d1} plus tard)",
+                    "d_gaz_moy": f"Δ gaz moy (m, + = {d1} plus tôt)",
+                })
+                st.markdown("##### Par type de virage")
+                st.dataframe(agg.round(1), width="stretch")
+
+                # --- Graphique par virage ---
+                fig_c = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
+                    subplot_titles=(
+                        f"Δ point de freinage (m) — barre couleur {d1} = {d1} freine plus tard",
+                        f"Δ remise des gaz (m) — barre couleur {d1} = {d1} remet plus tôt",
+                    ),
+                )
+                fig_c.add_trace(go.Bar(
+                    x=dfc["Virage"], y=dfc["dfrein"],
+                    marker_color=[c1 if (pd.notna(v) and v > 0) else c2 for v in dfc["dfrein"]],
+                    hovertemplate="%{x}<br>Δ frein: %{y:+.0f} m<extra></extra>",
+                ), row=1, col=1)
+                fig_c.add_trace(go.Bar(
+                    x=dfc["Virage"], y=dfc["dgaz"],
+                    marker_color=[c1 if (pd.notna(v) and v > 0) else c2 for v in dfc["dgaz"]],
+                    hovertemplate="%{x}<br>Δ gaz: %{y:+.0f} m<extra></extra>",
+                ), row=2, col=1)
+                fig_c.add_hline(y=0, line=dict(color="white", width=0.8), row=1, col=1)
+                fig_c.add_hline(y=0, line=dict(color="white", width=0.8), row=2, col=1)
+                fig_c.update_layout(height=550, template="plotly_dark", showlegend=False,
+                                    margin=dict(t=60, b=20, l=20, r=20))
+                plot(fig_c)
+
+                # --- Tableau détaillé ---
+                disp = pd.DataFrame({
+                    "Virage": dfc["Virage"], "Type": dfc["Type"],
+                    f"Frein {d1} (m)": dfc["frein1"].round(0),
+                    f"Frein {d2} (m)": dfc["frein2"].round(0),
+                    f"g max {d1}": dfc["g1"].round(1),
+                    f"g max {d2}": dfc["g2"].round(1),
+                    f"Vmin {d1}": dfc["vmin1"].round(0),
+                    f"Vmin {d2}": dfc["vmin2"].round(0),
+                    f"Gaz {d1} (m)": dfc["gaz1"].round(0),
+                    f"Gaz {d2} (m)": dfc["gaz2"].round(0),
+                })
+                with st.expander("📋 Tableau détaillé par virage"):
+                    st.dataframe(disp, width="stretch", hide_index=True,
+                                 height=min(38 * (len(disp) + 1) + 3, 600))
+                    st.caption(
+                        "**Frein** = distance avant l'apex où le freinage démarre (petit = freine tard). "
+                        "**Gaz** = distance après l'apex où le throttle repasse ≥90 % (petit ou négatif = sort fort). "
+                        "**—** = virage pris à fond. ⚠️ Échantillonnage télémétrie ~4-5 Hz : précision ±10-15 m "
+                        "à haute vitesse — les écarts <5 m ne sont pas significatifs, les tendances sur "
+                        "l'ensemble du tour le sont."
+                    )
+
+    # --- TAB 3 : SIGNATURES ---
+    with tab3:
+        st.markdown("Métriques chiffrées qui caractérisent le style de chaque pilote sur le tour sélectionné.")
+
+        sig1 = style_sig(tel1, d1)
+        sig2 = style_sig(tel2, d2)
+        df = pd.DataFrame([sig1, sig2]).set_index("Pilote").T
+        df["Δ (D1−D2)"] = (df[d1] - df[d2]).round(2)
+
+        st.dataframe(df, width="stretch", height=320)
+
+        # Interprétation
+        with st.expander("💡 Comment lire ces signatures"):
+            st.markdown("""
+            - **`% temps full throttle`** plus élevé = style **binaire/agressif** (rotation-style typique).
+            - **`% temps en coast`** plus élevé = pilote qui **module** entre frein et gaz, joue avec le rotation de l'arrière. Signature classique Verstappen.
+            - **`Throttle ramp-up`** élevé = réapplication brutale du gaz (Verstappen). Bas = progression lisse (Hamilton, Norris).
+            - **`V_min médiane courbes`** élevée = style **momentum** (porte de la vitesse en courbe, Norris, Hamilton). Basse = style **rotation** (V-shape, Verstappen).
+            - **`Nb phases de freinage`** : indicateur indirect du nombre de virages où on freine. Diffère peu entre 2 pilotes sur même circuit, mais utile pour repérer des freinages "manqués" ou ajoutés.
+            """)
+
+    # --- TAB GG : DIAGRAMME G-G (CERCLE DE FRICTION) ---
+    with tab_gg:
+        st.markdown(
+            "Le **cercle de friction** : accélération latérale vs longitudinale sur tout le tour. "
+            "C'est la représentation canonique du style de pilotage — un pilote *V-shape* dessine "
+            "une croix (freinage roues droites, puis rotation), un pilote *momentum* remplit les "
+            "diagonales basses (trail-braking = frein et charge latérale simultanés). "
+            "Basé sur les tours sélectionnés dans la barre latérale."
+        )
+
+        gg1 = gg2 = None
+        try:
+            with st.spinner("Reconstruction des accélérations…"):
+                gg1 = compute_gg(lap1)
+                gg2 = compute_gg(lap2)
+        except Exception as e:
+            st.warning(f"Impossible de calculer le diagramme g-g : {e}")
+
+        if gg1 is None or gg2 is None:
+            if gg1 is not None or gg2 is not None:
+                st.warning("Flux position X/Y insuffisant pour un des deux tours — "
+                           "essaie un autre tour ou une autre session.")
+        else:
+            fig_gg = go.Figure()
+
+            # Cercles de référence 1 à 5 g
+            for r in range(1, 6):
+                fig_gg.add_shape(type="circle", x0=-r, y0=-r, x1=r, y1=r,
+                                 line=dict(color="rgba(255,255,255,0.15)", width=1, dash="dot"))
+                fig_gg.add_annotation(x=0, y=r, text=f"{r}g", showarrow=False, yshift=8,
+                                      font=dict(color="rgba(255,255,255,0.35)", size=10))
+
+            for gg, drv, col in [(gg1, d1, c1), (gg2, d2, c2)]:
+                fig_gg.add_trace(go.Scatter(
+                    x=gg["a_lat"], y=gg["a_long"], mode="markers",
+                    marker=dict(color=col, size=3, opacity=0.25),
+                    name=f"{drv} — points", legendgroup=drv,
+                    customdata=gg["s"],
+                    hovertemplate=(f"<b>{drv}</b><br>Distance: %{{customdata:.0f}} m<br>"
+                                   "a_lat: %{x:+.2f} g<br>a_long: %{y:+.2f} g<extra></extra>"),
+                ))
+                env = gg_envelope(gg["a_lat"], gg["a_long"])
+                if env is not None:
+                    fig_gg.add_trace(go.Scatter(
+                        x=env[0], y=env[1], mode="lines",
+                        line=dict(color=col, width=2.5),
+                        name=f"{drv} — enveloppe p95", legendgroup=drv,
+                        hoverinfo="skip",
+                    ))
+
+            fig_gg.update_xaxes(title="Accélération latérale (g) · gauche ← → droite",
+                                scaleanchor="y", scaleratio=1,
+                                zeroline=True, zerolinecolor="rgba(255,255,255,0.3)")
+            fig_gg.update_yaxes(title="Accélération longitudinale (g) · ↓ freinage / traction ↑",
+                                zeroline=True, zerolinecolor="rgba(255,255,255,0.3)")
+            fig_gg.update_layout(height=700, template="plotly_dark",
+                                 legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center"),
+                                 margin=dict(t=30, b=20, l=20, r=20))
+            plot(fig_gg)
+
+            # --- Métriques dérivées ---
+            def gg_metrics(gg):
+                a_lat, a_long = gg["a_lat"], gg["a_long"]
+                braking = a_long < -1.0                       # freinage effectif
+                trail = braking & (np.abs(a_lat) > 1.5)       # freinage en appui = trail-braking
+                neg = a_long[a_long < 0]
+                return {
+                    "g_brake": float(np.percentile(-neg, 99)) if neg.size else np.nan,
+                    "g_lat": float(np.percentile(np.abs(a_lat), 99)),
+                    "trail_pct": float(trail.sum() / braking.sum() * 100) if braking.any() else np.nan,
+                }
+
+            def _fmt(v, unit):
+                return f"{v:.2f}{unit}" if pd.notna(v) else "—"
+
+            met1, met2 = gg_metrics(gg1), gg_metrics(gg2)
+            col_a, col_b = st.columns(2)
+            for col, drv, met in [(col_a, d1, met1), (col_b, d2, met2)]:
+                with col:
+                    st.markdown(f"#### {drv}")
+                    st.metric("g freinage max (p99)", _fmt(met["g_brake"], " g"))
+                    st.metric("g latéral max (p99)", _fmt(met["g_lat"], " g"))
+                    st.metric("Trail-braking (part du freinage avec >1.5 g latéral)",
+                              f"{met['trail_pct']:.0f} %" if pd.notna(met["trail_pct"]) else "—")
+
+            with st.expander("💡 Comment lire le diagramme g-g (et limites)"):
+                st.markdown(f"""
+                **Les deux archétypes** :
+                - **V-shape (rotation)** : croix marquée — le gros du freinage se fait roues
+                  droites (branche basse pure), la rotation à basse vitesse, puis traction.
+                  Diagonales basses peu remplies, % trail-braking bas. Signature typique Verstappen.
+                - **Momentum** : diagonales basses remplies — le pilote garde du frein en entrée
+                  de virage pendant que la charge latérale monte. Enveloppe plus « ronde »,
+                  % trail-braking élevé. Signature Norris / Hamilton.
+
+                **À croiser avec** :
+                - l'onglet **🧠 Virage par virage** : % trail-braking élevé + freinages tardifs
+                  = late braker qui gère la rotation au frein. % bas + vmin élevées = momentum
+                  pur qui prépare ses entrées.
+                - l'**asymétrie gauche/droite** du nuage reflète simplement le circuit
+                  (sens de rotation, répartition des virages) — comparez la *forme*, pas
+                  l'orientation.
+                - l'**enveloppe p95** : si celle de {d1} englobe celle de {d2} dans un quadrant,
+                  {d1} exploite plus de grip dans cette phase (ou sa voiture en offre plus).
+
+                ⚠️ **Limites** : position GPS ~4-5 Hz interpolée → les valeurs absolues sont
+                indicatives (±10-15 %), le dénivelé n'est pas pris en compte (la compression
+                d'Eau Rouge gonfle localement les g) et le lissage écrête les pics très brefs.
+                La **comparaison relative** entre deux pilotes sur le même tour reste valide —
+                c'est l'usage prévu. Comme pour l'onglet virage par virage : lisez les
+                tendances, pas le centième.
+                """)
+
+    # --- TAB 4 : ZOOM ---
+    with tab4:
+        st.markdown("Zoome sur une portion spécifique du circuit pour décortiquer un virage.")
+
+        max_dist = int(min(tel1["Distance"].max(), tel2["Distance"].max()))
+
+        # Presets alimentés par les zones du briefing circuit (CIRCUITS_INFO)
+        def _snap(v):
+            return int(round(v / 50.0) * 50)
+
+        presets = {"— Personnalisé —": None}
+        if circuit_info_data:
+            for z_name, z_turns, z_s, z_e, _ in circuit_info_data["zones"]:
+                start = max(0, min(_snap(z_s), max_dist))
+                end = max(0, min(_snap(z_e), max_dist))
+                if start < end:
+                    presets[f"{z_name} ({z_turns})"] = (start, end)
+
+        def _apply_zoom_preset():
+            rng = presets.get(st.session_state.get("zoom_preset"))
+            if rng:
+                st.session_state.zoom_range = rng
+                st.session_state.zoom_label = st.session_state.zoom_preset
+
+        # État initial + clamp (au cas où on a changé de circuit avec un ancien range)
+        default_range = (int(max_dist * 0.1), int(max_dist * 0.25))
+        lo, hi = st.session_state.get("zoom_range", default_range)
+        lo, hi = max(0, min(int(lo), max_dist)), max(0, min(int(hi), max_dist))
+        if lo >= hi:
+            lo, hi = default_range
+        st.session_state.zoom_range = (lo, hi)
+        st.session_state.setdefault("zoom_label", "Zoom virage")
+
+        col_z1, col_z2 = st.columns(2)
+        with col_z1:
+            st.selectbox(
+                "Zone prédéfinie",
+                options=list(presets.keys()),
+                key="zoom_preset",
+                on_change=_apply_zoom_preset,
+                help="Zones du briefing circuit — sélectionne puis affine avec le slider.",
+            )
+        with col_z2:
+            z_label = st.text_input("Étiquette de la section", key="zoom_label")
+
+        z_range = st.slider(
+            "Plage de distance (m)",
+            min_value=0, max_value=max_dist,
+            step=50,
+            key="zoom_range",
+        )
+
+        z_start, z_end = z_range
+        m1 = (tel1["Distance"] > z_start) & (tel1["Distance"] < z_end)
+        m2 = (tel2["Distance"] > z_start) & (tel2["Distance"] < z_end)
+
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+            subplot_titles=("Vitesse", "Throttle", "Frein"),
+        )
+        for i, ch in enumerate(["Speed", "Throttle", "Brake"], start=1):
+            fig.add_trace(go.Scatter(x=tel1.loc[m1, "Distance"], y=_chan(tel1.loc[m1], ch),
+                                     name=d1, line=dict(color=c1, width=2),
+                                     legendgroup=d1, showlegend=(i == 1)),
+                          row=i, col=1)
+            fig.add_trace(go.Scatter(x=tel2.loc[m2, "Distance"], y=_chan(tel2.loc[m2], ch),
+                                     name=d2, line=dict(color=c2, width=2),
+                                     legendgroup=d2, showlegend=(i == 1)),
+                          row=i, col=1)
+        fig.update_layout(height=600, template="plotly_dark", hovermode="x unified",
+                          title=f"{z_label} ({z_start}-{z_end} m)")
+        fig.update_xaxes(title_text="Distance (m)", row=3, col=1)
+        plot(fig)
+
+    # --- TAB 5 : SECTEURS ---
+    with tab5:
+        st.markdown("Comparaison secteur par secteur des tours sélectionnés.")
+
+        def _sec(td):
+            """Temps de secteur en secondes, nan si manquant (NaT arrive sur certains tours)."""
+            return td.total_seconds() if pd.notna(td) else np.nan
+
+        sectors_data = []
+        for i in (1, 2, 3):
+            s1_val = _sec(lap1[f"Sector{i}Time"])
+            s2_val = _sec(lap2[f"Sector{i}Time"])
+            if np.isnan(s1_val) or np.isnan(s2_val):
+                faster = "—"
+            else:
+                faster = d2 if s1_val > s2_val else d1
+            sectors_data.append({"Secteur": f"S{i}", d1: s1_val, d2: s2_val,
+                                 "Δ": s1_val - s2_val,
+                                 "Plus rapide": faster})
+        df_sec = pd.DataFrame(sectors_data).set_index("Secteur")
+
+        col_a, col_b = st.columns([1, 2])
+        with col_a:
+            st.dataframe(df_sec.round(3), width="stretch")
+        with col_b:
+            bar_colors = [c2 if d > 0 else c1 for d in df_sec["Δ"]]
+            fig = go.Figure(go.Bar(
+                x=df_sec.index, y=df_sec["Δ"],
+                marker_color=bar_colors,
+                text=[f"{d:+.3f}s" if pd.notna(d) else "—" for d in df_sec["Δ"]],
+                textposition="outside",
+            ))
+            fig.add_hline(y=0, line=dict(color="white"))
+            fig.update_layout(
+                height=400, template="plotly_dark",
+                yaxis_title=f"Δ {d1} − {d2} (s)",
+                title=f"Écart par secteur ({d2 if df_sec['Δ'].sum() > 0 else d1} plus rapide au total)",
+            )
+            plot(fig)
+
+    # --- TAB STINT : ÉVOLUTION COURSE ---
+    with tab_stint:
+        st.markdown("Évolution des temps au tour par relai pneu (stint). **Principalement utile en course** (R), mais marche aussi sur les longs runs FP2.")
+
+        def get_stint_laps(drv):
+            """Récupère les tours valides d'un pilote avec infos de stint.
+            FIX : exclusion des in-laps ET des out-laps — l'ancien filtre
+            `PitOutTime.isna() | (LapNumber > 1)` gardait quasiment tout et
+            polluait moyenne / écart-type / dégradation."""
+            laps_drv = session.laps.pick_drivers(drv)
+            valid = laps_drv.loc[laps_drv["LapTime"].notna()].copy()
+            if "PitOutTime" in valid.columns and "PitInTime" in valid.columns:
+                valid = valid.loc[valid["PitOutTime"].isna() & valid["PitInTime"].isna()]
+            valid["LapTimeSeconds"] = valid["LapTime"].dt.total_seconds()
+            return valid
+
+        laps_d1_s = get_stint_laps(d1)
+        laps_d2_s = get_stint_laps(d2)
+
+        if len(laps_d1_s) < 2 and len(laps_d2_s) < 2:
+            st.info("Pas assez de tours pour analyser l'évolution. Cet onglet est conçu pour les sessions de type course ou long-run.")
+        else:
+            # Option : filtrer les outliers (tours > médiane × 1.1)
+            col_opt1, col_opt2 = st.columns([1, 3])
+            with col_opt1:
+                filter_outliers = st.checkbox("Filtrer outliers", value=True,
+                                              help="Cache les tours > 110% de la médiane (sortie de piste, drapeau jaune, etc.)")
+
+            # --- Graphique principal ---
+            fig_stint = go.Figure()
+
+            for laps_drv, drv, line_color in [(laps_d1_s, d1, c1), (laps_d2_s, d2, c2)]:
+                if len(laps_drv) == 0:
+                    continue
+
+                # Filtre outliers
+                if filter_outliers and len(laps_drv) > 3:
+                    median = laps_drv["LapTimeSeconds"].median()
+                    laps_drv = laps_drv.loc[laps_drv["LapTimeSeconds"] < median * 1.10]
+
+                # Une trace par stint pour casser les lignes entre stints
+                if "Stint" in laps_drv.columns:
+                    stints_groups = laps_drv.groupby("Stint")
+                else:
+                    stints_groups = [(1, laps_drv)]
+
+                for stint_num, stint_laps in stints_groups:
+                    if len(stint_laps) == 0:
+                        continue
+                    compound = str(stint_laps["Compound"].iloc[0]) if "Compound" in stint_laps else "—"
+                    comp_col = compound_color(compound)
+
+                    fig_stint.add_trace(go.Scatter(
+                        x=stint_laps["LapNumber"],
+                        y=stint_laps["LapTimeSeconds"],
+                        mode="lines+markers",
+                        line=dict(color=line_color, width=2.5),
+                        marker=dict(
+                            color=comp_col, size=10,
+                            line=dict(color=line_color, width=2),
+                        ),
+                        name=f"{drv} - Stint {int(stint_num)} ({compound})",
+                        hovertemplate=(
+                            f"<b>{drv}</b><br>"
+                            "Tour %{x}<br>"
+                            "Temps: %{y:.3f}s<br>"
+                            f"Compound: {compound}<extra></extra>"
+                        ),
+                    ))
+
+            fig_stint.update_layout(
+                height=500, template="plotly_dark",
+                xaxis_title="Numéro de tour",
+                yaxis_title="Temps au tour (s)",
+                hovermode="closest",
+                legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+            )
+            plot(fig_stint)
+
+            # Légende des compounds visible
+            with st.expander("🛞 Légende des compounds", expanded=False):
+                cols = st.columns(5)
+                compounds_legend = [
+                    ("Soft", "#FF3333", "Le plus rapide, dégrade vite"),
+                    ("Medium", "#FFCC33", "Compromis vitesse/dégradation"),
+                    ("Hard", "#F0F0F0", "Le plus durable, moins de grip"),
+                    ("Intermediate", "#33B53C", "Pluie légère / piste humide"),
+                    ("Wet", "#4D7BC2", "Pluie soutenue"),
+                ]
+                for col, (name, color_, desc) in zip(cols, compounds_legend):
+                    col.markdown(f"<div style='background-color:{color_}; padding:6px 10px; border-radius:5px; color:#000; font-weight:bold; text-align:center'>{name}</div>", unsafe_allow_html=True)
+                    col.caption(desc)
+
+            st.markdown("---")
+            st.markdown("#### 📊 Statistiques par stint")
+
+            def compute_stint_stats(laps_drv, drv):
+                """Calcule les stats clés de chaque stint."""
+                if "Stint" not in laps_drv.columns or len(laps_drv) == 0:
+                    return []
+                stats = []
+                for stint_num, stint_laps in laps_drv.groupby("Stint"):
+                    if len(stint_laps) < 1:
+                        continue
+                    lt = stint_laps["LapTimeSeconds"].values
+                    # Régression linéaire pour la dégradation
+                    if len(lt) >= 3:
+                        n = np.arange(len(lt))
+                        slope, _ = np.polyfit(n, lt, 1)
+                        degrad = f"{slope*1000:+.1f} ms/tour"
+                    else:
+                        degrad = "—"
+                    compound = str(stint_laps["Compound"].iloc[0]) if "Compound" in stint_laps else "—"
+                    stats.append({
+                        "Pilote": drv,
+                        "Stint": int(stint_num),
+                        "Compound": compound,
+                        "Tours": len(stint_laps),
+                        "Best": f"{lt.min():.3f}s",
+                        "Moyenne": f"{lt.mean():.3f}s",
+                        "Écart-type": f"{lt.std():.3f}s" if len(lt) > 1 else "—",
+                        "Dégradation": degrad,
+                    })
+                return stats
+
+            all_stats = compute_stint_stats(laps_d1_s, d1) + compute_stint_stats(laps_d2_s, d2)
+            if all_stats:
+                df_stints = pd.DataFrame(all_stats)
+                st.dataframe(df_stints, width="stretch", hide_index=True)
+
+                with st.expander("💡 Comment lire ces stats"):
+                    st.markdown(f"""
+                    - **Best** : meilleur tour du stint — révèle la **pace pure** quand les pneus sont au top
+                    - **Moyenne** : pace réelle sur l'ensemble du stint — plus représentative pour comparer
+                    - **Écart-type** : indicateur de **consistance**. Bas = pilote métronome (Hamilton, Russell typiquement). Élevé = pilote qui prend des risques ou se bat avec sa voiture
+                    - **Dégradation** : pente de la régression linéaire (ms perdues par tour qui passe).
+                        - **< +30 ms/tour** : excellente gestion pneus (Verstappen, Hamilton historiquement)
+                        - **+30 à +80 ms/tour** : normal
+                        - **> +80 ms/tour** : pilote qui en demande trop à ses pneus, ou stratégie risquée
+
+                    **Crois ces deux infos** : un pilote avec un meilleur **Best** mais une moins bonne **Moyenne** est rapide quand il pousse mais ne tient pas — il sera défavorisé sur des longues séquences. C'est typiquement le profil "qualif > course".
+                    """)
+
+            # --- Bonus : différence de pace par tour ---
+            if len(laps_d1_s) > 5 and len(laps_d2_s) > 5:
+                st.markdown("---")
+                st.markdown("#### ⚔️ Différence de pace tour par tour")
+
+                # Aligne les deux pilotes sur les tours communs
+                common = pd.merge(
+                    laps_d1_s[["LapNumber", "LapTimeSeconds"]].rename(columns={"LapTimeSeconds": f"t_{d1}"}),
+                    laps_d2_s[["LapNumber", "LapTimeSeconds"]].rename(columns={"LapTimeSeconds": f"t_{d2}"}),
+                    on="LapNumber", how="inner",
+                )
+                common["delta"] = common[f"t_{d1}"] - common[f"t_{d2}"]
+
+                if len(common) > 0:
+                    fig_delta_stint = go.Figure()
+                    fig_delta_stint.add_trace(go.Bar(
+                        x=common["LapNumber"], y=common["delta"],
+                        marker_color=[c2 if d > 0 else c1 for d in common["delta"]],
+                        name=f"Δ {d1} − {d2}",
+                        hovertemplate="Tour %{x}<br>Δ: %{y:+.3f}s<extra></extra>",
+                    ))
+                    fig_delta_stint.add_hline(y=0, line=dict(color="white", width=0.8))
+                    fig_delta_stint.update_layout(
+                        height=350, template="plotly_dark",
+                        xaxis_title="Tour",
+                        yaxis_title=f"Δ {d1} − {d2} (s)",
+                        title=f"Barres positives = {d2} plus rapide · Barres négatives = {d1} plus rapide",
+                    )
+                    plot(fig_delta_stint)
+
+    # --- TAB CRAFT : ATTAQUE / DÉFENSE ---
+    with tab_craft:
+        ses_type = st.session_state.session_type
+        if ses_type not in ("R", "S"):
+            st.info("🥊 Le race craft (attaque, défense, dépassements) ne se mesure qu'en **course** ou en "
+                    "**sprint**. Charge une session R ou S pour cet onglet.")
+        else:
+            st.markdown(
+                "Qui attaque, qui défend, qui concrétise. Basé sur les écarts au passage de la ligne, "
+                "tour par tour, pour toute la course."
+            )
+            with st.spinner("Calcul des écarts tour par tour…"):
+                gaps = compute_race_gaps(st.session_state.year, st.session_state.gp_name, ses_type)
+            if gaps.empty:
+                st.warning("Pas de données de position exploitables pour cette session.")
+            else:
+                def craft_metrics(drv):
+                    g = gaps[gaps["Driver"] == drv].sort_values("LapNumber").reset_index(drop=True)
+                    if g.empty:
+                        return None
+                    g["NextPos"] = g["Position"].shift(-1)
+                    pit = g["PitInTime"].notna() | g["PitOutTime"].notna()
+                    clean = (~pit) & (~pit.shift(-1, fill_value=False)) & g["NextPos"].notna()
+                    press = clean & (g["GapBehind"] < 1.0)
+                    held = press & (g["NextPos"] <= g["Position"])
+                    attack = clean & (g["GapAhead"] < 1.0)
+                    conv = attack & (g["NextPos"] < g["Position"])
+                    gained = clean & (g["NextPos"] < g["Position"])
+                    lost = clean & (g["NextPos"] > g["Position"])
+                    return {
+                        "pos": g[["LapNumber", "Position"]],
+                        "press": int(press.sum()), "held": int(held.sum()),
+                        "attack": int(attack.sum()), "conv": int(conv.sum()),
+                        "gained": int(gained.sum()), "lost": int(lost.sum()),
+                    }
+
+                m1, m2 = craft_metrics(d1), craft_metrics(d2)
+                if m1 is None or m2 is None:
+                    st.warning("Un des deux pilotes n'a pas de données de course.")
+                else:
+                    # Évolution des positions
+                    fig_p = go.Figure()
+                    for m, drv, col in [(m1, d1, c1), (m2, d2, c2)]:
+                        fig_p.add_trace(go.Scatter(
+                            x=m["pos"]["LapNumber"], y=m["pos"]["Position"],
+                            mode="lines+markers", name=drv,
+                            line=dict(color=col, width=2.5), marker=dict(size=5),
+                            hovertemplate=f"<b>{drv}</b><br>Tour %{{x}}<br>P%{{y:.0f}}<extra></extra>",
+                        ))
+                    fig_p.update_layout(
+                        height=400, template="plotly_dark",
+                        xaxis_title="Tour", yaxis_title="Position",
+                        yaxis=dict(autorange="reversed", dtick=1),
+                        legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+                    )
+                    plot(fig_p)
+
+                    # Métriques attaque / défense
+                    def pct(a, b):
+                        return f"{a}/{b} ({a / b * 100:.0f} %)" if b else "—"
+
+                    col_a, col_b = st.columns(2)
+                    for col, m, drv in [(col_a, m1, d1), (col_b, m2, d2)]:
+                        with col:
+                            st.markdown(f"#### {drv}")
+                            st.metric("Tours sous pression (<1 s derrière)", m["press"])
+                            st.metric("Défenses réussies", pct(m["held"], m["press"]))
+                            st.metric("Tours à l'attaque (<1 s devant)", m["attack"])
+                            st.metric("Attaques converties en dépassement", pct(m["conv"], m["attack"]))
+                            st.metric("Positions gagnées / perdues en piste", f"+{m['gained']} / −{m['lost']}")
+
+                    with st.expander("💡 Comment lire (et limites)"):
+                        st.markdown("""
+                        - **Défenses réussies élevées** (>80 %) = pilote solide sous pression, place bien sa voiture.
+                        - **Conversion d'attaque élevée** = agressif ET efficace. Beaucoup de tours à l'attaque
+                          avec peu de conversions = suiveur qui n'ose pas, ou voiture sans top speed.
+                        - **Positions gagnées/perdues** : hors tours d'arrêt du pilote lui-même.
+
+                        ⚠️ **Limites** : écarts mesurés au passage de la ligne uniquement ; les arrêts des
+                        *autres* pilotes ne sont pas neutralisés (un undercut compte comme un dépassement) ;
+                        le trafic retardataire peut générer de la fausse "pression". À lire comme des
+                        **tendances**, pas une vérité au tour près.
+                        """)
+
+    # --- TAB FIT : AUTO VS CIRCUIT ---
+    with tab_fit:
+        st.markdown(
+            "La voiture aime-t-elle ce tracé ? Chaque pilote est comparé au **meilleur du plateau** "
+            "virage par virage (tours rapides), agrégé par type de virage, puis croisé avec la "
+            "typologie du circuit."
+        )
+        with st.spinner("Analyse du plateau complet (peut prendre quelques secondes)…"):
+            profile = field_corner_profile(
+                st.session_state.year, st.session_state.gp_name, st.session_state.session_type
+            )
+        if profile is None:
+            st.info("Pas de données virages disponibles pour ce circuit/session.")
+        else:
+            df_speeds, vmax_all = profile
+            best = df_speeds.max(axis=1)
+            classes = best.apply(corner_class)
+            counts = classes.value_counts().reindex(["Lent", "Moyen", "Rapide"]).fillna(0).astype(int)
+            dominant = counts.idxmax()
+
+            dominant_label = {"Lent": "lente", "Moyen": "moyenne", "Rapide": "rapide"}[dominant]
+            st.markdown(
+                f"**Typologie {ev['Location']}** : {counts.get('Lent', 0)} lent(s) · "
+                f"{counts.get('Moyen', 0)} moyen(s) · {counts.get('Rapide', 0)} rapide(s) "
+                f"→ dominante **{dominant_label}**"
+            )
+
+            fig_f = go.Figure()
+            verdicts = []
+            for drv, col in [(d1, c1), (d2, c2)]:
+                if drv not in df_speeds.columns:
+                    st.warning(f"Pas de tour rapide exploitable pour {drv}.")
+                    continue
+                deficit = best - df_speeds[drv]
+                agg = deficit.groupby(classes).mean().reindex(["Lent", "Moyen", "Rapide"])
+                fig_f.add_trace(go.Bar(
+                    x=agg.index, y=agg.values, name=drv, marker_color=col,
+                    hovertemplate=f"<b>{drv}</b><br>%{{x}} : −%{{y:.1f}} km/h vs meilleur<extra></extra>",
+                ))
+                valid = agg.dropna()
+                if len(valid) >= 2:
+                    strong, weak = valid.idxmin(), valid.idxmax()
+                    fit = ("✅ la typologie du circuit lui convient" if strong == dominant
+                           else "❌ typologie défavorable" if weak == dominant
+                           else "➖ typologie neutre pour lui")
+                    vmax_def = vmax_all.max() - vmax_all.get(drv, np.nan)
+                    verdicts.append(
+                        f"**{drv}** — à l'aise en virages **{strong.lower()}s** "
+                        f"(−{valid[strong]:.1f} km/h vs meilleur), en retrait en **{weak.lower()}s** "
+                        f"(−{valid[weak]:.1f}) · Vmax : −{vmax_def:.0f} km/h vs meilleur → {fit}"
+                    )
+
+            fig_f.update_layout(
+                height=420, template="plotly_dark", barmode="group",
+                yaxis_title="Déficit moyen vs meilleur du plateau (km/h)",
+                xaxis_title="Type de virage",
+                legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+            )
+            plot(fig_f)
+            for v in verdicts:
+                st.markdown(v)
+
+            with st.expander("💡 Comment lire (et limites)"):
+                st.markdown("""
+                - **Déficit faible en virages rapides** = voiture efficace en appui aéro.
+                - **Déficit faible en virages lents** = bon grip mécanique / traction.
+                - **Vmax proche du meilleur** = peu de traînée ou moteur fort.
+                - Croisé avec la dominante du circuit : une voiture forte en appui sur un tracé
+                  à dominante rapide (Suzuka, Silverstone) = circuit qui lui convient.
+
+                ⚠️ Ce benchmark mélange **voiture + pilote**. Pour isoler le pilote, l'astuce
+                classique : sélectionner les deux **coéquipiers** dans la barre latérale
+                (même voiture) et regarder l'onglet *Virage par virage*.
+                """)
+
+    # --- TAB 6 : RADAR ---
+    with tab6:
+        st.markdown("Compare jusqu'à 6 pilotes en visu radar. Idéal pour repérer des archétypes opposés.")
+
+        # FIX : si d1/d2 est NOR, HAM ou ALO, la liste par défaut contenait un doublon
+        # → index dupliqué après set_index("Pilote") → df_n.loc[drv] renvoyait un
+        # DataFrame (pas de .tolist()) → AttributeError. dict.fromkeys déduplique
+        # en préservant l'ordre.
+        default_radar = list(dict.fromkeys(
+            d for d in [d1, d2, "NOR", "HAM", "ALO"] if d in drivers_in_session
+        ))[:5]
+        drivers_radar = st.multiselect(
+            "Pilotes",
+            options=drivers_in_session,
+            default=default_radar,
+            max_selections=6,
+            format_func=lambda x: driver_full.get(x, x),
+        )
+        drivers_radar = list(dict.fromkeys(drivers_radar))  # ceinture + bretelles
+
+        if len(drivers_radar) < 2:
+            st.warning("Sélectionne au moins 2 pilotes.")
+        else:
+            def sig_for(drv):
+                lap = session.laps.pick_drivers(drv).pick_fastest()
+                if lap is None or pd.isna(lap.get("LapTime")):
+                    return None
+                tel = lap.get_car_data().add_distance()
+                # FIX : mean() d'un array vide → nan, et nan est truthy, donc
+                # l'ancien `... .mean() or 0` ne protégeait rien. Garde explicite.
+                dthr = np.diff(tel["Throttle"].values)
+                rising = dthr[dthr > 0]
+                ramp = float(rising.mean()) if rising.size else 0.0
+                return {
+                    "Pilote": drv,
+                    "Vmax": float(tel["Speed"].max()),
+                    "V_min courbes": float(tel.loc[tel["Speed"] < tel["Speed"].quantile(0.30), "Speed"].median()),
+                    "Full throttle %": float((tel["Throttle"] >= 99).mean() * 100),
+                    "Coast time %": float(((tel["Throttle"] < 5) & (tel["Brake"] == 0)).mean() * 100),
+                    "Brake %": float((tel["Brake"] > 0).mean() * 100),
+                    "Throttle ramp-up": ramp,
+                }
+
+            sigs = [s for s in (sig_for(d) for d in drivers_radar) if s is not None]
+            if not sigs:
+                st.error("Aucun pilote avec données valides.")
+            else:
+                df_m = pd.DataFrame(sigs).set_index("Pilote")
+                # Normalisation 0-1
+                df_n = (df_m - df_m.min()) / (df_m.max() - df_m.min() + 1e-9)
+
+                fig = go.Figure()
+                for drv in df_n.index:
+                    vals = df_n.loc[drv].tolist()
+                    vals += vals[:1]
+                    labels = df_n.columns.tolist() + [df_n.columns[0]]
+                    fig.add_trace(go.Scatterpolar(
+                        r=vals, theta=labels, fill="toself",
+                        name=drv, line=dict(color=driver_color(drv), width=2),
+                        opacity=0.7,
+                    ))
+                fig.update_layout(
+                    height=600, template="plotly_dark",
+                    polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False)),
+                    title="Signatures de style — comparaison normalisée",
+                )
+                plot(fig)
+
+                with st.expander("Valeurs brutes"):
+                    st.dataframe(df_m.round(2), width="stretch")
+
+# ============== PAGE : TIMING SESSION ==============
+def page_timing():
+    """Récap de session façon écran de timing : ordre d'arrivée, intervalles,
+    pneus, meilleur tour, dernier tour bouclé et secteurs (derniers + records
+    perso), badges couleur équipe, fonds violet (record session) / vert
+    (record perso). Les mini-secteurs n'existent que dans le flux live
+    SignalR — absents des données post-session FastF1, donc non affichés."""
+    st.markdown(f"## 📊 Timing — {SESSION_LABELS.get(st.session_state.session_type, st.session_state.session_type)}")
+
+    VIOLET_BG = "background-color: #7C3AED; color: #FFFFFF; font-weight: bold; border-radius: 6px; text-align: center"
+    GREEN_BG = "background-color: #22C55E; color: #111111; font-weight: bold; border-radius: 6px; text-align: center"
     _EPS = pd.Timedelta(milliseconds=1)
-
-    def _fmt_lap(td):
-        if pd.isna(td):
-            return "—"
-        s = td.total_seconds()
-        return f"{int(s // 60)}:{s % 60:06.3f}"
-
-    def _fmt_sec(td):
-        return f"{td.total_seconds():.3f}" if pd.notna(td) else "—"
+    is_race = st.session_state.session_type in ("R", "S")
 
     laps_all = session.laps
-    # Les tours supprimés (track limits) ne comptent pas pour les records
     laps_ok = laps_all[laps_all["Deleted"] != True] if "Deleted" in laps_all.columns else laps_all
-
-    # Records absolus de la session (→ violet)
     sess_best = {
         "lap": laps_ok["LapTime"].min(),
         "S1": laps_ok["Sector1Time"].min(),
@@ -1088,1270 +2406,169 @@ with tab_sheet:
         "S3": laps_ok["Sector3Time"].min(),
     }
 
+    # Résultats officiels (positions d'arrivée, écarts, statuts) si disponibles
+    try:
+        results = session.results
+        if results is None or results.empty or results["Position"].isna().all():
+            results = None
+    except Exception:
+        results = None
+
+    def _res_for(drv):
+        if results is None:
+            return None
+        m = results[results["Abbreviation"] == drv]
+        return m.iloc[0] if len(m) else None
+
     rows = []
     for drv in laps_all["Driver"].dropna().unique():
-        ld = laps_ok[laps_ok["Driver"] == drv]
-        timed = ld[ld["LapTime"].notna()]
-        if timed.empty:
+        ld_raw = laps_all[laps_all["Driver"] == drv]
+        ld_ok = laps_ok[laps_ok["Driver"] == drv]
+        timed_ok = ld_ok[ld_ok["LapTime"].notna()]
+        timed_raw = ld_raw[ld_raw["LapTime"].notna()].sort_values("LapNumber")
+        if timed_raw.empty:
             continue
-        best = timed.loc[timed["LapTime"].idxmin()]
-        b1, b2, b3 = ld["Sector1Time"].min(), ld["Sector2Time"].min(), ld["Sector3Time"].min()
-        theo = b1 + b2 + b3 if (pd.notna(b1) and pd.notna(b2) and pd.notna(b3)) else pd.NaT
-        speed_cols = [c for c in ("SpeedST", "SpeedFL", "SpeedI1", "SpeedI2") if c in ld.columns]
-        if speed_cols and ld[speed_cols].notna().any().any():
-            vmax_drv = float(np.nanmax(ld[speed_cols].values.astype(float)))
-        else:
-            vmax_drv = np.nan
-        try:
-            info = session.get_driver(drv)
-            name, team = info.get("FullName", drv), info.get("TeamName", "—")
-        except Exception:
-            name, team = drv, "—"
+        best_td = timed_ok["LapTime"].min() if len(timed_ok) else pd.NaT
+        last = timed_raw.iloc[-1]
+        # Pneu courant : compound + âge du dernier tour
+        comp = str(last.get("Compound", "—")) if pd.notna(last.get("Compound")) else "—"
+        tyre_age = int(last["TyreLife"]) if pd.notna(last.get("TyreLife")) else None
+        res = _res_for(drv)
         rows.append({
-            "Code": drv, "Pilote": name, "Équipe": team,
-            "_best": best["LapTime"].total_seconds(),
-            "best_td": best["LapTime"],
-            "s1": b1, "s2": b2, "s3": b3, "theo": theo,
-            "vmax": vmax_drv,
-            "Pneu": best.get("Compound", "—") if pd.notna(best.get("Compound")) else "—",
-            "Tours": int(timed["LapNumber"].nunique()),
+            "drv": drv,
+            "res_pos": float(res["Position"]) if res is not None and pd.notna(res.get("Position")) else np.nan,
+            "res_time": res.get("Time") if res is not None else pd.NaT,
+            "res_status": str(res.get("Status", "")) if res is not None else "",
+            "best": best_td,
+            "best_s": best_td.total_seconds() if pd.notna(best_td) else np.inf,
+            "last_lap": last["LapTime"],
+            "lS1": last.get("Sector1Time"), "lS2": last.get("Sector2Time"), "lS3": last.get("Sector3Time"),
+            "bS1": ld_ok["Sector1Time"].min(), "bS2": ld_ok["Sector2Time"].min(), "bS3": ld_ok["Sector3Time"].min(),
+            "pb_lap": best_td,
+            "comp": comp, "tyre_age": tyre_age,
+            "pits": int(ld_raw["PitInTime"].notna().sum()),
+            "laps": int(timed_raw["LapNumber"].nunique()),
         })
 
     if not rows:
         st.info("Aucun tour chronométré dans cette session.")
+        return
+
+    dfr = pd.DataFrame(rows)
+    # Ordre : positions officielles si dispo, sinon meilleur tour
+    if is_race and dfr["res_pos"].notna().any():
+        dfr = dfr.sort_values(["res_pos", "best_s"], na_position="last")
     else:
-        dft = pd.DataFrame(rows).sort_values("_best").reset_index(drop=True)
-        leader = dft["_best"].iloc[0]
-
-        disp = pd.DataFrame({
-            "Pos": dft.index + 1,
-            "Pilote": dft["Code"] if MOBILE else dft["Pilote"],
-            "Équipe": dft["Équipe"],
-            "Meilleur tour": dft["best_td"].apply(_fmt_lap),
-            "Écart": ["—"] + [f"+{t - leader:.3f}" for t in dft["_best"].iloc[1:]],
-            "S1": dft["s1"].apply(_fmt_sec),
-            "S2": dft["s2"].apply(_fmt_sec),
-            "S3": dft["s3"].apply(_fmt_sec),
-            "Théorique": dft["theo"].apply(_fmt_lap),
-            "Δ théo": [f"+{(b - t.total_seconds()):.3f}" if pd.notna(t) else "—"
-                       for b, t in zip(dft["_best"], dft["theo"])],
-            "Vmax": [f"{v:.0f}" if pd.notna(v) else "—" for v in dft["vmax"]],
-            "Pneu": dft["Pneu"],
-            "Tours": dft["Tours"],
-        })
-
-        styles = pd.DataFrame("", index=disp.index, columns=disp.columns)
-        purple_css = f"color: {PURPLE}; font-weight: bold"
-
-        def _mark_purple(col_disp, series_td, best_td):
-            if pd.isna(best_td):
-                return
-            m = series_td.notna() & ((series_td - best_td).abs() < _EPS)
-            styles.loc[m.values, col_disp] = purple_css
-
-        _mark_purple("S1", dft["s1"], sess_best["S1"])
-        _mark_purple("S2", dft["s2"], sess_best["S2"])
-        _mark_purple("S3", dft["s3"], sess_best["S3"])
-        _mark_purple("Meilleur tour", dft["best_td"], sess_best["lap"])
-
-        # Surligne les deux pilotes sélectionnés, comme le classement du haut
-        for drv_sel, colr in ((d1, c1), (d2, c2)):
-            mask = (dft["Code"] == drv_sel).values
-            if mask.any():
-                for c in disp.columns:
-                    cur = styles.loc[mask, c].iloc[0]
-                    styles.loc[mask, c] = (cur + "; " if cur else "") + f"background-color: {colr}30"
-
-        # Mode compact : colonnes essentielles seulement (le tableau complet
-        # reste à un toggle de distance dans la sidebar)
-        if MOBILE:
-            keep = ["Pos", "Pilote", "Meilleur tour", "Écart", "S1", "S2", "S3", "Δ théo", "Pneu"]
-            disp, styles = disp[keep], styles[keep]
-
-        show_table(
-            disp.style.apply(lambda _: styles, axis=None),
-            height=min(38 * (len(disp) + 1) + 3, 700),
-        )
-        st.caption(
-            "**Théorique** = somme des meilleurs secteurs individuels du pilote · "
-            "**Δ théo** = temps laissé sur la table (meilleur tour réel − tour théorique) · "
-            "**Vmax** = vitesse de pointe max relevée (speed traps), en km/h. "
-            "Les tours supprimés (track limits) sont exclus des records."
-        )
-
-        # --- Recap tour par tour des deux pilotes sélectionnés ---
-        st.markdown("---")
-        st.markdown(f"#### 📜 Recap tour par tour — {d1} vs {d2}")
-        st.caption(
-            "🟣 Violet = record de la session · 🟢 vert = record perso · "
-            "OUT = sortie des stands, IN = rentre aux stands · ligne barrée = tour supprimé."
-        )
-
-        def _render_laps_recap(drv):
-            ld = laps_all[laps_all["Driver"] == drv].sort_values("LapNumber")
-            ld = ld[ld["LapTime"].notna()].reset_index(drop=True)
-            if ld.empty:
-                st.info(f"Pas de tour chronométré pour {drv}.")
-                return
-            deleted = (ld["Deleted"] == True).values if "Deleted" in ld.columns \
-                else np.zeros(len(ld), dtype=bool)
-
-            # Records perso (hors tours supprimés)
-            ok = ld[~deleted]
-            pb = {
-                "lap": ok["LapTime"].min() if len(ok) else pd.NaT,
-                "S1": ok["Sector1Time"].min() if len(ok) else pd.NaT,
-                "S2": ok["Sector2Time"].min() if len(ok) else pd.NaT,
-                "S3": ok["Sector3Time"].min() if len(ok) else pd.NaT,
-            }
-
-            notes = []
-            for _, r in ld.iterrows():
-                n = []
-                if pd.notna(r.get("PitOutTime")):
-                    n.append("OUT")
-                if pd.notna(r.get("PitInTime")):
-                    n.append("IN")
-                notes.append("/".join(n))
-
-            rec = pd.DataFrame({
-                "Tour": ld["LapNumber"].astype(int).values,
-                "Temps": [_fmt_lap(t) for t in ld["LapTime"]],
-                "S1": [_fmt_sec(t) for t in ld["Sector1Time"]],
-                "S2": [_fmt_sec(t) for t in ld["Sector2Time"]],
-                "S3": [_fmt_sec(t) for t in ld["Sector3Time"]],
-                "Pneu": [str(c)[:1] if pd.notna(c) else "—" for c in ld["Compound"]],
-                "Note": notes,
-            })
-
-            sty = pd.DataFrame("", index=rec.index, columns=rec.columns)
-            for col_disp, col_src, key in [("Temps", "LapTime", "lap"),
-                                           ("S1", "Sector1Time", "S1"),
-                                           ("S2", "Sector2Time", "S2"),
-                                           ("S3", "Sector3Time", "S3")]:
-                s = ld[col_src]
-                if pd.notna(pb[key]):
-                    m_pers = s.notna() & ((s - pb[key]).abs() < _EPS)
-                    sty.loc[m_pers.values, col_disp] = f"color: {GREEN}; font-weight: bold"
-                if pd.notna(sess_best[key]):
-                    m_sess = s.notna() & ((s - sess_best[key]).abs() < _EPS)
-                    # le violet (record session) écrase le vert (record perso)
-                    sty.loc[m_sess.values, col_disp] = f"color: {PURPLE}; font-weight: bold"
-            if deleted.any():
-                for c in rec.columns:
-                    sty.loc[deleted, c] = sty.loc[deleted, c] + "; text-decoration: line-through; opacity: 0.45"
-
-            show_table(
-                rec.style.apply(lambda _: sty, axis=None),
-                height=min(38 * (len(rec) + 1) + 3, 560),
-            )
-
-        if MOBILE:
-            st.markdown(f"##### {d1}")
-            _render_laps_recap(d1)
-            st.markdown(f"##### {d2}")
-            _render_laps_recap(d2)
-        else:
-            col_l, col_r = st.columns(2)
-            with col_l:
-                st.markdown(f"##### {d1}")
-                _render_laps_recap(d1)
-            with col_r:
-                st.markdown(f"##### {d2}")
-                _render_laps_recap(d2)
-
-# --- TAB 1 : OVERLAY ---
-with tab1:
-    st.markdown("Vitesse, throttle, frein et rapport superposés sur la distance — survole les courbes pour les valeurs précises.")
-
-    fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-        subplot_titles=("Vitesse (km/h)", "Throttle (%)", "Frein", "Rapport"),
-    )
-    channels = ["Speed", "Throttle", "Brake", "nGear"]
-    for i, ch in enumerate(channels, start=1):
-        fig.add_trace(go.Scatter(
-            x=tel1["Distance"], y=_chan(tel1, ch), name=d1,
-            line=dict(color=c1, width=1.8),
-            legendgroup=d1, showlegend=(i == 1),
-        ), row=i, col=1)
-        fig.add_trace(go.Scatter(
-            x=tel2["Distance"], y=_chan(tel2, ch), name=d2,
-            line=dict(color=c2, width=1.8),
-            legendgroup=d2, showlegend=(i == 1),
-        ), row=i, col=1)
-
-    # Lignes verticales aux virages
-    if corners_df is not None:
-        for _, corner in corners_df.iterrows():
-            for r in range(1, 5):
-                fig.add_vline(x=corner["Distance"], line=dict(color="white", width=0.5, dash="dot"),
-                              opacity=0.2, row=r, col=1)
-        # Annotations virages sur le subplot du bas
-        fig.update_xaxes(
-            tickvals=corners_df["Distance"].tolist(),
-            ticktext=[f"T{int(c['Number'])}{c['Letter']}" for _, c in corners_df.iterrows()],
-            row=4, col=1,
-        )
-
-    fig.update_layout(
-        height=750, template="plotly_dark",
-        hovermode="x unified",
-        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
-        margin=dict(t=40, b=20, l=20, r=20),
-    )
-    fig.update_xaxes(title_text="Virage" if corners_df is not None else "Distance (m)", row=4, col=1)
-    plot(fig)
-
-# --- TAB MAP : VUE CIRCUIT ---
-with tab_map:
-    st.markdown("Le tracé du circuit, colorié selon le paramètre choisi. Repère **où** chaque pilote roule fort, où il freine, où il prend du temps.")
-
-    # Télémétrie complète avec X/Y (position GPS sur le tracé)
-    tel1_full = lap1.get_telemetry()
-    tel2_full = lap2.get_telemetry()
-
-    color_by = st.radio(
-        "Colorer par",
-        options=["Speed", "Throttle", "Brake", "nGear"],
-        format_func=lambda x: {"Speed": "Vitesse", "Throttle": "Throttle",
-                               "Brake": "Frein", "nGear": "Rapport"}[x],
-        horizontal=True,
-        key="map_color_by",
-    )
-
-    # Échelle commune aux deux pilotes pour comparabilité
-    vals1, vals2 = _chan(tel1_full, color_by), _chan(tel2_full, color_by)
-    vmin = float(min(vals1.min(), vals2.min()))
-    vmax = float(max(vals1.max(), vals2.max()))
-    colorscale = "Plasma" if color_by == "Speed" else "Viridis"
-
-    # Côte à côte sur desktop, empilés en mode compact (sinon chaque tracé
-    # devient un timbre-poste sur un écran de téléphone)
-    if MOBILE:
-        fig_map = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
-            vertical_spacing=0.06,
-        )
-    else:
-        fig_map = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
-            horizontal_spacing=0.04,
-        )
-    for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
-        r, c = (i, 1) if MOBILE else (1, i)
-        fig_map.add_trace(go.Scatter(
-            x=tel["X"], y=tel["Y"],
-            mode="markers",
-            marker=dict(
-                color=vals,
-                colorscale=colorscale,
-                cmin=vmin, cmax=vmax,
-                size=4,
-                showscale=(i == 2),
-                colorbar=dict(
-                    title=dict(text=color_by, side="right"),
-                    thickness=12, x=1.02,
-                ) if i == 2 else None,
-            ),
-            showlegend=False,
-            hovertemplate=f"{color_by}: %{{marker.color:.0f}}<extra></extra>",
-        ), row=r, col=c)
-    # Aspect ratio égal pour ne pas déformer le tracé
-    # (le subplot i utilise les axes x{i}/y{i} quelle que soit l'orientation)
-    for i in (1, 2):
-        r, c = (i, 1) if MOBILE else (1, i)
-        fig_map.update_xaxes(scaleanchor=f"y{i if i > 1 else ''}", scaleratio=1,
-                             showticklabels=False, showgrid=False, zeroline=False,
-                             row=r, col=c)
-        fig_map.update_yaxes(showticklabels=False, showgrid=False, zeroline=False,
-                             row=r, col=c)
-    fig_map.update_layout(height=850 if MOBILE else 550, template="plotly_dark",
-                          margin=dict(t=50, b=20, l=20, r=80))
-    plot(fig_map)
-
-    # --- Battle map : qui est plus rapide à chaque endroit du tracé ---
-    st.markdown("---")
-    st.markdown("#### ⚔️ Battle map — qui est plus rapide à chaque point du tracé")
-    st.caption(
-        f"Couleur {d1} = {d1} plus rapide à ce point · Couleur {d2} = {d2} plus rapide · "
-        f"Blanc = égalité. L'intensité de la couleur = ampleur de l'écart."
-    )
-
-    # Interpole la vitesse de tel2 sur la grille de distance de tel1 pour pouvoir comparer
-    tel2_speed_aligned = np.interp(
-        tel1_full["Distance"].values,
-        tel2_full["Distance"].values,
-        tel2_full["Speed"].values,
-    )
-    speed_delta = tel1_full["Speed"].values - tel2_speed_aligned
-
-    # Custom colorscale : c2 (négatif, d2 plus rapide) → blanc (0) → c1 (positif, d1 plus rapide)
-    custom_scale = [
-        [0.0, hex_to_rgb_str(c2)],
-        [0.5, "rgb(255,255,255)"],
-        [1.0, hex_to_rgb_str(c1)],
-    ]
-    # Échelle symétrique pour que 0 = blanc soit toujours au milieu
-    abs_max = float(np.percentile(np.abs(speed_delta), 95))  # robuste aux outliers
-
-    fig_battle = go.Figure(go.Scatter(
-        x=tel1_full["X"], y=tel1_full["Y"],
-        mode="markers",
-        marker=dict(
-            color=speed_delta,
-            colorscale=custom_scale,
-            cmin=-abs_max, cmax=abs_max,
-            size=6,
-            colorbar=dict(
-                title=dict(text="Δ vitesse<br>(km/h)", side="right"),
-                thickness=12,
-            ),
-        ),
-        hovertemplate=f"Δ vitesse ({d1}−{d2}): %{{marker.color:+.1f}} km/h<extra></extra>",
-    ))
-    fig_battle.update_xaxes(scaleanchor="y", scaleratio=1,
-                            showticklabels=False, showgrid=False, zeroline=False)
-    fig_battle.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
-    fig_battle.update_layout(height=600, template="plotly_dark",
-                             margin=dict(t=20, b=20, l=20, r=80))
-    plot(fig_battle)
-
-    with st.expander("💡 Comment lire la battle map vitesse"):
-        st.markdown(f"""
-        - **Zones colorées {d1}** : {d1} était plus rapide à cet endroit précis du tracé
-        - **Zones colorées {d2}** : {d2} était plus rapide
-        - **Zones blanches** : vitesses quasi identiques (égalité ou écart < 5 km/h)
-        - **L'intensité** : plus la couleur est saturée, plus l'écart est grand à cet endroit
-
-        ⚠️ **Attention** : la vitesse ne dit pas tout. Un pilote peut être plus rapide à un point précis mais avoir perdu du temps juste avant. Pour ça, regarde la heatmap de gain de temps ci-dessous.
-        """)
-
-    # --- Heatmap de gain/perte de temps ---
-    st.markdown("---")
-    st.markdown("#### 🌡️ Heatmap du gain de temps — qui prend du temps, où exactement")
-    st.caption(
-        "Mesure le **gain de temps local** à chaque point du tracé (dérivée du delta time cumulé "
-        "par rapport à la distance, en ms par mètre). Bien plus parlant que la vitesse seule : "
-        "un pilote peut être plus rapide à un point mais avoir perdu du temps juste avant. "
-        "Ici on lit le **temps réellement gagné**, mètre par mètre."
-    )
-
-    try:
-        delta_t, ref_tel_dt, _ = delta_time(lap1, lap2)
-        dist_dt = np.asarray(ref_tel_dt["Distance"], dtype=float)
-        # Gain local en s/m : gradient PAR RAPPORT À LA DISTANCE — sinon un gain
-        # "par échantillon" est biaisé (un échantillon couvre plus de mètres à
-        # haute vitesse qu'à basse vitesse).
-        local_gain = np.gradient(np.asarray(delta_t, dtype=float), dist_dt)
-        local_gain = np.nan_to_num(local_gain, nan=0.0, posinf=0.0, neginf=0.0)
-        # Lissage léger pour atténuer le bruit
-        local_gain_smooth = uniform_filter1d(local_gain, size=15)
-
-        # FIX : delta_time() renvoie du car data SANS colonnes X/Y. Impossible de
-        # tracer ref_tel_dt["X"] directement (KeyError → l'ancienne version tombait
-        # systématiquement dans le except). On projette le gain sur la télémétrie
-        # complète de lap1, qui contient la position sur le tracé.
-        gain_ms = np.interp(tel1_full["Distance"].values, dist_dt, local_gain_smooth) * 1000
-
-        # Convention : delta = t(D2) − t(D1). delta > 0 = D1 devant (cumulé).
-        # gradient > 0 = l'avance de D1 grandit = D1 gagne du temps ici.
-        custom_scale_time = [
-            [0.0, hex_to_rgb_str(c2)],   # gradient < 0 = D2 gagne
-            [0.5, "rgb(255,255,255)"],
-            [1.0, hex_to_rgb_str(c1)],   # gradient > 0 = D1 gagne
-        ]
-        abs_max_gain = max(float(np.percentile(np.abs(gain_ms), 95)), 1e-3)  # garde-fou
-
-        fig_heat = go.Figure(go.Scatter(
-            x=tel1_full["X"], y=tel1_full["Y"],
-            mode="markers",
-            marker=dict(
-                color=gain_ms,
-                colorscale=custom_scale_time,
-                cmin=-abs_max_gain, cmax=abs_max_gain,
-                size=6,
-                colorbar=dict(
-                    title=dict(text="Gain local<br>(ms/m)", side="right"),
-                    thickness=12,
-                    tickformat=".1f",
-                ),
-            ),
-            hovertemplate="Gain local: %{marker.color:+.2f} ms/m<extra></extra>",
-        ))
-        fig_heat.update_xaxes(scaleanchor="y", scaleratio=1,
-                              showticklabels=False, showgrid=False, zeroline=False)
-        fig_heat.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
-        fig_heat.update_layout(height=600, template="plotly_dark",
-                               margin=dict(t=20, b=20, l=20, r=80))
-        plot(fig_heat)
-
-        # Top zones de gain — dédupliquées (>=150 m entre deux zones), avec le
-        # virage le plus proche pour se repérer
-        gain_d1 = local_gain_smooth * 1000   # D1 gagne quand gradient > 0
-        gain_d2 = -gain_d1                   # D2 gagne quand gradient < 0
-        col_a, col_b = st.columns(2)
-        for col, drv, g in [(col_a, d1, gain_d1), (col_b, d2, gain_d2)]:
-            with col:
-                st.markdown(f"**🔝 Top zones de gain pour {drv}**")
-                idxs = _top_zones(g, dist_dt, k=3, min_sep=150.0)
-                if not idxs:
-                    st.markdown("- Aucune zone de gain nette sur ce tour.")
-                for i in idxs:
-                    st.markdown(
-                        f"- Distance {dist_dt[i]:.0f} m{_nearest_corner(dist_dt[i])} : "
-                        f"**+{g[i]:.1f} ms/m**"
-                    )
-
-        with st.expander("💡 Comment lire la heatmap de gain de temps"):
-            st.markdown(f"""
-            **C'est la visu la plus précise pour comprendre où la course se joue.**
-
-            - **Zone colorée {d1}** : {d1} **gagne du temps** sur ce mètre de circuit (que ce soit en étant plus rapide en vitesse ou en ayant un meilleur angle d'attaque qui ouvre la suite)
-            - **Zone colorée {d2}** : {d2} **gagne du temps** ici
-            - **Zone blanche** : ils sont à égalité sur ce micro-segment
-            - **Intensité** : ampleur du gain (en ms par **mètre** de circuit — comparable partout, y compris entre lignes droites et virages lents)
-
-            **Combo gagnant à analyser** :
-            1. Repère les **clusters** de couleur sur la heatmap (plusieurs dizaines de mètres consécutifs de même couleur)
-            2. Croise avec l'onglet **Overlay** pour comprendre **pourquoi** : freinage plus tardif ? throttle plus tôt ? vitesse mini plus haute ?
-            3. Ça te dit qu'à ce virage spécifique, ce pilote a un **avantage technique** précis
-
-            ⚠️ La différence fondamentale avec la battle map vitesse :
-            - **Battle map vitesse** : où chacun **roule plus vite** (peut être trompeur)
-            - **Heatmap gain temps** : où chacun **gagne réellement du temps** (la vérité au chrono)
-            """)
-    except Exception as e:
-        st.warning(f"Impossible de calculer la heatmap de gain : {e}")
-
-# --- TAB 2 : DELTA TIME ---
-with tab2:
-    st.markdown(
-        "Écart de temps cumulé le long du tour. **Courbe au-dessus de zéro = {} devant** "
-        "(plus rapide à cet instant du tour), en-dessous = {} devant.".format(d1, d2)
-    )
-
-    try:
-        delta, ref_tel, comp_tel = delta_time(lap1, lap2)
-        # Convention FastF1 : delta = t(lap2) - t(lap1) = t(D2) - t(D1).
-        # delta > 0  =>  D2 met plus de temps  =>  D1 devant.
-        delta_arr = np.asarray(delta, dtype=float)
-        xd = ref_tel["Distance"]
-
-        fig = go.Figure()
-        # Zone D1 devant (delta > 0)
-        fig.add_trace(go.Scatter(
-            x=xd, y=np.where(delta_arr >= 0, delta_arr, 0.0),
-            mode="lines", line=dict(width=0), fill="tozeroy",
-            fillcolor=hex_to_rgba(c1, 0.30), name=f"{d1} devant", hoverinfo="skip",
-        ))
-        # Zone D2 devant (delta < 0)
-        fig.add_trace(go.Scatter(
-            x=xd, y=np.where(delta_arr < 0, delta_arr, 0.0),
-            mode="lines", line=dict(width=0), fill="tozeroy",
-            fillcolor=hex_to_rgba(c2, 0.30), name=f"{d2} devant", hoverinfo="skip",
-        ))
-        # Courbe réelle
-        fig.add_trace(go.Scatter(
-            x=xd, y=delta_arr, mode="lines", line=dict(color="white", width=2),
-            name="Δt cumulé",
-            hovertemplate="%{x:.0f} m<br>Δt %{y:+.3f} s<extra></extra>",
-        ))
-        fig.add_hline(y=0, line=dict(color="grey", dash="dash"))
-        fig.update_layout(
-            height=450, template="plotly_dark",
-            xaxis_title="Distance (m)",
-            yaxis_title=f"Δt (s) · + = {d1} devant",
-            hovermode="x unified",
-            legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
-        )
-        plot(fig)
-    except Exception as e:
-        st.warning(f"Impossible de calculer le delta time : {e}")
-
-# --- TAB CORNERS : VIRAGE PAR VIRAGE ---
-with tab_corners:
-    st.markdown(
-        f"Pour chaque virage : **où** chacun commence à freiner, à quelle intensité, et **quand** il remet "
-        f"les gaz. C'est ici qu'on voit objectivement qui freine tard et qui sort fort. "
-        f"Analyse basée sur les tours sélectionnés dans la barre latérale."
-    )
-    if corners_df is None:
-        st.info("FastF1 ne fournit pas la position des virages pour ce circuit.")
-    else:
-        cdf = corners_df
-        lap_len = float(min(tel1["Distance"].max(), tel2["Distance"].max()))
-        bounds = _corner_bounds(cdf["Distance"].tolist(), lap_len)
-
-        rows = []
-        for (pb, nb), (_, c) in zip(bounds, cdf.iterrows()):
-            r1 = analyze_corner(tel1, float(c["Distance"]), pb, nb)
-            r2 = analyze_corner(tel2, float(c["Distance"]), pb, nb)
-            if r1 is None or r2 is None:
-                continue
-            rows.append({
-                "Virage": f"T{int(c['Number'])}{c['Letter']}",
-                "Type": corner_class(max(r1["vmin"], r2["vmin"])),
-                "frein1": r1["brake_before"], "frein2": r2["brake_before"],
-                "g1": r1["max_g"], "g2": r2["max_g"],
-                "vmin1": r1["vmin"], "vmin2": r2["vmin"],
-                "gaz1": r1["throttle_after"], "gaz2": r2["throttle_after"],
-            })
-
-        if not rows:
-            st.warning("Impossible d'analyser les virages sur ces tours.")
-        else:
-            dfc = pd.DataFrame(rows)
-            for col in ["frein1", "frein2", "g1", "g2", "vmin1", "vmin2", "gaz1", "gaz2"]:
-                dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
-            dfc["dfrein"] = dfc["frein2"] - dfc["frein1"]   # > 0 = D1 freine plus tard
-            dfc["dgaz"] = dfc["gaz2"] - dfc["gaz1"]         # > 0 = D1 remet les gaz plus tôt
-
-            # --- Verdicts synthétiques ---
-            vf = dfc.dropna(subset=["dfrein"])
-            vg = dfc.dropna(subset=["dgaz"])
-            col_v1, col_v2 = st.columns(2)
-            with col_v1:
-                st.markdown("##### 🛑 Freinage")
-                if len(vf):
-                    l1 = int((vf["dfrein"] > 5).sum())
-                    l2 = int((vf["dfrein"] < -5).sum())
-                    m = vf["dfrein"].mean()
-                    leader = d1 if m > 0 else d2
-                    st.markdown(
-                        f"- **{d1}** freine plus tard sur **{l1}** virage(s), **{d2}** sur **{l2}** "
-                        f"(égalité ±5 m sur les autres)\n"
-                        f"- En moyenne, **{leader}** retarde son freinage de **{abs(m):.0f} m**"
-                    )
-                else:
-                    st.markdown("Pas de virage freiné comparable.")
-            with col_v2:
-                st.markdown("##### 🚀 Remise des gaz")
-                if len(vg):
-                    e1 = int((vg["dgaz"] > 5).sum())
-                    e2 = int((vg["dgaz"] < -5).sum())
-                    m = vg["dgaz"].mean()
-                    leader = d1 if m > 0 else d2
-                    st.markdown(
-                        f"- **{d1}** remet les gaz plus tôt sur **{e1}** virage(s), **{d2}** sur **{e2}**\n"
-                        f"- En moyenne, **{leader}** repasse à fond **{abs(m):.0f} m** plus tôt"
-                    )
-                else:
-                    st.markdown("Pas de remise des gaz comparable.")
-
-            # --- Agrégats par type de virage ---
-            agg = dfc.groupby("Type").agg(
-                n=("Virage", "count"),
-                d_frein_moy=("dfrein", "mean"),
-                d_gaz_moy=("dgaz", "mean"),
-            ).reindex(["Lent", "Moyen", "Rapide"]).dropna(how="all")
-            agg = agg.rename(columns={
-                "n": "Virages",
-                "d_frein_moy": f"Δ frein moy (m, + = {d1} plus tard)",
-                "d_gaz_moy": f"Δ gaz moy (m, + = {d1} plus tôt)",
-            })
-            st.markdown("##### Par type de virage")
-            st.dataframe(agg.round(1), width="stretch")
-
-            # --- Graphique par virage ---
-            fig_c = make_subplots(
-                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
-                subplot_titles=(
-                    f"Δ point de freinage (m) — barre couleur {d1} = {d1} freine plus tard",
-                    f"Δ remise des gaz (m) — barre couleur {d1} = {d1} remet plus tôt",
-                ),
-            )
-            fig_c.add_trace(go.Bar(
-                x=dfc["Virage"], y=dfc["dfrein"],
-                marker_color=[c1 if (pd.notna(v) and v > 0) else c2 for v in dfc["dfrein"]],
-                hovertemplate="%{x}<br>Δ frein: %{y:+.0f} m<extra></extra>",
-            ), row=1, col=1)
-            fig_c.add_trace(go.Bar(
-                x=dfc["Virage"], y=dfc["dgaz"],
-                marker_color=[c1 if (pd.notna(v) and v > 0) else c2 for v in dfc["dgaz"]],
-                hovertemplate="%{x}<br>Δ gaz: %{y:+.0f} m<extra></extra>",
-            ), row=2, col=1)
-            fig_c.add_hline(y=0, line=dict(color="white", width=0.8), row=1, col=1)
-            fig_c.add_hline(y=0, line=dict(color="white", width=0.8), row=2, col=1)
-            fig_c.update_layout(height=550, template="plotly_dark", showlegend=False,
-                                margin=dict(t=60, b=20, l=20, r=20))
-            plot(fig_c)
-
-            # --- Tableau détaillé ---
-            disp = pd.DataFrame({
-                "Virage": dfc["Virage"], "Type": dfc["Type"],
-                f"Frein {d1} (m)": dfc["frein1"].round(0),
-                f"Frein {d2} (m)": dfc["frein2"].round(0),
-                f"g max {d1}": dfc["g1"].round(1),
-                f"g max {d2}": dfc["g2"].round(1),
-                f"Vmin {d1}": dfc["vmin1"].round(0),
-                f"Vmin {d2}": dfc["vmin2"].round(0),
-                f"Gaz {d1} (m)": dfc["gaz1"].round(0),
-                f"Gaz {d2} (m)": dfc["gaz2"].round(0),
-            })
-            with st.expander("📋 Tableau détaillé par virage"):
-                st.dataframe(disp, width="stretch", hide_index=True,
-                             height=min(38 * (len(disp) + 1) + 3, 600))
-                st.caption(
-                    "**Frein** = distance avant l'apex où le freinage démarre (petit = freine tard). "
-                    "**Gaz** = distance après l'apex où le throttle repasse ≥90 % (petit ou négatif = sort fort). "
-                    "**—** = virage pris à fond. ⚠️ Échantillonnage télémétrie ~4-5 Hz : précision ±10-15 m "
-                    "à haute vitesse — les écarts <5 m ne sont pas significatifs, les tendances sur "
-                    "l'ensemble du tour le sont."
-                )
-
-# --- TAB 3 : SIGNATURES ---
-with tab3:
-    st.markdown("Métriques chiffrées qui caractérisent le style de chaque pilote sur le tour sélectionné.")
-
-    sig1 = style_sig(tel1, d1)
-    sig2 = style_sig(tel2, d2)
-    df = pd.DataFrame([sig1, sig2]).set_index("Pilote").T
-    df["Δ (D1−D2)"] = (df[d1] - df[d2]).round(2)
-
-    st.dataframe(df, width="stretch", height=320)
-
-    # Interprétation
-    with st.expander("💡 Comment lire ces signatures"):
-        st.markdown("""
-        - **`% temps full throttle`** plus élevé = style **binaire/agressif** (rotation-style typique).
-        - **`% temps en coast`** plus élevé = pilote qui **module** entre frein et gaz, joue avec le rotation de l'arrière. Signature classique Verstappen.
-        - **`Throttle ramp-up`** élevé = réapplication brutale du gaz (Verstappen). Bas = progression lisse (Hamilton, Norris).
-        - **`V_min médiane courbes`** élevée = style **momentum** (porte de la vitesse en courbe, Norris, Hamilton). Basse = style **rotation** (V-shape, Verstappen).
-        - **`Nb phases de freinage`** : indicateur indirect du nombre de virages où on freine. Diffère peu entre 2 pilotes sur même circuit, mais utile pour repérer des freinages "manqués" ou ajoutés.
-        """)
-
-# --- TAB GG : DIAGRAMME G-G (CERCLE DE FRICTION) ---
-with tab_gg:
-    st.markdown(
-        "Le **cercle de friction** : accélération latérale vs longitudinale sur tout le tour. "
-        "C'est la représentation canonique du style de pilotage — un pilote *V-shape* dessine "
-        "une croix (freinage roues droites, puis rotation), un pilote *momentum* remplit les "
-        "diagonales basses (trail-braking = frein et charge latérale simultanés). "
-        "Basé sur les tours sélectionnés dans la barre latérale."
-    )
-
-    gg1 = gg2 = None
-    try:
-        with st.spinner("Reconstruction des accélérations…"):
-            gg1 = compute_gg(lap1)
-            gg2 = compute_gg(lap2)
-    except Exception as e:
-        st.warning(f"Impossible de calculer le diagramme g-g : {e}")
-
-    if gg1 is None or gg2 is None:
-        if gg1 is not None or gg2 is not None:
-            st.warning("Flux position X/Y insuffisant pour un des deux tours — "
-                       "essaie un autre tour ou une autre session.")
-    else:
-        fig_gg = go.Figure()
-
-        # Cercles de référence 1 à 5 g
-        for r in range(1, 6):
-            fig_gg.add_shape(type="circle", x0=-r, y0=-r, x1=r, y1=r,
-                             line=dict(color="rgba(255,255,255,0.15)", width=1, dash="dot"))
-            fig_gg.add_annotation(x=0, y=r, text=f"{r}g", showarrow=False, yshift=8,
-                                  font=dict(color="rgba(255,255,255,0.35)", size=10))
-
-        for gg, drv, col in [(gg1, d1, c1), (gg2, d2, c2)]:
-            fig_gg.add_trace(go.Scatter(
-                x=gg["a_lat"], y=gg["a_long"], mode="markers",
-                marker=dict(color=col, size=3, opacity=0.25),
-                name=f"{drv} — points", legendgroup=drv,
-                customdata=gg["s"],
-                hovertemplate=(f"<b>{drv}</b><br>Distance: %{{customdata:.0f}} m<br>"
-                               "a_lat: %{x:+.2f} g<br>a_long: %{y:+.2f} g<extra></extra>"),
-            ))
-            env = gg_envelope(gg["a_lat"], gg["a_long"])
-            if env is not None:
-                fig_gg.add_trace(go.Scatter(
-                    x=env[0], y=env[1], mode="lines",
-                    line=dict(color=col, width=2.5),
-                    name=f"{drv} — enveloppe p95", legendgroup=drv,
-                    hoverinfo="skip",
-                ))
-
-        fig_gg.update_xaxes(title="Accélération latérale (g) · gauche ← → droite",
-                            scaleanchor="y", scaleratio=1,
-                            zeroline=True, zerolinecolor="rgba(255,255,255,0.3)")
-        fig_gg.update_yaxes(title="Accélération longitudinale (g) · ↓ freinage / traction ↑",
-                            zeroline=True, zerolinecolor="rgba(255,255,255,0.3)")
-        fig_gg.update_layout(height=700, template="plotly_dark",
-                             legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center"),
-                             margin=dict(t=30, b=20, l=20, r=20))
-        plot(fig_gg)
-
-        # --- Métriques dérivées ---
-        def gg_metrics(gg):
-            a_lat, a_long = gg["a_lat"], gg["a_long"]
-            braking = a_long < -1.0                       # freinage effectif
-            trail = braking & (np.abs(a_lat) > 1.5)       # freinage en appui = trail-braking
-            neg = a_long[a_long < 0]
-            return {
-                "g_brake": float(np.percentile(-neg, 99)) if neg.size else np.nan,
-                "g_lat": float(np.percentile(np.abs(a_lat), 99)),
-                "trail_pct": float(trail.sum() / braking.sum() * 100) if braking.any() else np.nan,
-            }
-
-        def _fmt(v, unit):
-            return f"{v:.2f}{unit}" if pd.notna(v) else "—"
-
-        met1, met2 = gg_metrics(gg1), gg_metrics(gg2)
-        col_a, col_b = st.columns(2)
-        for col, drv, met in [(col_a, d1, met1), (col_b, d2, met2)]:
-            with col:
-                st.markdown(f"#### {drv}")
-                st.metric("g freinage max (p99)", _fmt(met["g_brake"], " g"))
-                st.metric("g latéral max (p99)", _fmt(met["g_lat"], " g"))
-                st.metric("Trail-braking (part du freinage avec >1.5 g latéral)",
-                          f"{met['trail_pct']:.0f} %" if pd.notna(met["trail_pct"]) else "—")
-
-        with st.expander("💡 Comment lire le diagramme g-g (et limites)"):
-            st.markdown(f"""
-            **Les deux archétypes** :
-            - **V-shape (rotation)** : croix marquée — le gros du freinage se fait roues
-              droites (branche basse pure), la rotation à basse vitesse, puis traction.
-              Diagonales basses peu remplies, % trail-braking bas. Signature typique Verstappen.
-            - **Momentum** : diagonales basses remplies — le pilote garde du frein en entrée
-              de virage pendant que la charge latérale monte. Enveloppe plus « ronde »,
-              % trail-braking élevé. Signature Norris / Hamilton.
-
-            **À croiser avec** :
-            - l'onglet **🧠 Virage par virage** : % trail-braking élevé + freinages tardifs
-              = late braker qui gère la rotation au frein. % bas + vmin élevées = momentum
-              pur qui prépare ses entrées.
-            - l'**asymétrie gauche/droite** du nuage reflète simplement le circuit
-              (sens de rotation, répartition des virages) — comparez la *forme*, pas
-              l'orientation.
-            - l'**enveloppe p95** : si celle de {d1} englobe celle de {d2} dans un quadrant,
-              {d1} exploite plus de grip dans cette phase (ou sa voiture en offre plus).
-
-            ⚠️ **Limites** : position GPS ~4-5 Hz interpolée → les valeurs absolues sont
-            indicatives (±10-15 %), le dénivelé n'est pas pris en compte (la compression
-            d'Eau Rouge gonfle localement les g) et le lissage écrête les pics très brefs.
-            La **comparaison relative** entre deux pilotes sur le même tour reste valide —
-            c'est l'usage prévu. Comme pour l'onglet virage par virage : lisez les
-            tendances, pas le centième.
-            """)
-
-# --- TAB 4 : ZOOM ---
-with tab4:
-    st.markdown("Zoome sur une portion spécifique du circuit pour décortiquer un virage.")
-
-    max_dist = int(min(tel1["Distance"].max(), tel2["Distance"].max()))
-
-    # Presets alimentés par les zones du briefing circuit (CIRCUITS_INFO)
-    def _snap(v):
-        return int(round(v / 50.0) * 50)
-
-    presets = {"— Personnalisé —": None}
-    if circuit_info_data:
-        for z_name, z_turns, z_s, z_e, _ in circuit_info_data["zones"]:
-            start = max(0, min(_snap(z_s), max_dist))
-            end = max(0, min(_snap(z_e), max_dist))
-            if start < end:
-                presets[f"{z_name} ({z_turns})"] = (start, end)
-
-    def _apply_zoom_preset():
-        rng = presets.get(st.session_state.get("zoom_preset"))
-        if rng:
-            st.session_state.zoom_range = rng
-            st.session_state.zoom_label = st.session_state.zoom_preset
-
-    # État initial + clamp (au cas où on a changé de circuit avec un ancien range)
-    default_range = (int(max_dist * 0.1), int(max_dist * 0.25))
-    lo, hi = st.session_state.get("zoom_range", default_range)
-    lo, hi = max(0, min(int(lo), max_dist)), max(0, min(int(hi), max_dist))
-    if lo >= hi:
-        lo, hi = default_range
-    st.session_state.zoom_range = (lo, hi)
-    st.session_state.setdefault("zoom_label", "Zoom virage")
-
-    col_z1, col_z2 = st.columns(2)
-    with col_z1:
-        st.selectbox(
-            "Zone prédéfinie",
-            options=list(presets.keys()),
-            key="zoom_preset",
-            on_change=_apply_zoom_preset,
-            help="Zones du briefing circuit — sélectionne puis affine avec le slider.",
-        )
-    with col_z2:
-        z_label = st.text_input("Étiquette de la section", key="zoom_label")
-
-    z_range = st.slider(
-        "Plage de distance (m)",
-        min_value=0, max_value=max_dist,
-        step=50,
-        key="zoom_range",
-    )
-
-    z_start, z_end = z_range
-    m1 = (tel1["Distance"] > z_start) & (tel1["Distance"] < z_end)
-    m2 = (tel2["Distance"] > z_start) & (tel2["Distance"] < z_end)
-
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-        subplot_titles=("Vitesse", "Throttle", "Frein"),
-    )
-    for i, ch in enumerate(["Speed", "Throttle", "Brake"], start=1):
-        fig.add_trace(go.Scatter(x=tel1.loc[m1, "Distance"], y=_chan(tel1.loc[m1], ch),
-                                 name=d1, line=dict(color=c1, width=2),
-                                 legendgroup=d1, showlegend=(i == 1)),
-                      row=i, col=1)
-        fig.add_trace(go.Scatter(x=tel2.loc[m2, "Distance"], y=_chan(tel2.loc[m2], ch),
-                                 name=d2, line=dict(color=c2, width=2),
-                                 legendgroup=d2, showlegend=(i == 1)),
-                      row=i, col=1)
-    fig.update_layout(height=600, template="plotly_dark", hovermode="x unified",
-                      title=f"{z_label} ({z_start}-{z_end} m)")
-    fig.update_xaxes(title_text="Distance (m)", row=3, col=1)
-    plot(fig)
-
-# --- TAB 5 : SECTEURS ---
-with tab5:
-    st.markdown("Comparaison secteur par secteur des tours sélectionnés.")
-
-    def _sec(td):
-        """Temps de secteur en secondes, nan si manquant (NaT arrive sur certains tours)."""
-        return td.total_seconds() if pd.notna(td) else np.nan
-
-    sectors_data = []
-    for i in (1, 2, 3):
-        s1_val = _sec(lap1[f"Sector{i}Time"])
-        s2_val = _sec(lap2[f"Sector{i}Time"])
-        if np.isnan(s1_val) or np.isnan(s2_val):
-            faster = "—"
-        else:
-            faster = d2 if s1_val > s2_val else d1
-        sectors_data.append({"Secteur": f"S{i}", d1: s1_val, d2: s2_val,
-                             "Δ": s1_val - s2_val,
-                             "Plus rapide": faster})
-    df_sec = pd.DataFrame(sectors_data).set_index("Secteur")
-
-    col_a, col_b = st.columns([1, 2])
-    with col_a:
-        st.dataframe(df_sec.round(3), width="stretch")
-    with col_b:
-        bar_colors = [c2 if d > 0 else c1 for d in df_sec["Δ"]]
-        fig = go.Figure(go.Bar(
-            x=df_sec.index, y=df_sec["Δ"],
-            marker_color=bar_colors,
-            text=[f"{d:+.3f}s" if pd.notna(d) else "—" for d in df_sec["Δ"]],
-            textposition="outside",
-        ))
-        fig.add_hline(y=0, line=dict(color="white"))
-        fig.update_layout(
-            height=400, template="plotly_dark",
-            yaxis_title=f"Δ {d1} − {d2} (s)",
-            title=f"Écart par secteur ({d2 if df_sec['Δ'].sum() > 0 else d1} plus rapide au total)",
-        )
-        plot(fig)
-
-# --- TAB STINT : ÉVOLUTION COURSE ---
-with tab_stint:
-    st.markdown("Évolution des temps au tour par relai pneu (stint). **Principalement utile en course** (R), mais marche aussi sur les longs runs FP2.")
-
-    def get_stint_laps(drv):
-        """Récupère les tours valides d'un pilote avec infos de stint.
-        FIX : exclusion des in-laps ET des out-laps — l'ancien filtre
-        `PitOutTime.isna() | (LapNumber > 1)` gardait quasiment tout et
-        polluait moyenne / écart-type / dégradation."""
-        laps_drv = session.laps.pick_drivers(drv)
-        valid = laps_drv.loc[laps_drv["LapTime"].notna()].copy()
-        if "PitOutTime" in valid.columns and "PitInTime" in valid.columns:
-            valid = valid.loc[valid["PitOutTime"].isna() & valid["PitInTime"].isna()]
-        valid["LapTimeSeconds"] = valid["LapTime"].dt.total_seconds()
-        return valid
-
-    laps_d1_s = get_stint_laps(d1)
-    laps_d2_s = get_stint_laps(d2)
-
-    if len(laps_d1_s) < 2 and len(laps_d2_s) < 2:
-        st.info("Pas assez de tours pour analyser l'évolution. Cet onglet est conçu pour les sessions de type course ou long-run.")
-    else:
-        # Option : filtrer les outliers (tours > médiane × 1.1)
-        col_opt1, col_opt2 = st.columns([1, 3])
-        with col_opt1:
-            filter_outliers = st.checkbox("Filtrer outliers", value=True,
-                                          help="Cache les tours > 110% de la médiane (sortie de piste, drapeau jaune, etc.)")
-
-        # --- Graphique principal ---
-        fig_stint = go.Figure()
-
-        for laps_drv, drv, line_color in [(laps_d1_s, d1, c1), (laps_d2_s, d2, c2)]:
-            if len(laps_drv) == 0:
-                continue
-
-            # Filtre outliers
-            if filter_outliers and len(laps_drv) > 3:
-                median = laps_drv["LapTimeSeconds"].median()
-                laps_drv = laps_drv.loc[laps_drv["LapTimeSeconds"] < median * 1.10]
-
-            # Une trace par stint pour casser les lignes entre stints
-            if "Stint" in laps_drv.columns:
-                stints_groups = laps_drv.groupby("Stint")
+        dfr = dfr.sort_values("best_s")
+    dfr = dfr.reset_index(drop=True)
+
+    # Écarts au leader et intervalles
+    gaps, intervals = [], []
+    if is_race and dfr["res_pos"].notna().any():
+        # Time FastF1 : durée totale pour le vainqueur, écart pour les autres.
+        # NaT (tours de retard, abandon) → on affiche le statut officiel.
+        gap_s = []
+        for i, r in dfr.iterrows():
+            if i == 0:
+                gaps.append("Leader")
+                gap_s.append(0.0)
+            elif pd.notna(r["res_time"]):
+                g = r["res_time"].total_seconds()
+                gaps.append(f"+{g:.3f}")
+                gap_s.append(g)
             else:
-                stints_groups = [(1, laps_drv)]
-
-            for stint_num, stint_laps in stints_groups:
-                if len(stint_laps) == 0:
-                    continue
-                compound = str(stint_laps["Compound"].iloc[0]) if "Compound" in stint_laps else "—"
-                comp_col = compound_color(compound)
-
-                fig_stint.add_trace(go.Scatter(
-                    x=stint_laps["LapNumber"],
-                    y=stint_laps["LapTimeSeconds"],
-                    mode="lines+markers",
-                    line=dict(color=line_color, width=2.5),
-                    marker=dict(
-                        color=comp_col, size=10,
-                        line=dict(color=line_color, width=2),
-                    ),
-                    name=f"{drv} - Stint {int(stint_num)} ({compound})",
-                    hovertemplate=(
-                        f"<b>{drv}</b><br>"
-                        "Tour %{x}<br>"
-                        "Temps: %{y:.3f}s<br>"
-                        f"Compound: {compound}<extra></extra>"
-                    ),
-                ))
-
-        fig_stint.update_layout(
-            height=500, template="plotly_dark",
-            xaxis_title="Numéro de tour",
-            yaxis_title="Temps au tour (s)",
-            hovermode="closest",
-            legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
-        )
-        plot(fig_stint)
-
-        # Légende des compounds visible
-        with st.expander("🛞 Légende des compounds", expanded=False):
-            cols = st.columns(5)
-            compounds_legend = [
-                ("Soft", "#FF3333", "Le plus rapide, dégrade vite"),
-                ("Medium", "#FFCC33", "Compromis vitesse/dégradation"),
-                ("Hard", "#F0F0F0", "Le plus durable, moins de grip"),
-                ("Intermediate", "#33B53C", "Pluie légère / piste humide"),
-                ("Wet", "#4D7BC2", "Pluie soutenue"),
-            ]
-            for col, (name, color_, desc) in zip(cols, compounds_legend):
-                col.markdown(f"<div style='background-color:{color_}; padding:6px 10px; border-radius:5px; color:#000; font-weight:bold; text-align:center'>{name}</div>", unsafe_allow_html=True)
-                col.caption(desc)
-
-        st.markdown("---")
-        st.markdown("#### 📊 Statistiques par stint")
-
-        def compute_stint_stats(laps_drv, drv):
-            """Calcule les stats clés de chaque stint."""
-            if "Stint" not in laps_drv.columns or len(laps_drv) == 0:
-                return []
-            stats = []
-            for stint_num, stint_laps in laps_drv.groupby("Stint"):
-                if len(stint_laps) < 1:
-                    continue
-                lt = stint_laps["LapTimeSeconds"].values
-                # Régression linéaire pour la dégradation
-                if len(lt) >= 3:
-                    n = np.arange(len(lt))
-                    slope, _ = np.polyfit(n, lt, 1)
-                    degrad = f"{slope*1000:+.1f} ms/tour"
-                else:
-                    degrad = "—"
-                compound = str(stint_laps["Compound"].iloc[0]) if "Compound" in stint_laps else "—"
-                stats.append({
-                    "Pilote": drv,
-                    "Stint": int(stint_num),
-                    "Compound": compound,
-                    "Tours": len(stint_laps),
-                    "Best": f"{lt.min():.3f}s",
-                    "Moyenne": f"{lt.mean():.3f}s",
-                    "Écart-type": f"{lt.std():.3f}s" if len(lt) > 1 else "—",
-                    "Dégradation": degrad,
-                })
-            return stats
-
-        all_stats = compute_stint_stats(laps_d1_s, d1) + compute_stint_stats(laps_d2_s, d2)
-        if all_stats:
-            df_stints = pd.DataFrame(all_stats)
-            st.dataframe(df_stints, width="stretch", hide_index=True)
-
-            with st.expander("💡 Comment lire ces stats"):
-                st.markdown(f"""
-                - **Best** : meilleur tour du stint — révèle la **pace pure** quand les pneus sont au top
-                - **Moyenne** : pace réelle sur l'ensemble du stint — plus représentative pour comparer
-                - **Écart-type** : indicateur de **consistance**. Bas = pilote métronome (Hamilton, Russell typiquement). Élevé = pilote qui prend des risques ou se bat avec sa voiture
-                - **Dégradation** : pente de la régression linéaire (ms perdues par tour qui passe).
-                    - **< +30 ms/tour** : excellente gestion pneus (Verstappen, Hamilton historiquement)
-                    - **+30 à +80 ms/tour** : normal
-                    - **> +80 ms/tour** : pilote qui en demande trop à ses pneus, ou stratégie risquée
-
-                **Crois ces deux infos** : un pilote avec un meilleur **Best** mais une moins bonne **Moyenne** est rapide quand il pousse mais ne tient pas — il sera défavorisé sur des longues séquences. C'est typiquement le profil "qualif > course".
-                """)
-
-        # --- Bonus : différence de pace par tour ---
-        if len(laps_d1_s) > 5 and len(laps_d2_s) > 5:
-            st.markdown("---")
-            st.markdown("#### ⚔️ Différence de pace tour par tour")
-
-            # Aligne les deux pilotes sur les tours communs
-            common = pd.merge(
-                laps_d1_s[["LapNumber", "LapTimeSeconds"]].rename(columns={"LapTimeSeconds": f"t_{d1}"}),
-                laps_d2_s[["LapNumber", "LapTimeSeconds"]].rename(columns={"LapTimeSeconds": f"t_{d2}"}),
-                on="LapNumber", how="inner",
-            )
-            common["delta"] = common[f"t_{d1}"] - common[f"t_{d2}"]
-
-            if len(common) > 0:
-                fig_delta_stint = go.Figure()
-                fig_delta_stint.add_trace(go.Bar(
-                    x=common["LapNumber"], y=common["delta"],
-                    marker_color=[c2 if d > 0 else c1 for d in common["delta"]],
-                    name=f"Δ {d1} − {d2}",
-                    hovertemplate="Tour %{x}<br>Δ: %{y:+.3f}s<extra></extra>",
-                ))
-                fig_delta_stint.add_hline(y=0, line=dict(color="white", width=0.8))
-                fig_delta_stint.update_layout(
-                    height=350, template="plotly_dark",
-                    xaxis_title="Tour",
-                    yaxis_title=f"Δ {d1} − {d2} (s)",
-                    title=f"Barres positives = {d2} plus rapide · Barres négatives = {d1} plus rapide",
-                )
-                plot(fig_delta_stint)
-
-# --- TAB CRAFT : ATTAQUE / DÉFENSE ---
-with tab_craft:
-    ses_type = st.session_state.session_type
-    if ses_type not in ("R", "S"):
-        st.info("🥊 Le race craft (attaque, défense, dépassements) ne se mesure qu'en **course** ou en "
-                "**sprint**. Charge une session R ou S pour cet onglet.")
-    else:
-        st.markdown(
-            "Qui attaque, qui défend, qui concrétise. Basé sur les écarts au passage de la ligne, "
-            "tour par tour, pour toute la course."
-        )
-        with st.spinner("Calcul des écarts tour par tour…"):
-            gaps = compute_race_gaps(st.session_state.year, st.session_state.gp_name, ses_type)
-        if gaps.empty:
-            st.warning("Pas de données de position exploitables pour cette session.")
-        else:
-            def craft_metrics(drv):
-                g = gaps[gaps["Driver"] == drv].sort_values("LapNumber").reset_index(drop=True)
-                if g.empty:
-                    return None
-                g["NextPos"] = g["Position"].shift(-1)
-                pit = g["PitInTime"].notna() | g["PitOutTime"].notna()
-                clean = (~pit) & (~pit.shift(-1, fill_value=False)) & g["NextPos"].notna()
-                press = clean & (g["GapBehind"] < 1.0)
-                held = press & (g["NextPos"] <= g["Position"])
-                attack = clean & (g["GapAhead"] < 1.0)
-                conv = attack & (g["NextPos"] < g["Position"])
-                gained = clean & (g["NextPos"] < g["Position"])
-                lost = clean & (g["NextPos"] > g["Position"])
-                return {
-                    "pos": g[["LapNumber", "Position"]],
-                    "press": int(press.sum()), "held": int(held.sum()),
-                    "attack": int(attack.sum()), "conv": int(conv.sum()),
-                    "gained": int(gained.sum()), "lost": int(lost.sum()),
-                }
-
-            m1, m2 = craft_metrics(d1), craft_metrics(d2)
-            if m1 is None or m2 is None:
-                st.warning("Un des deux pilotes n'a pas de données de course.")
+                status = r["res_status"]
+                gaps.append(status if status and status != "Finished" else "—")
+                gap_s.append(np.nan)
+        for i in range(len(dfr)):
+            if i == 0:
+                intervals.append("Interval")
+            elif pd.notna(gap_s[i]) and pd.notna(gap_s[i - 1]):
+                intervals.append(f"+{gap_s[i] - gap_s[i - 1]:.3f}")
             else:
-                # Évolution des positions
-                fig_p = go.Figure()
-                for m, drv, col in [(m1, d1, c1), (m2, d2, c2)]:
-                    fig_p.add_trace(go.Scatter(
-                        x=m["pos"]["LapNumber"], y=m["pos"]["Position"],
-                        mode="lines+markers", name=drv,
-                        line=dict(color=col, width=2.5), marker=dict(size=5),
-                        hovertemplate=f"<b>{drv}</b><br>Tour %{{x}}<br>P%{{y:.0f}}<extra></extra>",
-                    ))
-                fig_p.update_layout(
-                    height=400, template="plotly_dark",
-                    xaxis_title="Tour", yaxis_title="Position",
-                    yaxis=dict(autorange="reversed", dtick=1),
-                    legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
-                )
-                plot(fig_p)
-
-                # Métriques attaque / défense
-                def pct(a, b):
-                    return f"{a}/{b} ({a / b * 100:.0f} %)" if b else "—"
-
-                col_a, col_b = st.columns(2)
-                for col, m, drv in [(col_a, m1, d1), (col_b, m2, d2)]:
-                    with col:
-                        st.markdown(f"#### {drv}")
-                        st.metric("Tours sous pression (<1 s derrière)", m["press"])
-                        st.metric("Défenses réussies", pct(m["held"], m["press"]))
-                        st.metric("Tours à l'attaque (<1 s devant)", m["attack"])
-                        st.metric("Attaques converties en dépassement", pct(m["conv"], m["attack"]))
-                        st.metric("Positions gagnées / perdues en piste", f"+{m['gained']} / −{m['lost']}")
-
-                with st.expander("💡 Comment lire (et limites)"):
-                    st.markdown("""
-                    - **Défenses réussies élevées** (>80 %) = pilote solide sous pression, place bien sa voiture.
-                    - **Conversion d'attaque élevée** = agressif ET efficace. Beaucoup de tours à l'attaque
-                      avec peu de conversions = suiveur qui n'ose pas, ou voiture sans top speed.
-                    - **Positions gagnées/perdues** : hors tours d'arrêt du pilote lui-même.
-
-                    ⚠️ **Limites** : écarts mesurés au passage de la ligne uniquement ; les arrêts des
-                    *autres* pilotes ne sont pas neutralisés (un undercut compte comme un dépassement) ;
-                    le trafic retardataire peut générer de la fausse "pression". À lire comme des
-                    **tendances**, pas une vérité au tour près.
-                    """)
-
-# --- TAB FIT : AUTO VS CIRCUIT ---
-with tab_fit:
-    st.markdown(
-        "La voiture aime-t-elle ce tracé ? Chaque pilote est comparé au **meilleur du plateau** "
-        "virage par virage (tours rapides), agrégé par type de virage, puis croisé avec la "
-        "typologie du circuit."
-    )
-    with st.spinner("Analyse du plateau complet (peut prendre quelques secondes)…"):
-        profile = field_corner_profile(
-            st.session_state.year, st.session_state.gp_name, st.session_state.session_type
-        )
-    if profile is None:
-        st.info("Pas de données virages disponibles pour ce circuit/session.")
+                intervals.append(gaps[i])
     else:
-        df_speeds, vmax_all = profile
-        best = df_speeds.max(axis=1)
-        classes = best.apply(corner_class)
-        counts = classes.value_counts().reindex(["Lent", "Moyen", "Rapide"]).fillna(0).astype(int)
-        dominant = counts.idxmax()
+        leader_best = dfr["best_s"].iloc[0]
+        for i, r in dfr.iterrows():
+            if i == 0:
+                gaps.append("Leader")
+                intervals.append("Interval")
+            else:
+                gaps.append(f"+{r['best_s'] - leader_best:.3f}" if np.isfinite(r["best_s"]) else "—")
+                prev = dfr["best_s"].iloc[i - 1]
+                intervals.append(f"+{r['best_s'] - prev:.3f}"
+                                 if np.isfinite(r["best_s"]) and np.isfinite(prev) else "—")
 
-        dominant_label = {"Lent": "lente", "Moyen": "moyenne", "Rapide": "rapide"}[dominant]
-        st.markdown(
-            f"**Typologie {ev['Location']}** : {counts.get('Lent', 0)} lent(s) · "
-            f"{counts.get('Moyen', 0)} moyen(s) · {counts.get('Rapide', 0)} rapide(s) "
-            f"→ dominante **{dominant_label}**"
-        )
+    def _tyre_str(r):
+        letter = r["comp"][:1] if r["comp"] != "—" else "—"
+        return f"{r['tyre_age']} {letter}" if r["tyre_age"] is not None else letter
 
-        fig_f = go.Figure()
-        verdicts = []
-        for drv, col in [(d1, c1), (d2, c2)]:
-            if drv not in df_speeds.columns:
-                st.warning(f"Pas de tour rapide exploitable pour {drv}.")
+    disp = pd.DataFrame({
+        "Pos": dfr.index + 1,
+        "Pilote": dfr["drv"],
+        "Pit": dfr["pits"],
+        "Interval": intervals,
+        "Écart": gaps,
+        "Pneu": dfr.apply(_tyre_str, axis=1),
+        "Best lap": dfr["best"].apply(_fmt_lap),
+        "Dernier tour": dfr["last_lap"].apply(_fmt_lap),
+        "S1": dfr["lS1"].apply(_fmt_sec),
+        "S2": dfr["lS2"].apply(_fmt_sec),
+        "S3": dfr["lS3"].apply(_fmt_sec),
+        "S1★": dfr["bS1"].apply(_fmt_sec),
+        "S2★": dfr["bS2"].apply(_fmt_sec),
+        "S3★": dfr["bS3"].apply(_fmt_sec),
+    })
+
+    styles = pd.DataFrame("", index=disp.index, columns=disp.columns)
+
+    # Badge pilote : fond couleur équipe
+    for i, drv in enumerate(dfr["drv"]):
+        colr = driver_color(drv)
+        styles.loc[i, "Pilote"] = (f"background-color: {colr}; color: #FFFFFF; "
+                                   f"font-weight: bold; border-radius: 6px; text-align: center")
+        styles.loc[i, "Pneu"] = f"color: {compound_color(dfr['comp'].iloc[i])}; font-weight: bold"
+
+    def _mark(col_disp, series, best_session, best_perso=None):
+        """Fond violet = record session ; fond vert = record perso du pilote."""
+        for i, v in enumerate(series):
+            if pd.isna(v):
                 continue
-            deficit = best - df_speeds[drv]
-            agg = deficit.groupby(classes).mean().reindex(["Lent", "Moyen", "Rapide"])
-            fig_f.add_trace(go.Bar(
-                x=agg.index, y=agg.values, name=drv, marker_color=col,
-                hovertemplate=f"<b>{drv}</b><br>%{{x}} : −%{{y:.1f}} km/h vs meilleur<extra></extra>",
-            ))
-            valid = agg.dropna()
-            if len(valid) >= 2:
-                strong, weak = valid.idxmin(), valid.idxmax()
-                fit = ("✅ la typologie du circuit lui convient" if strong == dominant
-                       else "❌ typologie défavorable" if weak == dominant
-                       else "➖ typologie neutre pour lui")
-                vmax_def = vmax_all.max() - vmax_all.get(drv, np.nan)
-                verdicts.append(
-                    f"**{drv}** — à l'aise en virages **{strong.lower()}s** "
-                    f"(−{valid[strong]:.1f} km/h vs meilleur), en retrait en **{weak.lower()}s** "
-                    f"(−{valid[weak]:.1f}) · Vmax : −{vmax_def:.0f} km/h vs meilleur → {fit}"
-                )
+            if pd.notna(best_session) and abs(v - best_session) < _EPS:
+                styles.loc[i, col_disp] = VIOLET_BG
+            elif best_perso is not None and pd.notna(best_perso.iloc[i]) and abs(v - best_perso.iloc[i]) < _EPS:
+                styles.loc[i, col_disp] = GREEN_BG
 
-        fig_f.update_layout(
-            height=420, template="plotly_dark", barmode="group",
-            yaxis_title="Déficit moyen vs meilleur du plateau (km/h)",
-            xaxis_title="Type de virage",
-            legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
-        )
-        plot(fig_f)
-        for v in verdicts:
-            st.markdown(v)
+    _mark("Best lap", dfr["best"], sess_best["lap"])
+    _mark("Dernier tour", dfr["last_lap"], sess_best["lap"], dfr["pb_lap"])
+    _mark("S1", dfr["lS1"], sess_best["S1"], dfr["bS1"])
+    _mark("S2", dfr["lS2"], sess_best["S2"], dfr["bS2"])
+    _mark("S3", dfr["lS3"], sess_best["S3"], dfr["bS3"])
+    _mark("S1★", dfr["bS1"], sess_best["S1"])
+    _mark("S2★", dfr["bS2"], sess_best["S2"])
+    _mark("S3★", dfr["bS3"], sess_best["S3"])
 
-        with st.expander("💡 Comment lire (et limites)"):
-            st.markdown("""
-            - **Déficit faible en virages rapides** = voiture efficace en appui aéro.
-            - **Déficit faible en virages lents** = bon grip mécanique / traction.
-            - **Vmax proche du meilleur** = peu de traînée ou moteur fort.
-            - Croisé avec la dominante du circuit : une voiture forte en appui sur un tracé
-              à dominante rapide (Suzuka, Silverstone) = circuit qui lui convient.
-
-            ⚠️ Ce benchmark mélange **voiture + pilote**. Pour isoler le pilote, l'astuce
-            classique : sélectionner les deux **coéquipiers** dans la barre latérale
-            (même voiture) et regarder l'onglet *Virage par virage*.
-            """)
-
-# --- TAB 6 : RADAR ---
-with tab6:
-    st.markdown("Compare jusqu'à 6 pilotes en visu radar. Idéal pour repérer des archétypes opposés.")
-
-    # FIX : si d1/d2 est NOR, HAM ou ALO, la liste par défaut contenait un doublon
-    # → index dupliqué après set_index("Pilote") → df_n.loc[drv] renvoyait un
-    # DataFrame (pas de .tolist()) → AttributeError. dict.fromkeys déduplique
-    # en préservant l'ordre.
-    default_radar = list(dict.fromkeys(
-        d for d in [d1, d2, "NOR", "HAM", "ALO"] if d in drivers_in_session
-    ))[:5]
-    drivers_radar = st.multiselect(
-        "Pilotes",
-        options=drivers_in_session,
-        default=default_radar,
-        max_selections=6,
-        format_func=lambda x: driver_full.get(x, x),
+    show_table(
+        disp.style.apply(lambda _: styles, axis=None),
+        height=min(40 * (len(disp) + 1) + 3, 780),
+        force_html=True, mono=True,
     )
-    drivers_radar = list(dict.fromkeys(drivers_radar))  # ceinture + bretelles
+    st.caption(
+        "🟣 fond violet = record de la session · 🟢 fond vert = record perso · "
+        "**S1-S3** = secteurs du dernier tour bouclé · **S1★-S3★** = meilleurs secteurs "
+        "individuels · **Pneu** = âge (tours) + compound du dernier relais · "
+        "les tours supprimés (track limits) sont exclus des records. "
+        + ("Écarts et statuts issus du classement officiel." if is_race
+           else "Classement par meilleur tour.")
+    )
 
-    if len(drivers_radar) < 2:
-        st.warning("Sélectionne au moins 2 pilotes.")
-    else:
-        def sig_for(drv):
-            lap = session.laps.pick_drivers(drv).pick_fastest()
-            if lap is None or pd.isna(lap.get("LapTime")):
-                return None
-            tel = lap.get_car_data().add_distance()
-            # FIX : mean() d'un array vide → nan, et nan est truthy, donc
-            # l'ancien `... .mean() or 0` ne protégeait rien. Garde explicite.
-            dthr = np.diff(tel["Throttle"].values)
-            rising = dthr[dthr > 0]
-            ramp = float(rising.mean()) if rising.size else 0.0
-            return {
-                "Pilote": drv,
-                "Vmax": float(tel["Speed"].max()),
-                "V_min courbes": float(tel.loc[tel["Speed"] < tel["Speed"].quantile(0.30), "Speed"].median()),
-                "Full throttle %": float((tel["Throttle"] >= 99).mean() * 100),
-                "Coast time %": float(((tel["Throttle"] < 5) & (tel["Brake"] == 0)).mean() * 100),
-                "Brake %": float((tel["Brake"] > 0).mean() * 100),
-                "Throttle ramp-up": ramp,
-            }
 
-        sigs = [s for s in (sig_for(d) for d in drivers_radar) if s is not None]
-        if not sigs:
-            st.error("Aucun pilote avec données valides.")
-        else:
-            df_m = pd.DataFrame(sigs).set_index("Pilote")
-            # Normalisation 0-1
-            df_n = (df_m - df_m.min()) / (df_m.max() - df_m.min() + 1e-9)
-
-            fig = go.Figure()
-            for drv in df_n.index:
-                vals = df_n.loc[drv].tolist()
-                vals += vals[:1]
-                labels = df_n.columns.tolist() + [df_n.columns[0]]
-                fig.add_trace(go.Scatterpolar(
-                    r=vals, theta=labels, fill="toself",
-                    name=drv, line=dict(color=driver_color(drv), width=2),
-                    opacity=0.7,
-                ))
-            fig.update_layout(
-                height=600, template="plotly_dark",
-                polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False)),
-                title="Signatures de style — comparaison normalisée",
-            )
-            plot(fig)
-
-            with st.expander("Valeurs brutes"):
-                st.dataframe(df_m.round(2), width="stretch")
+# ============== NAVIGATION ==============
+pg = st.navigation([
+    st.Page(page_timing, title="Timing session", icon="📊", default=True),
+    st.Page(page_style, title="Style de pilotage", icon="🎨"),
+])
+pg.run()
 
 # ============== FOOTER ==============
 st.markdown("---")
