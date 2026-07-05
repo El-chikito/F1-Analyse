@@ -419,6 +419,30 @@ SESSION_LABELS = {
 }
 
 
+RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
+SPRINT_POINTS = {1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1}
+
+
+def points_from_results(res, ses):
+    """Points par pilote depuis une feuille de résultats FastF1.
+    La colonne Points est vide pour les sessions Sprint (même trou de données
+    que la colonne Time) → fallback : barème officiel appliqué à la position
+    d'arrivée. Pas de point de meilleur tour (supprimé depuis 2025)."""
+    scale = SPRINT_POINTS if ses == "S" else RACE_POINTS
+    pts_col_ok = ("Points" in res.columns and res["Points"].notna().any()
+                  and float(res["Points"].fillna(0).sum()) > 0)
+    out = {}
+    for _, r in res.iterrows():
+        code = str(r["Abbreviation"])
+        if pts_col_ok:
+            p = r.get("Points")
+            out[code] = float(p) if pd.notna(p) else 0.0
+        else:
+            pos = r.get("Position")
+            out[code] = float(scale.get(int(pos), 0)) if pd.notna(pos) else 0.0
+    return out
+
+
 def hex_to_rgb_str(h):
     h = h.lstrip("#")
     return f"rgb({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)})"
@@ -671,13 +695,12 @@ def season_points_before(year, round_number, session_type):
                 s = fastf1.get_session(year, rnd, ses)
                 s.load(laps=False, telemetry=False, weather=False, messages=False)
                 res = s.results
-                if res is None:
+                if res is None or res.empty:
                     continue
+                for code, p in points_from_results(res, ses).items():
+                    pts[code] = pts.get(code, 0.0) + p
                 for _, r in res.iterrows():
                     code = str(r["Abbreviation"])
-                    p = r.get("Points")
-                    if pd.notna(p):
-                        pts[code] = pts.get(code, 0.0) + float(p)
                     if ses == "R":
                         pos = r.get("Position")
                         if pd.notna(pos) and 1 <= int(pos) <= 22:
@@ -2635,6 +2658,19 @@ def page_timing():
     else:
         codes = [c for c, _ in plotted]
         xs = [g for _, g in plotted]
+        # Anti-chevauchement : 3 rangées en quinconce. Chaque bulle prend la
+        # première rangée où elle ne recouvre pas la précédente ; à défaut,
+        # la rangée libérée depuis le plus longtemps.
+        span = (max(xs) - min(xs)) or 1.0
+        min_sep = span * 0.06
+        levels = [0.0, 0.65, -0.65]
+        last_at = {lv: -1e12 for lv in levels}
+        ys = []
+        for x in xs:
+            free = [lv for lv in levels if x - last_at[lv] >= min_sep]
+            lv = free[0] if free else min(levels, key=lambda l: last_at[l])
+            ys.append(lv)
+            last_at[lv] = x
         fig_gap = go.Figure()
         fig_gap.add_trace(go.Scatter(  # ligne de fond
             x=[min(xs), max(xs)], y=[0, 0], mode="lines",
@@ -2642,19 +2678,19 @@ def page_timing():
             hoverinfo="skip", showlegend=False,
         ))
         fig_gap.add_trace(go.Scatter(
-            x=xs, y=[0] * len(xs), mode="markers+text",
-            marker=dict(size=36, color=[driver_color(c) for c in codes],
-                        line=dict(color="rgba(255,255,255,0.9)", width=1.5)),
+            x=xs, y=ys, mode="markers+text",
+            marker=dict(size=27, color=[driver_color(c) for c in codes],
+                        line=dict(color="rgba(255,255,255,0.9)", width=1.2)),
             text=codes, textposition="middle center",
-            textfont=dict(size=10, color="white"),
+            textfont=dict(size=8, color="white"),
             hovertemplate="%{text} : +%{x:.3f} s<extra></extra>",
             cliponaxis=False, showlegend=False,
         ))
-        pad = max((max(xs) - min(xs)) * 0.04, 0.5)
+        pad = max(span * 0.05, 0.5)
         fig_gap.update_xaxes(title="Écart au leader (s)", showgrid=False, zeroline=False,
                              range=[min(xs) - pad, max(xs) + pad])
-        fig_gap.update_yaxes(visible=False, range=[-1, 1], fixedrange=True)
-        fig_gap.update_layout(height=180, template="plotly_dark",
+        fig_gap.update_yaxes(visible=False, range=[-1.3, 1.3], fixedrange=True)
+        fig_gap.update_layout(height=200, template="plotly_dark",
                               margin=dict(t=10, b=40, l=20, r=20))
         plot(fig_gap)
         missing = [dfr["drv"].iloc[i] for i in range(len(dfr))
@@ -2674,9 +2710,7 @@ def page_timing():
         )
     pts_session = {}
     if results is not None:
-        for _, r in results.iterrows():
-            p = r.get("Points")
-            pts_session[str(r["Abbreviation"])] = float(p) if pd.notna(p) else 0.0
+        pts_session = points_from_results(results, st.session_state.session_type)
     all_drv = set(pts_before) | set(pts_session)
     if not all_drv:
         st.info("Points indisponibles pour cette session.")
