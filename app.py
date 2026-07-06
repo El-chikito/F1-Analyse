@@ -14,6 +14,32 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- DATA session.load(weather=True, messages=True) — nouvelles données exploitées :
+       · bandeau météo (air, piste, vent, pluie) + durée de roulage dans
+         l'en-tête de session ;
+       · périodes SC/VSC (statut piste officiel) et pluie surlignées sur le
+         graphe d'évolution course, température de piste en axe secondaire ;
+       · le filtre outliers exclut d'abord les tours sous SC/VSC/rouge
+         (TrackStatus) avant le seuil médiane ;
+       · expander « Direction de course » (drapeaux, SC, pénalités, tours
+         supprimés) dans l'Overview ; pénalités par pilote dans Race craft ;
+       · motif officiel des tours supprimés (DeletedReason) dans le recap.
+       Au passage FIX : FastF1 ne renseigne la colonne Deleted que si
+       messages=True — l'exclusion des tours supprimés des records ne
+       fonctionnait donc jamais avant.
+- DATA Canaux RPM et DRS dans l'Overlay (6 sous-graphes) ; « DRS ouvert »
+       disponible comme coloration de la Vue circuit.
+- DATA Overview enrichi : Δ Grille (places gagnées/perdues vs départ,
+       PL = pit lane), progression Q1→Q2→Q3 en qualif, arrêts aux stands
+       (temps pit lane entrée→sortie), championnat constructeurs
+       avant/après session.
+- DATA Portraits officiels des pilotes (HeadshotUrl) sur la page Style ;
+       ° = pneus rodés (FreshTyre) ; ⚠ = chrono jugé imprécis (IsAccurate)
+       dans le sélecteur de tours.
+- Vue circuit / battle map / heatmap : tracés orientés comme à la TV
+  (rotation officielle du circuit) + numéros de virage sur la carte.
+- Couleurs d'équipe : fallback vers le référentiel officiel fastf1.plotting
+  pour toute équipe absente de la palette locale.
 - FIX  UX mobile : plus de clavier virtuel à l'ouverture des menus
        déroulants (inputs des selectbox passés en readonly + inputmode="none"
        en mode compact ; le menu s'ouvre normalement, seule la recherche par
@@ -506,8 +532,13 @@ def text_on(bg):
 
 def _chan(tel, ch):
     """Brake est booléen chez FastF1 → int, sinon plotly peut basculer en axe
-    catégoriel selon les versions. Les autres canaux passent tels quels."""
-    return tel[ch].astype(int) if ch == "Brake" else tel[ch]
+    catégoriel selon les versions. DRS est un code (0/1 fermé, 8 éligible,
+    10/12/14 volet ouvert) → converti en 0/1 « ouvert ». Le reste passe tel quel."""
+    if ch == "Brake":
+        return tel[ch].astype(int)
+    if ch == "DRS":
+        return (tel[ch] >= 10).astype(int)
+    return tel[ch]
 
 
 def _top_zones(gain, dist, k=3, min_sep=150.0):
@@ -712,22 +743,25 @@ def load_session(year, gp, session_type):
     """Charge une session F1, mise en cache.
     max_entries=3 : une session complète pèse plusieurs centaines de Mo une fois
     chargée — sans limite, quelques sessions suffisent à saturer 1 Go de RAM
-    (Streamlit Community Cloud). weather/messages inutilisés → non chargés."""
+    (Streamlit Community Cloud).
+    weather=True → bandeau météo + contexte pluie/température sur les graphes.
+    messages=True → drapeaux/SC/pénalités, ET la colonne Deleted des laps :
+    FastF1 ne marque les tours supprimés QUE si les messages sont chargés."""
     s = fastf1.get_session(year, gp, session_type)
-    s.load(telemetry=True, laps=True, weather=False, messages=False)
+    s.load(telemetry=True, laps=True, weather=True, messages=True)
     return s
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def season_points_before(year, round_number, session_type):
-    """Points cumulés par pilote AVANT la session courante (courses + sprints
+    """Points cumulés par pilote ET par équipe AVANT la session courante (courses + sprints
     des manches précédentes, plus le sprint du même week-end si la session
     analysée est la course), et countback réglementaire : décompte des
     positions d'arrivée en course [nb de P1, nb de P2, ...] pour départager
     les égalités de points comme la F1. Ne charge que les feuilles de
     résultats (laps/télémétrie exclus) → rapide, puis caches disque + app."""
     sched = fastf1.get_event_schedule(year, include_testing=False)
-    pts, cb = {}, {}
+    pts, cb, team_pts = {}, {}, {}
     for _, ev_row in sched.iterrows():
         rnd = int(ev_row["RoundNumber"])
         if rnd > round_number:
@@ -747,17 +781,21 @@ def season_points_before(year, round_number, session_type):
                 res = s.results
                 if res is None or res.empty:
                     continue
-                for code, p in points_from_results(res, ses).items():
+                pfr = points_from_results(res, ses)
+                for code, p in pfr.items():
                     pts[code] = pts.get(code, 0.0) + p
                 for _, r in res.iterrows():
                     code = str(r["Abbreviation"])
+                    team = str(r.get("TeamName", "") or "")
+                    if team:  # cumul constructeurs (somme des deux pilotes)
+                        team_pts[team] = team_pts.get(team, 0.0) + pfr.get(code, 0.0)
                     if ses == "R":
                         pos = r.get("Position")
                         if pd.notna(pos) and 1 <= int(pos) <= 22:
                             cb.setdefault(code, [0] * 22)[int(pos) - 1] += 1
             except Exception:
                 continue  # manche pas encore courue / résultats absents
-    return pts, cb
+    return pts, cb, team_pts
 
 
 def safe_circuit_info(sess):
@@ -984,6 +1022,33 @@ corners_df = None
 if circuit_info is not None and circuit_info.corners is not None and len(circuit_info.corners):
     corners_df = circuit_info.corners.sort_values("Distance").reset_index(drop=True)
 
+# Rotation officielle du tracé (degrés) : oriente les cartes comme à la TV
+TRACK_ROTATION = float(getattr(circuit_info, "rotation", 0) or 0) if circuit_info is not None else 0.0
+
+
+def _rotate_xy(x, y):
+    """Applique la rotation officielle du circuit aux coordonnées X/Y
+    (télémétrie et virages partagent le même repère)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if not TRACK_ROTATION:
+        return x, y
+    rad = np.deg2rad(TRACK_ROTATION)
+    return x * np.cos(rad) - y * np.sin(rad), x * np.sin(rad) + y * np.cos(rad)
+
+
+def _add_corner_labels(fig, row=None, col=None):
+    """Écrit T1, T2… sur une carte du circuit (si les positions sont dispo)."""
+    if corners_df is None or "X" not in corners_df.columns:
+        return
+    cx, cy = _rotate_xy(corners_df["X"].values, corners_df["Y"].values)
+    fig.add_trace(go.Scatter(
+        x=cx, y=cy, mode="text",
+        text=[f"T{int(r['Number'])}{r['Letter']}" for _, r in corners_df.iterrows()],
+        textfont=dict(size=10, color="rgba(255,255,255,0.65)"),
+        hoverinfo="skip", showlegend=False,
+    ), row=row, col=col)
+
 
 def _nearest_corner(d):
     """Étiquette du virage le plus proche d'une distance donnée (si dispo)."""
@@ -1013,13 +1078,51 @@ for d in drivers_in_session:
 # ============== HEADER DE SESSION (commun aux pages) ==============
 ev = session.event
 st.markdown(f"### {ev['EventName']} {st.session_state.year} — {st.session_state.session_type}")
-st.caption(f"📍 {ev['Location']}, {ev['Country']} · {ev['EventDate'].strftime('%d %B %Y')}")
+
+# Durée de roulage effective (session_status : Started → Finished/Ends)
+_dur = ""
+try:
+    _ss = session.session_status
+    _t0 = _ss.loc[_ss["Status"] == "Started", "Time"].iloc[0]
+    _t1 = _ss.loc[_ss["Status"].isin(("Finished", "Finalised", "Ends")), "Time"].iloc[-1]
+    _dur = f" · ⏱️ ~{(_t1 - _t0).total_seconds() / 60:.0f} min de roulage"
+except Exception:
+    pass
+st.caption(f"📍 {ev['Location']}, {ev['Country']} · {ev['EventDate'].strftime('%d %B %Y')}{_dur}")
+
+# Bandeau météo (session.weather_data, échantillonné ~1/min sur la session)
+try:
+    _wx = session.weather_data
+    if _wx is not None and len(_wx):
+        _rain_pct = float(_wx["Rainfall"].mean() * 100) if "Rainfall" in _wx.columns else 0.0
+        _rain_txt = (f"🌧️ pluie ~{_rain_pct:.0f} % de la session" if _rain_pct > 0
+                     else "☀️ pas de pluie")
+        st.caption(
+            f"🌡️ Air {_wx['AirTemp'].mean():.0f} °C · Piste {_wx['TrackTemp'].min():.0f}–"
+            f"{_wx['TrackTemp'].max():.0f} °C · 💨 vent {_wx['WindSpeed'].mean():.1f} m/s · {_rain_txt}"
+        )
+except Exception:
+    pass
+
+
+def team_color(team):
+    """Couleur d'équipe : notre palette d'abord, sinon le référentiel officiel
+    de fastf1.plotting (couvre toutes les équipes de toutes les saisons)."""
+    if team in TEAM_COLORS:
+        return TEAM_COLORS[team]
+    try:
+        import fastf1.plotting as f1plt
+        c = f1plt.get_team_color(team, session=session)
+        if c:
+            return c
+    except Exception:
+        pass
+    return "#888888"
 
 
 def driver_color(drv):
     try:
-        team = session.get_driver(drv)["TeamName"]
-        return TEAM_COLORS.get(team, "#888888")
+        return team_color(session.get_driver(drv)["TeamName"])
     except Exception:
         return "#888888"
 
@@ -1086,9 +1189,11 @@ def page_style():
             lt = row["LapTime"].total_seconds()
             compound = str(row.get("Compound", "—"))[:1] if pd.notna(row.get("Compound")) else "—"
             is_fastest_marker = " ⚡" if n == fastest_num else ""
+            acc = row.get("IsAccurate")
+            warn = " ⚠" if (pd.notna(acc) and not bool(acc)) else ""
             time_str = f"{int(lt // 60)}:{lt % 60:06.3f}"
             options.append(n)
-            descriptions[n] = f"L{n:>2} — {time_str} ({compound}){is_fastest_marker}"
+            descriptions[n] = f"L{n:>2} — {time_str} ({compound}){is_fastest_marker}{warn}"
         return options, descriptions, fastest_num
 
 
@@ -1104,7 +1209,8 @@ def page_style():
         options=opts1,
         index=opts1.index(fast1),
         format_func=lambda n: desc1.get(n, f"L{n}"),
-        help="⚡ marque le tour le plus rapide. Tu peux choisir n'importe quel autre tour.",
+        help="⚡ = tour le plus rapide · ⚠ = chrono jugé imprécis par FastF1 (in/out-lap, "
+             "drapeau…). Tu peux choisir n'importe quel tour.",
     )
     lap_n2 = st.sidebar.selectbox(
         f"Tour {d2}",
@@ -1229,8 +1335,18 @@ def page_style():
         st.info(f"ℹ️ Pas encore de briefing détaillé pour **{event_name}** dans la base. "
                 f"Tu peux toujours explorer via les onglets ci-dessous.")
 
-    # --- Métriques principales ---
+    # --- Métriques principales (+ portraits officiels si disponibles) ---
+    def _headshot(drv):
+        try:
+            url = session.get_driver(drv).get("HeadshotUrl")
+            return url if isinstance(url, str) and url.startswith("http") else None
+        except Exception:
+            return None
+
     col1, col2, col3, col4 = st.columns(4)
+    for _c, _h in ((col1, _headshot(d1)), (col2, _headshot(d2))):
+        if _h:
+            _c.image(_h, width=72)
     t1 = lap1["LapTime"].total_seconds()
     t2 = lap2["LapTime"].total_seconds()
     lap_label1 = f"L{lap_n1} {'⚡' if lap_n1 == fast1 else ''}"
@@ -1309,7 +1425,8 @@ def page_style():
                 "best_td": best["LapTime"],
                 "s1": b1, "s2": b2, "s3": b3, "theo": theo,
                 "vmax": vmax_drv,
-                "Pneu": best.get("Compound", "—") if pd.notna(best.get("Compound")) else "—",
+                "Pneu": ((str(best.get("Compound")) if pd.notna(best.get("Compound")) else "—")
+                         + ("°" if pd.notna(best.get("FreshTyre")) and not best.get("FreshTyre") else "")),
                 "Tours": int(timed["LapNumber"].nunique()),
             })
 
@@ -1371,7 +1488,8 @@ def page_style():
             st.caption(
                 "**Théorique** = somme des meilleurs secteurs individuels du pilote · "
                 "**Δ théo** = temps laissé sur la table (meilleur tour réel − tour théorique) · "
-                "**Vmax** = vitesse de pointe max relevée (speed traps), en km/h. "
+                "**Vmax** = vitesse de pointe max relevée (speed traps), en km/h · "
+                "**°** = pneus rodés (pas neufs). "
                 "Les tours supprimés (track limits) sont exclus des records."
             )
 
@@ -1380,7 +1498,8 @@ def page_style():
             st.markdown(f"#### 📜 Recap tour par tour — {d1} vs {d2}")
             st.caption(
                 "🟣 Violet = record de la session · 🟢 vert = record perso · "
-                "OUT = sortie des stands, IN = rentre aux stands · ligne barrée = tour supprimé."
+                "OUT = sortie des stands, IN = rentre aux stands · ° = pneus rodés · "
+                "ligne barrée = tour supprimé (motif officiel dans la colonne Note)."
             )
 
             def _render_laps_recap(drv):
@@ -1408,7 +1527,11 @@ def page_style():
                         n.append("OUT")
                     if pd.notna(r.get("PitInTime")):
                         n.append("IN")
-                    notes.append("/".join(n))
+                    # Motif officiel de suppression (direction de course)
+                    reason = r.get("DeletedReason")
+                    if bool(r.get("Deleted")) and pd.notna(reason) and str(reason).strip():
+                        n.append(str(reason).strip().capitalize())
+                    notes.append(" / ".join(n))
 
                 rec = pd.DataFrame({
                     "Tour": ld["LapNumber"].astype(int).values,
@@ -1416,7 +1539,11 @@ def page_style():
                     "S1": [_fmt_sec(t) for t in ld["Sector1Time"]],
                     "S2": [_fmt_sec(t) for t in ld["Sector2Time"]],
                     "S3": [_fmt_sec(t) for t in ld["Sector3Time"]],
-                    "Pneu": [str(c)[:1] if pd.notna(c) else "—" for c in ld["Compound"]],
+                    "Pneu": [(str(c)[:1] if pd.notna(c) else "—")
+                             + ("°" if pd.notna(c) and pd.notna(f) and not f else "")
+                             for c, f in zip(ld["Compound"],
+                                             ld["FreshTyre"] if "FreshTyre" in ld.columns
+                                             else [np.nan] * len(ld))],
                     "Note": notes,
                 })
 
@@ -1460,15 +1587,19 @@ def page_style():
     with tab1:
         st.markdown("Vitesse, throttle, frein et rapport superposés sur la distance — survole les courbes pour les valeurs précises.")
 
+        CH_TITLES = {"Speed": "Vitesse (km/h)", "Throttle": "Throttle (%)", "Brake": "Frein",
+                     "nGear": "Rapport", "RPM": "RPM", "DRS": "DRS ouvert"}
+        channels = [c for c in ("Speed", "Throttle", "Brake", "nGear", "RPM", "DRS")
+                    if c in tel1.columns and c in tel2.columns]
+        n_ch = len(channels)
         fig = make_subplots(
-            rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-            subplot_titles=("Vitesse (km/h)", "Throttle (%)", "Frein", "Rapport"),
+            rows=n_ch, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+            subplot_titles=[CH_TITLES[c] for c in channels],
         )
-        channels = ["Speed", "Throttle", "Brake", "nGear"]
         for i, ch in enumerate(channels, start=1):
-            # Brake (0/1) et nGear (entiers) : tracé en marches — sinon plotly
+            # Brake/DRS (0/1) et nGear (entiers) : tracé en marches — sinon plotly
             # relie les échantillons par des rampes physiquement fausses
-            shape = "hv" if ch in ("Brake", "nGear") else "linear"
+            shape = "hv" if ch in ("Brake", "nGear", "DRS") else "linear"
             fig.add_trace(go.Scatter(
                 x=tel1["Distance"], y=_chan(tel1, ch), name=d1,
                 line=dict(color=c1, width=1.8, shape=shape),
@@ -1483,7 +1614,7 @@ def page_style():
         # Lignes verticales aux virages
         if corners_df is not None:
             for _, corner in corners_df.iterrows():
-                for r in range(1, 5):
+                for r in range(1, n_ch + 1):
                     fig.add_vline(x=corner["Distance"], line=dict(color="white", width=0.5, dash="dot"),
                                   opacity=0.2, row=r, col=1)
             # Annotations virages sur le subplot du bas
@@ -1491,16 +1622,16 @@ def page_style():
                 tickvals=corners_df["Distance"].tolist(),
                 ticktext=[f"T{int(c['Number'])}{c['Letter']}" for _, c in corners_df.iterrows()],
                 tickangle=45 if MOBILE else 0,  # T1…T19 se chevauchent sur petit écran
-                row=4, col=1,
+                row=n_ch, col=1,
             )
 
         fig.update_layout(
-            height=750, template="plotly_dark",
+            height=170 * n_ch + 60, template="plotly_dark",
             hovermode="x unified",
             legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
             margin=dict(t=40, b=20, l=20, r=20),
         )
-        fig.update_xaxes(title_text="Virage" if corners_df is not None else "Distance (m)", row=4, col=1)
+        fig.update_xaxes(title_text="Virage" if corners_df is not None else "Distance (m)", row=n_ch, col=1)
         plot(fig)
 
     # --- TAB MAP : VUE CIRCUIT ---
@@ -1513,9 +1644,10 @@ def page_style():
 
         color_by = st.radio(
             "Colorer par",
-            options=["Speed", "Throttle", "Brake", "nGear"],
+            options=["Speed", "Throttle", "Brake", "nGear", "DRS"],
             format_func=lambda x: {"Speed": "Vitesse", "Throttle": "Throttle",
-                                   "Brake": "Frein", "nGear": "Rapport"}[x],
+                                   "Brake": "Frein", "nGear": "Rapport",
+                                   "DRS": "DRS ouvert"}[x],
             horizontal=True,
             key="map_color_by",
         )
@@ -1542,8 +1674,9 @@ def page_style():
             )
         for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
             r, c = (i, 1) if MOBILE else (1, i)
+            xr, yr = _rotate_xy(tel["X"], tel["Y"])
             fig_map.add_trace(go.Scatter(
-                x=tel["X"], y=tel["Y"],
+                x=xr, y=yr,
                 mode="markers",
                 marker=dict(
                     color=vals,
@@ -1559,6 +1692,7 @@ def page_style():
                 showlegend=False,
                 hovertemplate=f"{color_by}: %{{marker.color:.0f}}<extra></extra>",
             ), row=r, col=c)
+            _add_corner_labels(fig_map, row=r, col=c)
         # Aspect ratio égal pour ne pas déformer le tracé
         # (le subplot i utilise les axes x{i}/y{i} quelle que soit l'orientation)
         for i in (1, 2):
@@ -1597,8 +1731,9 @@ def page_style():
         # Échelle symétrique pour que 0 = blanc soit toujours au milieu
         abs_max = float(np.percentile(np.abs(speed_delta), 95))  # robuste aux outliers
 
+        xb, yb = _rotate_xy(tel1_full["X"], tel1_full["Y"])
         fig_battle = go.Figure(go.Scatter(
-            x=tel1_full["X"], y=tel1_full["Y"],
+            x=xb, y=yb,
             mode="markers",
             marker=dict(
                 color=speed_delta,
@@ -1612,6 +1747,7 @@ def page_style():
             ),
             hovertemplate=f"Δ vitesse ({d1}−{d2}): %{{marker.color:+.1f}} km/h<extra></extra>",
         ))
+        _add_corner_labels(fig_battle)
         fig_battle.update_xaxes(scaleanchor="y", scaleratio=1,
                                 showticklabels=False, showgrid=False, zeroline=False)
         fig_battle.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
@@ -1665,8 +1801,9 @@ def page_style():
             ]
             abs_max_gain = max(float(np.percentile(np.abs(gain_ms), 95)), 1e-3)  # garde-fou
 
+            xh, yh = _rotate_xy(tel1_full["X"], tel1_full["Y"])
             fig_heat = go.Figure(go.Scatter(
-                x=tel1_full["X"], y=tel1_full["Y"],
+                x=xh, y=yh,
                 mode="markers",
                 marker=dict(
                     color=gain_ms,
@@ -1681,6 +1818,7 @@ def page_style():
                 ),
                 hovertemplate="Gain local: %{marker.color:+.2f} ms/m<extra></extra>",
             ))
+            _add_corner_labels(fig_heat)
             fig_heat.update_xaxes(scaleanchor="y", scaleratio=1,
                                   showticklabels=False, showgrid=False, zeroline=False)
             fig_heat.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
@@ -2176,21 +2314,31 @@ def page_style():
         if len(laps_d1_s) < 2 and len(laps_d2_s) < 2:
             st.info("Pas assez de tours pour analyser l'évolution. Cet onglet est conçu pour les sessions de type course ou long-run.")
         else:
-            # Option : filtrer les outliers (tours > médiane × 1.1)
+            # Option : filtrer les tours non représentatifs
             col_opt1, col_opt2 = st.columns([1, 3])
             with col_opt1:
                 filter_outliers = st.checkbox("Filtrer outliers", value=True,
-                                              help="Exclut les tours > 110% de la médiane (sortie de piste, "
-                                                   "drapeau jaune, etc.) du graphique ET des stats.")
+                                              help="Exclut les tours sous SC/VSC/drapeau rouge (statut piste "
+                                                   "officiel) puis les tours > 110% de la médiane, du "
+                                                   "graphique ET des stats.")
 
-            # FIX : le filtre s'applique en amont — graphique, stats par stint et
-            # pace tour par tour restent cohérents entre eux (avant : seul le
-            # graphe était filtré, moyennes/écart-type/dégradation incluaient
-            # les tours sous safety car que le graphe cachait).
+            def _is_neutralized(ts):
+                """TrackStatus FastF1 = concaténation de codes : 4 = Safety Car,
+                5 = drapeau rouge, 6/7 = Virtual Safety Car (déploiement/fin)."""
+                return any(c in str(ts) for c in ("4", "5", "6", "7"))
+
+            # Le filtre s'applique en amont — graphique, stats par stint et pace
+            # tour par tour restent cohérents entre eux. Le statut piste officiel
+            # attrape les tours neutralisés ; le seuil médiane garde le reste
+            # (tête-à-queue, trafic, tour raté).
             def _drop_outliers(laps_drv):
-                if filter_outliers and len(laps_drv) > 3:
+                if not filter_outliers:
+                    return laps_drv
+                if "TrackStatus" in laps_drv.columns:
+                    laps_drv = laps_drv.loc[~laps_drv["TrackStatus"].apply(_is_neutralized)]
+                if len(laps_drv) > 3:
                     median = laps_drv["LapTimeSeconds"].median()
-                    return laps_drv.loc[laps_drv["LapTimeSeconds"] < median * 1.10]
+                    laps_drv = laps_drv.loc[laps_drv["LapTimeSeconds"] < median * 1.10]
                 return laps_drv
 
             laps_d1_s = _drop_outliers(laps_d1_s)
@@ -2233,10 +2381,67 @@ def page_style():
                         ),
                     ))
 
+            # Contexte de course en fond : périodes SC/VSC (statut piste), pluie
+            # (météo) et température de piste (axe secondaire) — ce qui explique
+            # les tours « bizarres » sans avoir à les deviner.
+            def _lap_ranges(flags):
+                """Plages contiguës de tours où flags (Series bool indexée par
+                LapNumber) est vraie."""
+                ranges, start, prev = [], None, None
+                for n in sorted(flags.index):
+                    if flags[n] and start is None:
+                        start = n
+                    elif not flags[n] and start is not None:
+                        ranges.append((start, prev))
+                        start = None
+                    prev = n
+                if start is not None:
+                    ranges.append((start, prev))
+                return ranges
+
+            la_all = session.laps
+            if "TrackStatus" in la_all.columns:
+                sc_flags = la_all.groupby("LapNumber")["TrackStatus"].agg(
+                    lambda s: any(_is_neutralized(v) for v in s))
+                for a, b in _lap_ranges(sc_flags):
+                    fig_stint.add_vrect(x0=a - 0.5, x1=b + 0.5, line_width=0,
+                                        fillcolor="rgba(255,180,0,0.12)",
+                                        annotation_text="SC/VSC",
+                                        annotation_position="top left",
+                                        annotation_font=dict(size=9, color="rgba(255,200,80,0.9)"))
+            try:
+                wx_s = session.weather_data
+            except Exception:
+                wx_s = None
+            if wx_s is not None and len(wx_s) and "Rainfall" in wx_s.columns:
+                lap_t = la_all.dropna(subset=["Time"]).groupby("LapNumber")["Time"].max().dt.total_seconds()
+                if len(lap_t) > 1:
+                    # Mappe l'horodatage météo (temps session) → numéro de tour
+                    wx_lap = np.interp(wx_s["Time"].dt.total_seconds(),
+                                       lap_t.values, lap_t.index.values)
+                    if bool(wx_s["Rainfall"].any()):
+                        rain_flags = pd.Series(False, index=lap_t.index)
+                        for ln in np.round(wx_lap[wx_s["Rainfall"].values.astype(bool)]).astype(int):
+                            if ln in rain_flags.index:
+                                rain_flags[ln] = True
+                        for a, b in _lap_ranges(rain_flags):
+                            fig_stint.add_vrect(x0=a - 0.5, x1=b + 0.5, line_width=0,
+                                                fillcolor="rgba(80,140,255,0.12)",
+                                                annotation_text="🌧",
+                                                annotation_position="bottom left")
+                    fig_stint.add_trace(go.Scatter(
+                        x=wx_lap, y=wx_s["TrackTemp"], yaxis="y2", mode="lines",
+                        line=dict(color="rgba(255,255,255,0.35)", width=1.5, dash="dot"),
+                        name="Temp. piste (°C)",
+                        hovertemplate="Temp. piste: %{y:.0f} °C<extra></extra>",
+                    ))
+
             fig_stint.update_layout(
                 height=500, template="plotly_dark",
                 xaxis_title="Numéro de tour",
                 yaxis_title="Temps au tour (s)",
+                yaxis2=dict(title="Temp. piste (°C)", overlaying="y", side="right",
+                            showgrid=False, tickfont=dict(color="rgba(255,255,255,0.5)")),
                 hovermode="closest",
                 legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
             )
@@ -2401,6 +2606,17 @@ def page_style():
                     def pct(a, b):
                         return f"{a}/{b} ({a / b * 100:.0f} %)" if b else "—"
 
+                    # Pénalités relevées par la direction de course, par pilote
+                    try:
+                        rcm_pen = session.race_control_messages
+                        if rcm_pen is not None and len(rcm_pen):
+                            rcm_pen = rcm_pen[rcm_pen["Message"].astype(str)
+                                              .str.contains("PENALTY", na=False)]
+                        else:
+                            rcm_pen = None
+                    except Exception:
+                        rcm_pen = None
+
                     col_a, col_b = st.columns(2)
                     for col, m, drv in [(col_a, m1, d1), (col_b, m2, d2)]:
                         with col:
@@ -2410,6 +2626,12 @@ def page_style():
                             st.metric("Tours à l'attaque (<1 s devant)", m["attack"])
                             st.metric("Attaques converties en dépassement", pct(m["conv"], m["attack"]))
                             st.metric("Positions gagnées / perdues en piste", f"+{m['gained']} / −{m['lost']}")
+                            if rcm_pen is not None:
+                                mine = rcm_pen[rcm_pen["Message"].astype(str)
+                                               .str.contains(f"({drv})", regex=False, na=False)]
+                                st.metric("Pénalités (direction de course)", int(len(mine)))
+                                for _, pm in mine.iterrows():
+                                    st.caption(f"• {str(pm['Message']).capitalize()}")
 
                     with st.expander("💡 Comment lire (et limites)"):
                         st.markdown("""
@@ -2629,6 +2851,7 @@ def page_timing():
         rows.append({
             "drv": drv,
             "res_pos": float(res["Position"]) if res is not None and pd.notna(res.get("Position")) else np.nan,
+            "grid": float(res["GridPosition"]) if res is not None and pd.notna(res.get("GridPosition")) else np.nan,
             "res_status": str(res.get("Status", "")) if res is not None else "",
             "fin_laps": int(last["LapNumber"]),
             "fin_t": last["Time"].total_seconds() if pd.notna(last.get("Time")) else np.nan,
@@ -2732,7 +2955,27 @@ def page_timing():
         "S3★": dfr["bS3"].apply(_fmt_sec),
     })
 
+    if is_race and dfr["grid"].notna().any():
+        # Δ vs grille : places gagnées (vert) / perdues (rouge) depuis le départ
+        def _grid_cell(r):
+            if pd.isna(r["grid"]) or pd.isna(r["res_pos"]):
+                return "—"
+            g = int(r["grid"])
+            if g <= 0:
+                return "PL"  # départ de la pit lane
+            d = g - int(r["res_pos"])
+            return f"+{d}" if d > 0 else (f"−{abs(d)}" if d < 0 else "=")
+
+        disp.insert(2, "Δ Grille", [_grid_cell(r) for _, r in dfr.iterrows()])
+
     styles = pd.DataFrame("", index=disp.index, columns=disp.columns)
+
+    if "Δ Grille" in disp.columns:
+        for i, v in enumerate(disp["Δ Grille"]):
+            if v.startswith("+"):
+                styles.loc[i, "Δ Grille"] = "color: #4ADE80; font-weight: bold"
+            elif v.startswith("−"):
+                styles.loc[i, "Δ Grille"] = "color: #F87171; font-weight: bold"
 
     # Badge pilote : fond couleur équipe
     for i, drv in enumerate(dfr["drv"]):
@@ -2770,7 +3013,8 @@ def page_timing():
         "**S1-S3** = secteurs du dernier tour bouclé · **S1★-S3★** = meilleurs secteurs "
         "individuels · **Pneu** = âge (tours) + compound du dernier relais · "
         "les tours supprimés (track limits) sont exclus des records. "
-        + ("Écarts et statuts issus du classement officiel." if is_race
+        + ("Écarts, statuts et **Δ Grille** (places vs grille de départ, PL = départ "
+           "pit lane) issus du classement officiel." if is_race
            else "Classement par meilleur tour.")
     )
 
@@ -2816,13 +3060,101 @@ def page_timing():
             st.caption("Non représentés (écart non chiffré — tour(s) de retard ou abandon) : "
                        + ", ".join(missing))
 
+    # --- Progression des segments de qualification ---
+    if st.session_state.session_type in ("Q", "SQ") and results is not None:
+        qcols = [c for c in ("Q1", "Q2", "Q3") if c in results.columns]
+        if qcols and results[qcols].notna().any().any():
+            seg = "SQ" if st.session_state.session_type == "SQ" else "Q"
+            st.markdown("---")
+            st.markdown(f"#### 📶 Progression {seg}1 → {seg}2 → {seg}3")
+            resq = results.dropna(subset=["Position"]).sort_values("Position")
+            dispq = pd.DataFrame({
+                "Pos": resq["Position"].astype(int).values,
+                "Pilote": resq["Abbreviation"].astype(str).values,
+                **{f"{seg}{k}": resq[f"Q{k}"].apply(_fmt_lap).values
+                   for k in (1, 2, 3) if f"Q{k}" in qcols},
+            })
+            stylesq = pd.DataFrame("", index=dispq.index, columns=dispq.columns)
+            for i, drv in enumerate(dispq["Pilote"]):
+                colr = driver_color(drv)
+                stylesq.loc[i, "Pilote"] = (f"background-color: {colr}; color: {text_on(colr)}; "
+                                            f"font-weight: bold; border-radius: 6px; text-align: center")
+            for k in (1, 2, 3):
+                if f"Q{k}" not in qcols:
+                    continue
+                best_q = results[f"Q{k}"].min()
+                if pd.isna(best_q):
+                    continue
+                m = resq[f"Q{k}"].notna() & ((resq[f"Q{k}"] - best_q).abs() < _EPS)
+                stylesq.loc[m.values, f"{seg}{k}"] = "color: #C77DFF; font-weight: bold"
+            show_table(dispq.style.apply(lambda _: stylesq, axis=None),
+                       height=min(40 * (len(dispq) + 1) + 3, 780),
+                       force_html=True, mono=True)
+            st.caption("🟣 = meilleur temps du segment · — = éliminé avant ce segment "
+                       "(ou pas de temps enregistré).")
+
+    # --- Arrêts aux stands : temps perdu dans la pit lane ---
+    if is_race:
+        pit_rows = []
+        for drv in dfr["drv"]:
+            ld_p = laps_all[laps_all["Driver"] == drv].sort_values("LapNumber")
+            durs = []
+            for _, r in ld_p[ld_p["PitInTime"].notna()].iterrows():
+                nxt = ld_p[ld_p["LapNumber"] == r["LapNumber"] + 1]
+                if len(nxt) and pd.notna(nxt["PitOutTime"].iloc[0]):
+                    durs.append((nxt["PitOutTime"].iloc[0] - r["PitInTime"]).total_seconds())
+            if durs:
+                pit_rows.append({"Pilote": drv, "Arrêts": len(durs),
+                                 "Total pit lane": f"{sum(durs):.1f}s",
+                                 "Moyenne": f"{np.mean(durs):.1f}s",
+                                 "Plus rapide": f"{min(durs):.1f}s",
+                                 "_tot": sum(durs)})
+        if pit_rows:
+            st.markdown("---")
+            with st.expander("🛠️ Arrêts aux stands — temps perdu dans la pit lane", expanded=False):
+                dfp = pd.DataFrame(pit_rows).sort_values("_tot").drop(columns="_tot").reset_index(drop=True)
+                stylesp = pd.DataFrame("", index=dfp.index, columns=dfp.columns)
+                for i, drv in enumerate(dfp["Pilote"]):
+                    colr = driver_color(drv)
+                    stylesp.loc[i, "Pilote"] = (f"background-color: {colr}; color: {text_on(colr)}; "
+                                                f"font-weight: bold; border-radius: 6px; text-align: center")
+                show_table(dfp.style.apply(lambda _: stylesp, axis=None),
+                           height=min(40 * (len(dfp) + 1) + 3, 600),
+                           force_html=True, mono=True)
+                st.caption("Temps entrée → sortie de la pit lane (traversée + arrêt), reconstruit "
+                           "depuis PitInTime/PitOutTime. Trié du moins au plus de temps perdu.")
+
+    # --- Messages de la direction de course ---
+    try:
+        rcm = session.race_control_messages
+    except Exception:
+        rcm = None
+    if rcm is not None and len(rcm):
+        st.markdown("---")
+        with st.expander("📢 Direction de course — drapeaux, SC, pénalités, tours supprimés",
+                         expanded=False):
+            msgs = rcm["Message"].astype(str)
+            cat = rcm["Category"].astype(str) if "Category" in rcm.columns \
+                else pd.Series("", index=rcm.index)
+            important = rcm[
+                (cat.isin(("Flag", "SafetyCar")) & ~msgs.str.contains("GREEN|CLEAR", na=False))
+                | msgs.str.contains("PENALTY|INVESTIGAT|DELETED|SAFETY CAR|VIRTUAL|RED FLAG",
+                                    case=False, na=False)
+            ]
+            df_rcm = important if len(important) else rcm
+            cols_rcm = [c for c in ("Lap", "Category", "Message") if c in df_rcm.columns]
+            st.dataframe(df_rcm[cols_rcm], width="stretch", hide_index=True,
+                         height=min(38 * (len(df_rcm) + 1) + 3, 480))
+            st.caption("Messages officiels FIA, filtrés sur l'essentiel : drapeaux, SC/VSC, "
+                       "pénalités, enquêtes et tours supprimés.")
+
     # --- Championnat pilotes : impact de la session ---
     if not is_race:
         return
     st.markdown("---")
     st.markdown("#### 🏆 Championnat pilotes — impact de la session")
     with st.spinner("Calcul des points de la saison (long au premier chargement, ensuite en cache)…"):
-        pts_before, cb_before = season_points_before(
+        pts_before, cb_before, team_before = season_points_before(
             st.session_state.year, int(ev["RoundNumber"]), st.session_state.session_type
         )
     pts_session = {}
@@ -2892,6 +3224,56 @@ def page_timing():
         "gagnées/perdues au général grâce à cette session. Les égalités de points sont "
         "départagées comme au règlement : décompte des meilleures positions d'arrivée "
         "en course (les sprints ne comptent pas dans le départage)."
+    )
+
+    # --- Championnat constructeurs : impact de la session ---
+    st.markdown("---")
+    st.markdown("#### 🏭 Championnat constructeurs — impact de la session")
+    team_session = {}
+    if results is not None:
+        for _, r in results.iterrows():
+            team = str(r.get("TeamName", "") or "")
+            if team:
+                team_session[team] = (team_session.get(team, 0.0)
+                                      + pts_session.get(str(r["Abbreviation"]), 0.0))
+    all_teams = set(team_before) | set(team_session)
+    if not all_teams:
+        st.info("Points constructeurs indisponibles pour cette session.")
+        return
+    t_after = {t: team_before.get(t, 0.0) + team_session.get(t, 0.0) for t in all_teams}
+    trk_b = {t: i + 1 for i, t in enumerate(
+        sorted(all_teams, key=lambda t: (-team_before.get(t, 0.0), t)))}
+    trk_a = {t: i + 1 for i, t in enumerate(
+        sorted(all_teams, key=lambda t: (-t_after[t], t)))}
+    rows_t = []
+    for t in sorted(all_teams, key=lambda k: trk_a[k]):
+        dlt = trk_b[t] - trk_a[t]
+        rows_t.append({
+            "Pos": trk_a[t], "Équipe": t,
+            "Points": f"{t_after[t]:g}",
+            "+ Session": f"+{team_session.get(t, 0):g}" if team_session.get(t, 0) else "–",
+            "Δ Pos": (f"+{dlt}" if dlt > 0 else f"−{abs(dlt)}") if dlt else "–",
+            "_delta": dlt,
+        })
+    dct = pd.DataFrame(rows_t)
+    disp_t = dct[["Pos", "Équipe", "Points", "+ Session", "Δ Pos"]]
+    styles_t = pd.DataFrame("", index=disp_t.index, columns=disp_t.columns)
+    for i in disp_t.index:
+        colr = team_color(dct["Équipe"].iloc[i])
+        styles_t.loc[i, "Équipe"] = (f"background-color: {colr}; color: {text_on(colr)}; "
+                                     f"font-weight: bold; border-radius: 6px")
+        dlt = dct["_delta"].iloc[i]
+        if dlt > 0:
+            styles_t.loc[i, "Δ Pos"] = "color: #4ADE80; font-weight: bold"
+        elif dlt < 0:
+            styles_t.loc[i, "Δ Pos"] = "color: #F87171; font-weight: bold"
+    show_table(disp_t.style.apply(lambda _: styles_t, axis=None),
+               height=min(40 * (len(disp_t) + 1) + 3, 560),
+               force_html=True, mono=True)
+    st.caption(
+        "Somme des points des pilotes de chaque équipe, courses + sprints. "
+        "Égalités départagées par points uniquement (le countback constructeurs "
+        "n'est pas appliqué)."
     )
 
 
