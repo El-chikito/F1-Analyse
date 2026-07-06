@@ -1,5 +1,5 @@
-"""Style Decoder — Streamlit App
-================================
+"""Analyse F1 — Streamlit App
+=============================
 Interface interactive pour analyser les styles de pilotage en F1.
 
 Pour lancer :
@@ -14,6 +14,12 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- RENOMMAGE : l'app s'appelle désormais « Analyse F1 » ; la page d'accueil
+  « Timing session » devient « Overview session ».
+- NOUVEAU écran de bienvenue : à la première visite, les réglages (saison,
+  GP, session) sont aussi proposés au centre de la page — plus besoin de
+  trouver la barre latérale (repliée sur mobile) pour démarrer. Ils restent
+  synchronisés avec ceux de la sidebar.
 - FIX  Garde pilote 1 ≠ pilote 2 : le doublon créait un index dupliqué qui
        cassait l'onglet Signatures et la pace tour par tour.
 - FIX  get_lap_options : pick_fastest() peut renvoyer None (ex. tous les
@@ -91,7 +97,7 @@ from fastf1.utils import delta_time
 
 # ============== CONFIG ==============
 st.set_page_config(
-    page_title="F1 Style Decoder",
+    page_title="Analyse F1",
     page_icon="🏎️",
     layout="wide",
     initial_sidebar_state="auto",  # repliée sur mobile, dépliée sur desktop
@@ -438,6 +444,17 @@ SESSION_LABELS = {
     "Q": "Qualifications", "R": "Course", "SQ": "Sprint Shootout", "S": "Sprint",
     "FP3": "Essais Libres 3", "FP2": "Essais Libres 2", "FP1": "Essais Libres 1",
 }
+SESSION_TYPES = list(SESSION_LABELS.keys())
+YEARS = list(range(2026, 2017, -1))
+
+
+def gp_options_from(sched):
+    """Options du sélecteur de Grand Prix depuis un calendrier FastF1 :
+    {label affiché: EventName}. Partagé entre la sidebar et l'écran d'accueil."""
+    return {
+        f"R{int(row.RoundNumber)} — {row.EventName} ({row.Country})": row.EventName
+        for _, row in sched.iterrows()
+    }
 
 
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
@@ -811,7 +828,7 @@ def field_corner_profile(year, gp, ses):
 
 # ============== HEADER ==============
 st.markdown("""
-# 🏎️ F1 Style Decoder
+# 🏎️ Analyse F1
 ### Lecture télémétrique des styles de pilotage en Formule 1
 """)
 
@@ -847,7 +864,7 @@ st.markdown("""
 
 year = st.sidebar.selectbox(
     "Saison",
-    options=list(range(2026, 2017, -1)),
+    options=YEARS,
     index=0,  # saison en cours (2026) par défaut
     help="FastF1 supporte 2018 → présent. Les données 2026 récentes peuvent être partielles.",
 )
@@ -855,10 +872,7 @@ year = st.sidebar.selectbox(
 with st.spinner(f"Chargement du calendrier {year}…"):
     schedule = load_schedule(year)
 
-gp_options = {
-    f"R{int(row.RoundNumber)} — {row.EventName} ({row.Country})": row.EventName
-    for _, row in schedule.iterrows()
-}
+gp_options = gp_options_from(schedule)
 gp_label = st.sidebar.selectbox(
     "Grand Prix",
     options=list(gp_options.keys()),
@@ -868,7 +882,7 @@ gp_name = gp_options[gp_label]
 
 session_type = st.sidebar.selectbox(
     "Session",
-    options=["Q", "R", "SQ", "S", "FP3", "FP2", "FP1"],
+    options=SESSION_TYPES,
     index=0,
     format_func=lambda x: SESSION_LABELS.get(x, x),
 )
@@ -886,7 +900,39 @@ if load_btn:
     st.session_state.session_type = session_type
 
 if not st.session_state.get("session_loaded"):
-    st.info("👈 Configure les paramètres dans la barre latérale et clique sur **Charger la session**.")
+    # Écran de bienvenue : les mêmes réglages que la sidebar, au centre de la
+    # page — un premier visiteur (sidebar repliée sur mobile) n'est pas perdu.
+    st.markdown("### 👋 Bienvenue !")
+    st.markdown(
+        "Choisis la **session à analyser** ci-dessous, puis clique sur **Charger la session**. "
+        "Tu retrouveras ces réglages à tout moment dans la barre latérale "
+        "(sur mobile : icône **»** en haut à gauche)."
+    )
+    if MOBILE:
+        c_y = c_gp = c_s = st  # empilé verticalement sur petit écran
+    else:
+        c_y, c_gp, c_s = st.columns([1, 2, 1])
+    home_year = c_y.selectbox(
+        "Saison", options=YEARS, index=YEARS.index(year), key="home_year",
+        help="FastF1 supporte 2018 → présent.",
+    )
+    with st.spinner(f"Chargement du calendrier {home_year}…"):
+        gp_options_h = gp_options_from(load_schedule(home_year))
+    labels_h = list(gp_options_h.keys())
+    home_gp_label = c_gp.selectbox(
+        "Grand Prix", options=labels_h, key="home_gp",
+        index=labels_h.index(gp_label) if gp_label in labels_h else min(len(labels_h) - 1, 12),
+    )
+    home_session = c_s.selectbox(
+        "Session", options=SESSION_TYPES, index=SESSION_TYPES.index(session_type),
+        format_func=lambda x: SESSION_LABELS.get(x, x), key="home_session",
+    )
+    if st.button("🚀 Charger la session", type="primary", key="home_load"):
+        st.session_state.session_loaded = True
+        st.session_state.year = home_year
+        st.session_state.gp_name = gp_options_h[home_gp_label]
+        st.session_state.session_type = home_session
+        st.rerun()  # repart proprement, sans laisser le formulaire d'accueil affiché
     st.stop()
 
 # Hint si les widgets de la sidebar diffèrent de la session actuellement chargée
@@ -2511,7 +2557,7 @@ def page_timing():
     perso), badges couleur équipe, fonds violet (record session) / vert
     (record perso). Les mini-secteurs n'existent que dans le flux live
     SignalR — absents des données post-session FastF1, donc non affichés."""
-    st.markdown(f"## 📊 Timing — {SESSION_LABELS.get(st.session_state.session_type, st.session_state.session_type)}")
+    st.markdown(f"## 📊 Overview — {SESSION_LABELS.get(st.session_state.session_type, st.session_state.session_type)}")
 
     VIOLET_BG = "background-color: #7C3AED; color: #FFFFFF; font-weight: bold; border-radius: 6px; text-align: center"
     GREEN_BG = "background-color: #22C55E; color: #111111; font-weight: bold; border-radius: 6px; text-align: center"
@@ -2826,11 +2872,11 @@ def page_timing():
 
 # ============== NAVIGATION ==============
 pg = st.navigation([
-    st.Page(page_timing, title="Timing session", icon="📊", default=True),
+    st.Page(page_timing, title="Overview session", icon="📊", default=True),
     st.Page(page_style, title="Style de pilotage", icon="🎨"),
 ])
 pg.run()
 
 # ============== FOOTER ==============
 st.markdown("---")
-st.caption("Données : F1 Live Timing via FastF1 · Couleurs équipes 2026 · Style decoder by you")
+st.caption("Données : F1 Live Timing via FastF1 · Couleurs équipes 2026 · Analyse F1 by you")
