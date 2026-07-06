@@ -14,6 +14,10 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX  UX mobile : plus de clavier virtuel à l'ouverture des menus
+       déroulants (inputs des selectbox passés en readonly + inputmode="none"
+       en mode compact ; le menu s'ouvre normalement, seule la recherche par
+       frappe — inutile au doigt — disparaît).
 - RENOMMAGE : l'app s'appelle désormais « Analyse F1 » ; la page d'accueil
   « Timing session » devient « Overview session ».
 - NOUVEAU écran de bienvenue : à la première visite, les réglages (saison,
@@ -87,6 +91,7 @@ import os
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import uniform_filter1d
@@ -861,6 +866,26 @@ st.markdown("""
 .tbl-wrap.mono td {padding: 5px 9px;}
 </style>
 """, unsafe_allow_html=True)
+
+if MOBILE:
+    # Les selectbox Streamlit sont des champs de recherche (BaseWeb) : au tap,
+    # le téléphone ouvre le clavier virtuel qui mange la moitié de l'écran.
+    # On passe leurs inputs en readonly + inputmode="none" → le menu s'ouvre
+    # toujours, mais plus de clavier (seule la recherche par frappe, inutile
+    # au doigt, est sacrifiée). Le MutationObserver re-patche les inputs que
+    # Streamlit recrée à chaque rerun. Desktop non concerné (recherche gardée).
+    components.html("""
+    <script>
+    const doc = window.parent.document;
+    const patch = () => doc.querySelectorAll('div[data-baseweb="select"] input')
+        .forEach(el => {
+            el.setAttribute('readonly', 'readonly');
+            el.setAttribute('inputmode', 'none');
+        });
+    patch();
+    new MutationObserver(patch).observe(doc.body, {childList: true, subtree: true});
+    </script>
+    """, height=0)
 
 year = st.sidebar.selectbox(
     "Saison",
