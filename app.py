@@ -14,6 +14,21 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX  Garde pilote 1 ≠ pilote 2 : le doublon créait un index dupliqué qui
+       cassait l'onglet Signatures et la pace tour par tour.
+- FIX  get_lap_options : pick_fastest() peut renvoyer None (ex. tous les
+       tours supprimés pour track limits) → fallback sur le tour le plus
+       rapide par idxmin.
+- FIX  Évolution course : le filtre outliers s'applique aussi aux stats de
+       stint et à la pace tour par tour (avant : graphique seulement, les
+       moyennes/dégradation restaient polluées par les tours sous SC).
+- Couleurs des équipes historiques 2018-2020 (Renault, Toro Rosso, Alfa
+  Romeo, Racing Point, Force India) + texte des badges en noir sur fonds
+  clairs (lisibilité, ex. jaune Renault).
+- Brake et nGear tracés en marches (line_shape="hv") au lieu de rampes.
+- Radar : tirets distincts par pilote → deux coéquipiers (même couleur
+  équipe) restent discernables.
+- Saison par défaut : 2026 (saison en cours).
 - REFONTE en deux pages via st.navigation (menu en haut de la sidebar ;
   sur mobile, il s'ouvre par l'icône en haut à gauche) :
   · 📊 Timing session (accueil) : tableau récap façon écran livetiming —
@@ -99,6 +114,12 @@ TEAM_COLORS = {
     "Racing Bulls": "#6692FF", "RB": "#6692FF",
     "Cadillac": "#C9B037",
     "AlphaTauri": "#6692FF",
+    # Équipes historiques (l'app couvre 2018 → présent)
+    "Toro Rosso": "#469BFF",
+    "Alfa Romeo": "#900000", "Alfa Romeo Racing": "#900000",
+    "Renault": "#FFF500",
+    "Racing Point": "#F596C8", "Force India": "#F596C8",
+    "Alpine F1 Team": "#E91E63",
 }
 
 # --- Couleurs des compounds pneus (officiel F1) ---
@@ -125,7 +146,7 @@ CIRCUITS_INFO = {
         "zones": [
             ("T1 entrée", "T1", 0, 400, "Gros freinage de 320 à 80 km/h depuis la ligne droite des stands. Premier overtaking spot, beaucoup de chaos au départ."),
             ("T4 chicane", "T4", 800, 1100, "Freinage en bout de la deuxième plus longue ligne droite. Deuxième zone d'overtaking majeur."),
-            ("Esses T9-T10", "T9-T10", 2900, 3300, "Enchaînement rapide gauche-droite, technique. Différencie les caméléons."),
+            ("Esses T9-T10", "T9-T10", 2900, 3300, "Enchaînement rapide gauche-droite, technique. Différencie les champions."),
             ("T13", "T13", 4400, 4700, "Long virage à droite, traction critique sur la sortie pour les stats S3."),
         ],
     },
@@ -152,7 +173,7 @@ CIRCUITS_INFO = {
         "zones": [
             ("S1 Esses (T2-T7)", "T2-T7", 400, 1300, "Enchaînement de S à haute vitesse. Le rythme et la fluidité du pilote sont mis à nu. Une seule erreur compromet toute la séquence."),
             ("Dunlop Curve + Degner", "T8-T10", 1300, 2200, "Gauche en aveugle puis droite-droite. Trail-braking expert nécessaire."),
-            ("Spoon Curve", "T13-T14", 3300, 3800, "Gauche double-apex, very long. Différencie momentum vs rotation."),
+            ("Spoon Curve", "T13-T14", 3300, 3800, "Gauche double-apex, très long. Différencie momentum vs rotation."),
             ("130R", "T15", 4300, 4600, "Gauche flat-out à 320 km/h. Engagement pur, peu de marge."),
             ("Casio Triangle", "T16-T18", 4900, 5200, "Chicane finale, freinage tardif depuis 130R, sortie sur la ligne droite des stands."),
         ],
@@ -202,7 +223,7 @@ CIRCUITS_INFO = {
         "zones": [
             ("T1-T2 chicane", "T1-T2", 0, 400, "Première chicane après le départ, gros freinage."),
             ("T6-T7 chicane", "T6-T7", 1200, 1500, "Chicane rapide gauche-droite."),
-            ("Hairpin", "T10", 2300, 2700, "L'épingle la plus lente du calendrier (~60 km/h). Modulation throttle critique en sortie sur Casino Straight."),
+            ("Hairpin", "T10", 2300, 2700, "Épingle très lente (~60 km/h). Modulation throttle critique en sortie sur Casino Straight."),
             ("Wall of Champions", "T13-T14", 3900, 4250, "Chicane finale gauche-droite à 30 cm du mur. Hill, Schumacher, Villeneuve s'y sont crashés en 1999. Le test ultime de confiance dans l'avant."),
         ],
     },
@@ -306,7 +327,7 @@ CIRCUITS_INFO = {
         ],
     },
     "São Paulo Grand Prix": {
-        "facts": "Interlagos, circuit antihoraire (rare en F1). Météo très changeante (la pluie peut tomber sur S1 et pas S3). Sentier vallonné, course toujours pleine d'action.",
+        "facts": "Interlagos, circuit antihoraire (rare en F1). Météo très changeante (la pluie peut tomber sur S1 et pas S3). Tracé vallonné, course toujours pleine d'action.",
         "zones": [
             ("S do Senna", "T1-T2", 0, 500, "Gauche-droite d'ouverture en descente. Premier overtaking spot, chaos fréquent."),
             ("Descida do Lago", "T4-T5", 800, 1300, "Descente technique."),
@@ -453,6 +474,14 @@ def hex_to_rgba(h, a):
     return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{a})"
 
 
+def text_on(bg):
+    """Noir ou blanc selon la luminance du fond — garde les badges lisibles
+    sur les couleurs claires (jaune Renault, gris Haas, pink Racing Point)."""
+    h = bg.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#111111" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#FFFFFF"
+
+
 def _chan(tel, ch):
     """Brake est booléen chez FastF1 → int, sinon plotly peut basculer en axe
     catégoriel selon les versions. Les autres canaux passent tels quels."""
@@ -514,11 +543,10 @@ def analyze_corner(tel, apex_d, prev_b, next_b):
     if len(pre):
         brk = (pre["Brake"].astype(float) > 0).astype(int).values
         if brk.any():
+            # prepend=0 garantit au moins un onset dès que brk.any() (y compris
+            # si le pilote freinait déjà au 1er échantillon de la fenêtre)
             onsets = np.where(np.diff(brk, prepend=0) == 1)[0]
-            if len(onsets):
-                onset_d = float(pre["Distance"].iloc[onsets[-1]])
-            else:
-                onset_d = float(pre["Distance"].iloc[0])  # freinait déjà (chicane)
+            onset_d = float(pre["Distance"].iloc[onsets[-1]])
             res["brake_before"] = apex_d - onset_d
             zone = pre[pre["Distance"] >= onset_d]
             if len(zone) >= 3:
@@ -820,7 +848,7 @@ st.markdown("""
 year = st.sidebar.selectbox(
     "Saison",
     options=list(range(2026, 2017, -1)),
-    index=1,  # 2025 par défaut
+    index=0,  # saison en cours (2026) par défaut
     help="FastF1 supporte 2018 → présent. Les données 2026 récentes peuvent être partielles.",
 )
 
@@ -842,15 +870,7 @@ session_type = st.sidebar.selectbox(
     "Session",
     options=["Q", "R", "SQ", "S", "FP3", "FP2", "FP1"],
     index=0,
-    format_func=lambda x: {
-        "Q": "Qualifications",
-        "R": "Course",
-        "SQ": "Sprint Shootout",
-        "S": "Sprint",
-        "FP3": "Essais Libres 3",
-        "FP2": "Essais Libres 2",
-        "FP1": "Essais Libres 1",
-    }[x],
+    format_func=lambda x: SESSION_LABELS.get(x, x),
 )
 
 # Bouton pour déclencher le chargement.
@@ -959,6 +979,11 @@ def page_style():
         format_func=lambda x: driver_full.get(x, x),
     )
 
+    # Le même pilote deux fois crée un index dupliqué (Signatures) et des
+    # colonnes de merge en double (pace tour par tour) → on bloque proprement.
+    if d1 == d2:
+        st.warning("⚠️ Sélectionne deux pilotes **différents** dans la barre latérale pour comparer.")
+        st.stop()
 
     c1, c2 = driver_color(d1), driver_color(d2)
     # S'assure que les deux couleurs sont différentes
@@ -977,6 +1002,10 @@ def page_style():
         if valid.empty:
             return [], {}, None
         fastest = valid.pick_fastest()
+        if fastest is None or pd.isna(fastest.get("LapTime")):
+            # pick_fastest() renvoie None si aucun tour n'est marqué personal
+            # best (ex. tous les tours valides supprimés pour track limits)
+            fastest = valid.loc[valid["LapTime"].idxmin()]
         fastest_num = int(fastest["LapNumber"])
 
         options = []
@@ -1366,14 +1395,17 @@ def page_style():
         )
         channels = ["Speed", "Throttle", "Brake", "nGear"]
         for i, ch in enumerate(channels, start=1):
+            # Brake (0/1) et nGear (entiers) : tracé en marches — sinon plotly
+            # relie les échantillons par des rampes physiquement fausses
+            shape = "hv" if ch in ("Brake", "nGear") else "linear"
             fig.add_trace(go.Scatter(
                 x=tel1["Distance"], y=_chan(tel1, ch), name=d1,
-                line=dict(color=c1, width=1.8),
+                line=dict(color=c1, width=1.8, shape=shape),
                 legendgroup=d1, showlegend=(i == 1),
             ), row=i, col=1)
             fig.add_trace(go.Scatter(
                 x=tel2["Distance"], y=_chan(tel2, ch), name=d2,
-                line=dict(color=c2, width=1.8),
+                line=dict(color=c2, width=1.8, shape=shape),
                 legendgroup=d2, showlegend=(i == 1),
             ), row=i, col=1)
 
@@ -1387,6 +1419,7 @@ def page_style():
             fig.update_xaxes(
                 tickvals=corners_df["Distance"].tolist(),
                 ticktext=[f"T{int(c['Number'])}{c['Letter']}" for _, c in corners_df.iterrows()],
+                tickangle=45 if MOBILE else 0,  # T1…T19 se chevauchent sur petit écran
                 row=4, col=1,
             )
 
@@ -1813,7 +1846,7 @@ def page_style():
         with st.expander("💡 Comment lire ces signatures"):
             st.markdown("""
             - **`% temps full throttle`** plus élevé = style **binaire/agressif** (rotation-style typique).
-            - **`% temps en coast`** plus élevé = pilote qui **module** entre frein et gaz, joue avec le rotation de l'arrière. Signature classique Verstappen.
+            - **`% temps en coast`** plus élevé = pilote qui **module** entre frein et gaz, joue avec la rotation de l'arrière. Signature classique Verstappen.
             - **`Throttle ramp-up`** élevé = réapplication brutale du gaz (Verstappen). Bas = progression lisse (Hamilton, Norris).
             - **`V_min médiane courbes`** élevée = style **momentum** (porte de la vitesse en courbe, Norris, Hamilton). Basse = style **rotation** (V-shape, Verstappen).
             - **`Nb phases de freinage`** : indicateur indirect du nombre de virages où on freine. Diffère peu entre 2 pilotes sur même circuit, mais utile pour repérer des freinages "manqués" ou ajoutés.
@@ -1993,12 +2026,13 @@ def page_style():
             subplot_titles=("Vitesse", "Throttle", "Frein"),
         )
         for i, ch in enumerate(["Speed", "Throttle", "Brake"], start=1):
+            shape = "hv" if ch == "Brake" else "linear"  # frein 0/1 → marches
             fig.add_trace(go.Scatter(x=tel1.loc[m1, "Distance"], y=_chan(tel1.loc[m1], ch),
-                                     name=d1, line=dict(color=c1, width=2),
+                                     name=d1, line=dict(color=c1, width=2, shape=shape),
                                      legendgroup=d1, showlegend=(i == 1)),
                           row=i, col=1)
             fig.add_trace(go.Scatter(x=tel2.loc[m2, "Distance"], y=_chan(tel2.loc[m2], ch),
-                                     name=d2, line=dict(color=c2, width=2),
+                                     name=d2, line=dict(color=c2, width=2, shape=shape),
                                      legendgroup=d2, showlegend=(i == 1)),
                           row=i, col=1)
         fig.update_layout(height=600, template="plotly_dark", hovermode="x unified",
@@ -2020,6 +2054,8 @@ def page_style():
             s2_val = _sec(lap2[f"Sector{i}Time"])
             if np.isnan(s1_val) or np.isnan(s2_val):
                 faster = "—"
+            elif s1_val == s2_val:
+                faster = "Égalité"
             else:
                 faster = d2 if s1_val > s2_val else d1
             sectors_data.append({"Secteur": f"S{i}", d1: s1_val, d2: s2_val,
@@ -2037,6 +2073,7 @@ def page_style():
                 marker_color=bar_colors,
                 text=[f"{d:+.3f}s" if pd.notna(d) else "—" for d in df_sec["Δ"]],
                 textposition="outside",
+                cliponaxis=False,  # sinon le label de la plus grande barre est rogné
             ))
             fig.add_hline(y=0, line=dict(color="white"))
             fig.update_layout(
@@ -2048,7 +2085,7 @@ def page_style():
 
     # --- TAB STINT : ÉVOLUTION COURSE ---
     with tab_stint:
-        st.markdown("Évolution des temps au tour par relai pneu (stint). **Principalement utile en course** (R), mais marche aussi sur les longs runs FP2.")
+        st.markdown("Évolution des temps au tour par relais pneu (stint). **Principalement utile en course** (R), mais marche aussi sur les longs runs FP2.")
 
         def get_stint_laps(drv):
             """Récupère les tours valides d'un pilote avec infos de stint.
@@ -2072,7 +2109,21 @@ def page_style():
             col_opt1, col_opt2 = st.columns([1, 3])
             with col_opt1:
                 filter_outliers = st.checkbox("Filtrer outliers", value=True,
-                                              help="Cache les tours > 110% de la médiane (sortie de piste, drapeau jaune, etc.)")
+                                              help="Exclut les tours > 110% de la médiane (sortie de piste, "
+                                                   "drapeau jaune, etc.) du graphique ET des stats.")
+
+            # FIX : le filtre s'applique en amont — graphique, stats par stint et
+            # pace tour par tour restent cohérents entre eux (avant : seul le
+            # graphe était filtré, moyennes/écart-type/dégradation incluaient
+            # les tours sous safety car que le graphe cachait).
+            def _drop_outliers(laps_drv):
+                if filter_outliers and len(laps_drv) > 3:
+                    median = laps_drv["LapTimeSeconds"].median()
+                    return laps_drv.loc[laps_drv["LapTimeSeconds"] < median * 1.10]
+                return laps_drv
+
+            laps_d1_s = _drop_outliers(laps_d1_s)
+            laps_d2_s = _drop_outliers(laps_d2_s)
 
             # --- Graphique principal ---
             fig_stint = go.Figure()
@@ -2080,11 +2131,6 @@ def page_style():
             for laps_drv, drv, line_color in [(laps_d1_s, d1, c1), (laps_d2_s, d2, c2)]:
                 if len(laps_drv) == 0:
                     continue
-
-                # Filtre outliers
-                if filter_outliers and len(laps_drv) > 3:
-                    median = laps_drv["LapTimeSeconds"].median()
-                    laps_drv = laps_drv.loc[laps_drv["LapTimeSeconds"] < median * 1.10]
 
                 # Une trace par stint pour casser les lignes entre stints
                 if "Stint" in laps_drv.columns:
@@ -2185,8 +2231,12 @@ def page_style():
                         - **< +30 ms/tour** : excellente gestion pneus (Verstappen, Hamilton historiquement)
                         - **+30 à +80 ms/tour** : normal
                         - **> +80 ms/tour** : pilote qui en demande trop à ses pneus, ou stratégie risquée
+                        - ⚠️ En course, l'allègement carburant fait gagner ~50-80 ms/tour : la pente
+                          affichée **sous-estime la vraie dégradation pneu** d'autant. La comparaison
+                          entre les deux pilotes reste valide (même effet des deux côtés), les seuils
+                          absolus ci-dessus sont à lire avec cette réserve.
 
-                    **Crois ces deux infos** : un pilote avec un meilleur **Best** mais une moins bonne **Moyenne** est rapide quand il pousse mais ne tient pas — il sera défavorisé sur des longues séquences. C'est typiquement le profil "qualif > course".
+                    **Croise ces deux infos** : un pilote avec un meilleur **Best** mais une moins bonne **Moyenne** est rapide quand il pousse mais ne tient pas — il sera défavorisé sur des longues séquences. C'est typiquement le profil "qualif > course".
                     """)
 
             # --- Bonus : différence de pace par tour ---
@@ -2388,7 +2438,7 @@ def page_style():
         # en préservant l'ordre.
         default_radar = list(dict.fromkeys(
             d for d in [d1, d2, "NOR", "HAM", "ALO"] if d in drivers_in_session
-        ))[:5]
+        ))[:6]
         drivers_radar = st.multiselect(
             "Pilotes",
             options=drivers_in_session,
@@ -2430,13 +2480,18 @@ def page_style():
                 df_n = (df_m - df_m.min()) / (df_m.max() - df_m.min() + 1e-9)
 
                 fig = go.Figure()
-                for drv in df_n.index:
+                dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+                for k, drv in enumerate(df_n.index):
                     vals = df_n.loc[drv].tolist()
                     vals += vals[:1]
                     labels = df_n.columns.tolist() + [df_n.columns[0]]
                     fig.add_trace(go.Scatterpolar(
                         r=vals, theta=labels, fill="toself",
-                        name=drv, line=dict(color=driver_color(drv), width=2),
+                        name=drv,
+                        # tiret différent par trace : deux coéquipiers (même
+                        # couleur équipe) restent discernables
+                        line=dict(color=driver_color(drv), width=2,
+                                  dash=dashes[k % len(dashes)]),
                         opacity=0.7,
                     ))
                 fig.update_layout(
@@ -2611,7 +2666,7 @@ def page_timing():
     # Badge pilote : fond couleur équipe
     for i, drv in enumerate(dfr["drv"]):
         colr = driver_color(drv)
-        styles.loc[i, "Pilote"] = (f"background-color: {colr}; color: #FFFFFF; "
+        styles.loc[i, "Pilote"] = (f"background-color: {colr}; color: {text_on(colr)}; "
                                    f"font-weight: bold; border-radius: 6px; text-align: center")
         styles.loc[i, "Pneu"] = f"color: {compound_color(dfr['comp'].iloc[i])}; font-weight: bold"
 
@@ -2652,7 +2707,7 @@ def page_timing():
     st.markdown("---")
     st.markdown("#### ⏱️ Écarts à l'arrivée" if is_race else "#### ⏱️ Écarts au meilleur tour")
     plotted = [(dfr["drv"].iloc[i], gap_num[i]) for i in range(len(dfr))
-               if gap_num[i] is not None and np.isfinite(gap_num[i])]
+               if np.isfinite(gap_num[i])]
     if len(plotted) < 2:
         st.info("Pas assez d'écarts chiffrés pour tracer le schéma.")
     else:
@@ -2685,7 +2740,7 @@ def page_timing():
                               margin=dict(t=10, b=40, l=20, r=20))
         plot(fig_gap)
         missing = [dfr["drv"].iloc[i] for i in range(len(dfr))
-                   if not (gap_num[i] is not None and np.isfinite(gap_num[i]))]
+                   if not np.isfinite(gap_num[i])]
         if missing:
             st.caption("Non représentés (écart non chiffré — tour(s) de retard ou abandon) : "
                        + ", ".join(missing))
@@ -2749,8 +2804,9 @@ def page_timing():
     disp_c = dcp[["Pos", "Pilote", "Points", "+ Session", "Δ Pos"]]
     styles_c = pd.DataFrame("", index=disp_c.index, columns=disp_c.columns)
     for i in disp_c.index:
-        styles_c.loc[i, "Pilote"] = (f"background-color: {driver_color(dcp['_code'].iloc[i])}; "
-                                     f"color: #FFFFFF; font-weight: bold; border-radius: 6px")
+        colr = driver_color(dcp["_code"].iloc[i])
+        styles_c.loc[i, "Pilote"] = (f"background-color: {colr}; color: {text_on(colr)}; "
+                                     f"font-weight: bold; border-radius: 6px")
         dlt = dcp["_delta"].iloc[i]
         if dlt > 0:
             styles_c.loc[i, "Δ Pos"] = "color: #4ADE80; font-weight: bold"
