@@ -33,6 +33,12 @@ Changements vs version précédente
        PL = pit lane), progression Q1→Q2→Q3 en qualif, arrêts aux stands
        (temps pit lane entrée→sortie), championnat constructeurs
        avant/après session.
+- DATA 📻 Radios d'équipe (flux TeamRadio du live timing) : clips MP3
+       officiels des « meilleurs moments », jouables dans l'app avec pilote,
+       tour approximatif (via LapStartDate) et heure — expander dans
+       l'Overview (filtrable par pilote) + onglet Radios des deux pilotes
+       comparés sur la page Style. Miroir fastf1 en secours, repli propre
+       si le flux est indisponible (fréquent avant 2022).
 - DATA Portraits officiels des pilotes (HeadshotUrl) sur la page Style ;
        ° = pneus rodés (FreshTyre) ; ⚠ = chrono jugé imprécis (IsAccurate)
        dans le sélecteur de tours.
@@ -881,6 +887,76 @@ def field_corner_profile(year, gp, ses):
     return pd.DataFrame(speeds, index=labels), pd.Series(vmax)
 
 
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def load_team_radio(year, gp, ses):
+    """Clips radio publiés par la FOM (flux TeamRadio du live timing) : la
+    sélection officielle des « meilleurs moments » diffusés TV/app F1 — pas
+    l'intégralité des communications. Endpoint non documenté mais stable ;
+    seul le JSON (léger) est téléchargé ici, les MP3 sont lus directement par
+    le navigateur via st.audio. Miroir communautaire fastf1 en secours.
+    Retourne un DataFrame [Pilote, Lap, utc, url] chronologique, ou None si
+    indisponible (fréquent avant ~2022)."""
+    import json
+    import requests
+
+    sess = load_session(year, gp, ses)
+    path = getattr(sess, "api_path", None)
+    if not path:
+        return None
+    captures, audio_base = None, None
+    for base in ("https://livetiming.formula1.com",
+                 "https://livetiming-mirror.fastf1.dev"):
+        try:
+            r = requests.get(base + path + "TeamRadio.json", timeout=10,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            captures = json.loads(r.content.decode("utf-8-sig")).get("Captures", [])
+            audio_base = base + path
+            break
+        except Exception:
+            continue
+    if isinstance(captures, dict):  # quirk de l'API quand il n'y a qu'un clip
+        captures = [captures]
+    if not captures:
+        return None
+
+    laps = sess.laps
+    num2code = {}
+    if "DriverNumber" in laps.columns:
+        num2code = (laps.dropna(subset=["DriverNumber", "Driver"])
+                        .drop_duplicates("DriverNumber")
+                        .set_index("DriverNumber")["Driver"].to_dict())
+    rows = []
+    for c in captures:
+        utc = pd.to_datetime(c.get("Utc"), errors="coerce", utc=True)
+        utc = utc.tz_convert(None) if pd.notna(utc) else pd.NaT
+        drv = num2code.get(str(c.get("RacingNumber", "")), str(c.get("RacingNumber", "?")))
+        lap_n = np.nan
+        if pd.notna(utc) and "LapStartDate" in laps.columns:
+            # Tour en cours = dernier tour du pilote démarré avant le message
+            ld = laps[(laps["Driver"] == drv) & laps["LapStartDate"].notna()]
+            before = ld[ld["LapStartDate"] <= utc]
+            if len(before):
+                lap_n = int(before["LapNumber"].iloc[-1])
+        rows.append({"Pilote": drv, "Lap": lap_n, "utc": utc,
+                     "url": audio_base + str(c.get("Path", ""))})
+    if not rows:
+        return None
+    return pd.DataFrame(rows).sort_values("utc", na_position="last").reset_index(drop=True)
+
+
+def _render_radio_clips(df_clips, max_clips=50):
+    """Liste de clips radio jouables (label pilote · tour · heure + lecteur)."""
+    for _, r_ in df_clips.head(max_clips).iterrows():
+        lap_txt = f"L{int(r_['Lap'])}" if pd.notna(r_["Lap"]) else "—"
+        when = f" · {r_['utc']:%H:%M} UTC" if pd.notna(r_["utc"]) else ""
+        st.markdown(f"**{r_['Pilote']}** · {lap_txt}{when}")
+        st.audio(r_["url"], format="audio/mp3")
+    if len(df_clips) > max_clips:
+        st.caption(f"… {len(df_clips) - max_clips} clips non affichés — filtre par pilote "
+                   f"pour les voir.")
+
+
 # ============== HEADER ==============
 st.markdown("""
 # 🏎️ Analyse F1
@@ -1391,7 +1467,7 @@ def page_style():
     col4.metric("Circuit", f"{tel1['Distance'].max():.0f} m")
 
     # ============== TABS ==============
-    tab_sheet, tab1, tab_map, tab2, tab_corners, tab3, tab_gg, tab4, tab5, tab_stint, tab_craft, tab_fit, tab6 = st.tabs([
+    tab_sheet, tab1, tab_map, tab2, tab_corners, tab3, tab_gg, tab4, tab5, tab_stint, tab_craft, tab_fit, tab6, tab_radio = st.tabs([
         "📋 Feuille des temps",
         "🎯 Overlay télémétrie",
         "🗺️ Vue circuit",
@@ -1405,6 +1481,7 @@ def page_style():
         "🥊 Race craft",
         "🏟️ Auto vs circuit",
         "🕸️ Radar multi-pilotes",
+        "📻 Radios",
     ])
 
     # --- TAB SHEET : FEUILLE DES TEMPS ---
@@ -2828,6 +2905,40 @@ def page_style():
                 with st.expander("Valeurs brutes"):
                     st.dataframe(df_m.round(2), width="stretch")
 
+    # --- TAB RADIO : RADIOS D'ÉQUIPE ---
+    with tab_radio:
+        st.markdown(
+            f"Les échanges radio de **{d1}** et **{d2}** publiés par la FOM — la sélection "
+            f"officielle des « meilleurs moments » (tout n'est pas diffusé). "
+            f"**L** = tour en cours au moment du message."
+        )
+        with st.spinner("Recherche des radios d'équipe…"):
+            radio_df = load_team_radio(st.session_state.year, st.session_state.gp_name,
+                                       st.session_state.session_type)
+        if radio_df is None or radio_df.empty:
+            st.info("📻 Pas de radios publiées pour cette session — flux indisponible "
+                    "(fréquent avant 2022) ou pas encore mis en ligne côté F1.")
+        else:
+            def _drv_clips(drv):
+                clips = radio_df[radio_df["Pilote"] == drv]
+                st.markdown(f"##### {drv} — {len(clips)} clip(s)")
+                if clips.empty:
+                    st.info(f"Aucun clip publié pour {drv} sur cette session.")
+                else:
+                    _render_radio_clips(clips)
+
+            if MOBILE:
+                _drv_clips(d1)
+                st.markdown("---")
+                _drv_clips(d2)
+            else:
+                col_l, col_r = st.columns(2)
+                with col_l:
+                    _drv_clips(d1)
+                with col_r:
+                    _drv_clips(d2)
+            st.caption("Audio lu en direct depuis les serveurs F1 (rien n'est stocké par l'app).")
+
 # ============== PAGE : TIMING SESSION ==============
 def page_timing():
     """Récap de session façon écran de timing : ordre d'arrivée, intervalles,
@@ -3178,6 +3289,24 @@ def page_timing():
                          height=min(38 * (len(df_rcm) + 1) + 3, 480))
             st.caption("Messages officiels FIA, filtrés sur l'essentiel : drapeaux, SC/VSC, "
                        "pénalités, enquêtes et tours supprimés.")
+
+    # --- Radios d'équipe ---
+    with st.spinner("Recherche des radios d'équipe…"):
+        radio_df = load_team_radio(st.session_state.year, st.session_state.gp_name,
+                                   st.session_state.session_type)
+    if radio_df is not None and len(radio_df):
+        st.markdown("---")
+        with st.expander(f"📻 Radios d'équipe — {len(radio_df)} clips publiés", expanded=False):
+            st.caption(
+                "Sélection officielle FOM (les clips diffusés TV/app F1 — tout n'est pas "
+                "publié) · **L** = tour en cours au moment du message · audio lu en direct "
+                "depuis les serveurs F1."
+            )
+            drv_sel = st.multiselect("Filtrer par pilote",
+                                     options=sorted(radio_df["Pilote"].unique().tolist()),
+                                     key="radio_filter")
+            shown = radio_df[radio_df["Pilote"].isin(drv_sel)] if drv_sel else radio_df
+            _render_radio_clips(shown)
 
     # --- Championnat pilotes : impact de la session ---
     if not is_race:
