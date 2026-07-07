@@ -749,6 +749,18 @@ def load_session(year, gp, session_type):
     FastF1 ne marque les tours supprimés QUE si les messages sont chargés."""
     s = fastf1.get_session(year, gp, session_type)
     s.load(telemetry=True, laps=True, weather=True, messages=True)
+    # s.load() N'ÉCHOUE PAS si l'API F1 est injoignable : il avale les erreurs
+    # en warnings et rend une session vide → session.laps lèverait un
+    # DataNotLoadedError brut plus loin, hors du try/except d'affichage.
+    # On vérifie ici pour transformer ça en message d'erreur propre.
+    try:
+        _ = s.laps
+    except Exception as exc:
+        raise RuntimeError(
+            "les données de cette session n'ont pas pu être téléchargées — "
+            "API F1 momentanément indisponible, ou session pas encore publiée. "
+            "Réessaie dans quelques minutes."
+        ) from exc
     return s
 
 
@@ -932,8 +944,12 @@ year = st.sidebar.selectbox(
     help="FastF1 supporte 2018 → présent. Les données 2026 récentes peuvent être partielles.",
 )
 
-with st.spinner(f"Chargement du calendrier {year}…"):
-    schedule = load_schedule(year)
+try:
+    with st.spinner(f"Chargement du calendrier {year}…"):
+        schedule = load_schedule(year)
+except Exception as e:
+    st.error(f"❌ Impossible de charger le calendrier {year} (API FastF1 injoignable ?) : {e}")
+    st.stop()
 
 gp_options = gp_options_from(schedule)
 gp_label = st.sidebar.selectbox(
