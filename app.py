@@ -918,22 +918,37 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if MOBILE:
-    # Les selectbox Streamlit sont des champs de recherche (BaseWeb) : au tap,
-    # le téléphone ouvre le clavier virtuel qui mange la moitié de l'écran.
+    # Les selectbox Streamlit sont des champs de recherche : au tap, le
+    # téléphone ouvre le clavier virtuel qui mange la moitié de l'écran.
     # On passe leurs inputs en readonly + inputmode="none" → le menu s'ouvre
     # toujours, mais plus de clavier (seule la recherche par frappe, inutile
-    # au doigt, est sacrifiée). Le MutationObserver re-patche les inputs que
-    # Streamlit recrée à chaque rerun. Desktop non concerné (recherche gardée).
+    # au doigt, est sacrifiée). Desktop non concerné (recherche conservée).
+    # Sélecteurs : react-aria (Streamlit >= 1.59, role="combobox") ET BaseWeb
+    # (versions antérieures). Streamlit 1.59 met déjà readonly sur les listes
+    # courtes — seules les longues (ex. Grand Prix) restent « cherchables ».
+    # Trois filets : patch immédiat, MutationObserver (Streamlit recrée les
+    # inputs à chaque rerun et React peut retirer l'attribut), et touchstart
+    # en capture (synchrone, AVANT que le focus ne déclenche le clavier).
     components.html("""
     <script>
     const doc = window.parent.document;
-    const patch = () => doc.querySelectorAll('div[data-baseweb="select"] input')
-        .forEach(el => {
-            el.setAttribute('readonly', 'readonly');
-            el.setAttribute('inputmode', 'none');
-        });
+    const SEL = '[data-testid="stSelectbox"] input[role="combobox"], '
+              + '[data-testid="stMultiSelect"] input[role="combobox"], '
+              + 'div[data-baseweb="select"] input';
+    const fix = (el) => {
+        if (!el.hasAttribute('readonly')) el.setAttribute('readonly', 'readonly');
+        if (el.getAttribute('inputmode') !== 'none') el.setAttribute('inputmode', 'none');
+    };
+    const patch = () => doc.querySelectorAll(SEL).forEach(fix);
     patch();
-    new MutationObserver(patch).observe(doc.body, {childList: true, subtree: true});
+    new MutationObserver(patch).observe(doc.body, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ['readonly', 'inputmode'],
+    });
+    doc.addEventListener('touchstart', patch, {capture: true, passive: true});
+    doc.addEventListener('focusin', (e) => {
+        if (e.target && e.target.matches && e.target.matches(SEL)) fix(e.target);
+    }, true);
     </script>
     """, height=0)
 
