@@ -33,6 +33,9 @@ Changements vs version précédente
        PL = pit lane), progression Q1→Q2→Q3 en qualif, arrêts aux stands
        (temps pit lane entrée→sortie), championnat constructeurs
        avant/après session.
+- NOUVEAU Overview course : expander « 📈 Position des pilotes par tour » —
+  évolution des positions tour par tour de tout le plateau (grille de départ
+  en tour 0), filtrable par multiselect, replié par défaut.
 - DATA 📻 Radios d'équipe (flux TeamRadio du live timing) : clips MP3
        officiels des « meilleurs moments », jouables dans l'app avec pilote,
        tour approximatif (via LapStartDate) et heure — expander dans
@@ -3201,6 +3204,61 @@ def page_timing():
         if missing:
             st.caption("Non représentés (écart non chiffré — tour(s) de retard ou abandon) : "
                        + ", ".join(missing))
+
+    # --- Position des pilotes par tour (course/sprint) ---
+    if is_race:
+        pos_laps = laps_all[["Driver", "LapNumber", "Position"]].dropna()
+        if len(pos_laps):
+            st.markdown("---")
+            with st.expander("📈 Position des pilotes par tour", expanded=False):
+                order = dfr["drv"].tolist()  # ordre du classement final
+                sel = st.multiselect(
+                    "Pilotes affichés",
+                    options=order,
+                    default=order,
+                    key="pos_laps_drivers",
+                    format_func=lambda d: driver_full.get(d, d) if not MOBILE else d,
+                )
+                if not sel:
+                    st.info("Sélectionne au moins un pilote.")
+                else:
+                    grid_map = dict(zip(dfr["drv"], dfr["grid"]))
+                    fig_pos = go.Figure()
+                    for drv in order:
+                        if drv not in sel:
+                            continue
+                        g = pos_laps[pos_laps["Driver"] == drv].sort_values("LapNumber")
+                        if g.empty:
+                            continue
+                        xs = g["LapNumber"].tolist()
+                        ys = g["Position"].tolist()
+                        # Point « tour 0 » = grille de départ → le premier tour
+                        # (envol ou départ raté) devient lisible
+                        g0 = grid_map.get(drv)
+                        if pd.notna(g0) and g0 > 0:
+                            xs = [0] + xs
+                            ys = [float(g0)] + ys
+                        fig_pos.add_trace(go.Scatter(
+                            x=xs, y=ys, mode="lines+markers", name=drv,
+                            line=dict(color=driver_color(drv), width=2),
+                            marker=dict(size=4),
+                            hovertemplate=f"<b>{drv}</b><br>Tour %{{x}}<br>P%{{y:.0f}}<extra></extra>",
+                        ))
+                    fig_pos.update_layout(
+                        height=550, template="plotly_dark",
+                        xaxis_title="Tour (0 = grille de départ)",
+                        yaxis=dict(title="Position", autorange="reversed", dtick=1),
+                        hovermode="closest",
+                        legend=dict(orientation="h", y=-0.18, x=0.5, xanchor="center",
+                                    font=dict(size=10)),
+                        margin=dict(t=20, b=20, l=20, r=20),
+                    )
+                    plot(fig_pos)
+                    st.caption(
+                        "Position au passage de la ligne à chaque tour · deux coéquipiers "
+                        "partagent la même couleur · une chute brutale suivie d'une remontée "
+                        "= arrêt aux stands · une ligne qui s'arrête = abandon."
+                    )
 
     # --- Progression des segments de qualification ---
     if st.session_state.session_type in ("Q", "SQ") and results is not None:
