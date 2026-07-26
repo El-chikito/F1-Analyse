@@ -33,6 +33,14 @@ Changements vs version précédente
        PL = pit lane), progression Q1→Q2→Q3 en qualif, arrêts aux stands
        (temps pit lane entrée→sortie), championnat constructeurs
        avant/après session.
+- FIX  Chargement de session impossible : FastF1 ne bascule sur son miroir
+       que si le serveur F1 répond HTTP >= 400 — si la CONNEXION échoue
+       (timeout, reset, filtrage réseau de l'hébergeur), l'exception remonte
+       et le miroir n'est jamais essayé, donc la session se charge vide.
+       `fetch_page` est désormais enveloppé pour rejouer ces échecs sur le
+       miroir. En cas d'échec malgré tout : panneau 🩺 Diagnostic (warnings
+       FastF1 capturés + joignabilité de chaque serveur) et boutons
+       Réessayer / Vider le cache.
 - NOUVEAU Overview course : expander « 📈 Position des pilotes par tour » —
   évolution des positions tour par tour de tout le plateau (grille de départ
   en tour 0), filtrable par multiselect, replié par défaut.
@@ -121,6 +129,8 @@ Changements vs version précédente
 - use_container_width (déprécié) → width="stretch".
 - Suppression de l'entrée morte "Monaco Grand Prix de Monaco".
 """
+import contextlib
+import logging
 import os
 
 import numpy as np
@@ -145,6 +155,94 @@ st.set_page_config(
 
 os.makedirs("cache_f1", exist_ok=True)
 fastf1.Cache.enable_cache("cache_f1")
+
+
+# ============== ROBUSTESSE RÉSEAU FASTF1 ==============
+def _patch_fastf1_mirror_fallback():
+    """FastF1 ne bascule sur son miroir QUE si le serveur F1 répond avec un code
+    HTTP >= 400 (`fetch_page` dans `fastf1._api`). Si la connexion elle-même
+    échoue — timeout, connexion réinitialisée, DNS, filtrage réseau côté
+    hébergeur — l'exception remonte et le miroir n'est jamais essayé : la
+    session se charge alors totalement vide. On enveloppe `fetch_page` pour
+    rejouer aussi ces échecs-là sur le miroir.
+
+    Les fonctions internes de FastF1 appellent `fetch_page` via le global du
+    module (résolu à l'appel) : remplacer l'attribut suffit à couvrir tous les
+    flux (laps, télémétrie, météo, messages…)."""
+    api = fastf1._api
+    if getattr(api, "_mirror_fallback_patched", False):
+        return
+    original = api.fetch_page
+
+    def fetch_page_with_mirror(path, name):
+        try:
+            return original(path, name)
+        except Exception:
+            saved = api.base_url
+            api.base_url = api.base_url_mirror  # relu à l'appel par fetch_page
+            try:
+                return original(path, name)
+            except Exception:
+                return None  # même comportement qu'un échec FastF1 normal
+            finally:
+                api.base_url = saved
+
+    api.fetch_page = fetch_page_with_mirror
+    api._mirror_fallback_patched = True
+
+
+_patch_fastf1_mirror_fallback()
+
+
+class SessionLoadError(RuntimeError):
+    """Échec de chargement, avec les warnings FastF1 qui expliquent pourquoi."""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or []
+
+
+@contextlib.contextmanager
+def _capture_fastf1_logs():
+    """Collecte les warnings FastF1 émis pendant un chargement. FastF1 avale
+    les erreurs réseau en warnings (« Failed to load timing data! ») : sans ça
+    on ne sait pas CE qui a échoué, seulement que la session est vide."""
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                records.append(record.getMessage())
+
+    handler = _Handler()
+    logger = logging.getLogger("fastf1")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+
+
+def _network_diagnostic():
+    """Joignabilité des serveurs de données depuis l'hébergeur (le calendrier
+    et les sessions vivent sur des hôtes différents : savoir lequel répond
+    localise la panne)."""
+    import requests
+
+    targets = [
+        ("Serveur F1 (données de session)", "https://livetiming.formula1.com/static/"),
+        ("Miroir FastF1 (secours)", "https://livetiming-mirror.fastf1.dev/static/"),
+        ("Jolpica/Ergast (résultats)", "https://api.jolpi.ca/ergast/f1/2025/1/results.json"),
+    ]
+    lines = []
+    for label, url in targets:
+        try:
+            r = requests.get(url, timeout=12, headers={"User-Agent": "BestHTTP"})
+            mark = "✅" if r.status_code < 400 else "⛔"
+            lines.append(f"- {mark} **{label}** : HTTP {r.status_code}")
+        except Exception as exc:
+            lines.append(f"- ❌ **{label}** : {type(exc).__name__} — {str(exc)[:150]}")
+    return lines
 
 # --- Couleurs équipes (mises à jour 2026) ---
 TEAM_COLORS = {
@@ -756,20 +854,22 @@ def load_session(year, gp, session_type):
     weather=True → bandeau météo + contexte pluie/température sur les graphes.
     messages=True → drapeaux/SC/pénalités, ET la colonne Deleted des laps :
     FastF1 ne marque les tours supprimés QUE si les messages sont chargés."""
-    s = fastf1.get_session(year, gp, session_type)
-    s.load(telemetry=True, laps=True, weather=True, messages=True)
-    # s.load() N'ÉCHOUE PAS si l'API F1 est injoignable : il avale les erreurs
-    # en warnings et rend une session vide → session.laps lèverait un
-    # DataNotLoadedError brut plus loin, hors du try/except d'affichage.
-    # On vérifie ici pour transformer ça en message d'erreur propre.
-    try:
-        _ = s.laps
-    except Exception as exc:
-        raise RuntimeError(
-            "les données de cette session n'ont pas pu être téléchargées — "
-            "API F1 momentanément indisponible, ou session pas encore publiée. "
-            "Réessaie dans quelques minutes."
-        ) from exc
+    with _capture_fastf1_logs() as fastf1_logs:
+        s = fastf1.get_session(year, gp, session_type)
+        s.load(telemetry=True, laps=True, weather=True, messages=True)
+        # s.load() N'ÉCHOUE PAS si l'API F1 est injoignable : il avale les
+        # erreurs en warnings et rend une session vide → session.laps lèverait
+        # un DataNotLoadedError brut plus loin, hors du try/except d'affichage.
+        # On vérifie ici pour transformer ça en message d'erreur documenté.
+        try:
+            _ = s.laps
+        except Exception as exc:
+            raise SessionLoadError(
+                "les données de cette session n'ont pas pu être téléchargées — "
+                "serveurs F1 injoignables depuis l'hébergeur, ou session pas "
+                "encore publiée. Ouvre le diagnostic ci-dessous pour la cause exacte.",
+                list(dict.fromkeys(fastf1_logs)),
+            ) from exc
     return s
 
 
@@ -1124,6 +1224,38 @@ try:
         )
 except Exception as e:
     st.error(f"❌ Impossible de charger la session : {e}")
+
+    col_r1, col_r2 = st.columns(2)
+    if col_r1.button("🔄 Réessayer", width="stretch"):
+        st.rerun()
+    if col_r2.button("🧹 Vider le cache et réessayer", width="stretch",
+                     help="Un cache corrompu (redémarrage du serveur en pleine écriture) "
+                          "peut bloquer tous les chargements."):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        try:
+            fastf1.Cache.clear_cache("cache_f1", deep=True)
+        except Exception:
+            pass
+        st.rerun()
+
+    with st.expander("🩺 Diagnostic — pourquoi ça échoue", expanded=True):
+        details = getattr(e, "details", [])
+        if details:
+            st.markdown("**Ce que FastF1 a signalé pendant le chargement :**")
+            st.code("\n".join(details[:15]))
+        st.markdown("**Joignabilité des serveurs depuis l'hébergeur :**")
+        with st.spinner("Test des serveurs…"):
+            for line in _network_diagnostic():
+                st.markdown(line)
+        st.caption(
+            f"FastF1 {fastf1.__version__} · Streamlit {st.__version__}. "
+            "Si le serveur F1 répond ⛔ ou ❌ alors que le miroir répond ✅, "
+            "c'est un blocage de l'hébergeur côté F1 (le repli miroir est censé "
+            "prendre le relais). Si TOUT échoue, c'est le réseau sortant de "
+            "Streamlit Cloud. Si tout est ✅, la session n'est probablement pas "
+            "encore publiée côté F1."
+        )
     st.stop()
 
 # Position des virages — calculée UNE seule fois (le warning éventuel ne sort qu'ici)

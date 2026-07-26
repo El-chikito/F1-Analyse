@@ -86,6 +86,13 @@ pour du contenu principal.
 - **`d1 == d2` interdit** (index dupliqué) — gardé après les selectbox pilotes.
 - **Résultats Sprint** : colonnes `Points`/`Time` vides côté FastF1 → fallback
   barème officiel (`points_from_results`) et écarts reconstruits depuis les laps.
+- **Repli miroir FastF1 incomplet** : `fetch_page` (`fastf1._api`) ne bascule
+  sur `livetiming-mirror.fastf1.dev` que si le serveur F1 répond HTTP >= 400.
+  Une *exception* de connexion (timeout, reset, blocage hébergeur) court-circuite
+  le repli → session vide. D'où `_patch_fastf1_mirror_fallback()` en haut de
+  `app.py`. Le parcours d'échec expose un panneau 🩺 Diagnostic
+  (`_capture_fastf1_logs` + `_network_diagnostic`) : c'est LUI qu'il faut lire
+  avant de supposer une cause.
 - **Radios** : flux `TeamRadio.json` non documenté sur
   `livetiming.formula1.com/static/` + `session.api_path` ; miroir
   `livetiming-mirror.fastf1.dev` en secours ; JSON encodé `utf-8-sig`.
