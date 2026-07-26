@@ -320,22 +320,26 @@ def _deep_probe(year, gp, ses):
     return res
 
 
-def _probe_verdict(primary, mirror):
-    """Traduit les deux codes en diagnostic actionnable, en français."""
+def _probe_verdict(primary, mirror, ua_any_ok=None):
+    """Traduit les codes en diagnostic actionnable, en français.
+    `ua_any_ok` : une identité autre que celle de FastF1 a-t-elle été acceptée ?"""
     if primary == 200 or mirror == 200:
         return ("✅ **Les données sont pourtant servies.** L'échec vient très probablement "
                 "d'un cache corrompu : utilise le bouton **🧹 Vider le cache et réessayer** "
                 "ci-dessus.")
     if primary == 403 and mirror == 404:
-        return ("🔒 **Aucune source disponible depuis cet hébergeur.** Le serveur officiel "
-                "refuse l'adresse IP de Streamlit Cloud (403 — F1 filtre les hébergeurs) et "
-                "le miroir de secours ne sert pas les flux de session (404), y compris pour "
-                "des courses anciennes.\n\n"
-                "👉 Regarde le test des identités juste au-dessus : si une ligne est ✅, le "
-                "blocage vise la signature de FastF1 et l'app se corrigera toute seule au "
-                "prochain démarrage. Si tout est ⛔, c'est bien l'IP qui est filtrée : **il "
-                "faut faire tourner l'app ailleurs que sur Streamlit Cloud** (en local, elle "
-                "fonctionne).")
+        if ua_any_ok:
+            return ("🔓 **Contournable !** Le blocage visait la signature de FastF1, pas "
+                    "l'adresse IP : une autre identité est acceptée. L'app utilise désormais "
+                    "cette identité — relance le chargement, ça devrait passer.")
+        return ("🔒 **L'adresse IP de l'hébergeur est filtrée par la F1** — le refus (403) est "
+                "identique quelle que soit l'identité envoyée, et le miroir de secours ne sert "
+                "pas les flux de session (404), même pour des courses anciennes. Aucun réglage "
+                "de l'app ne peut lever ce blocage.\n\n"
+                "**Ce qui fonctionne :** faire tourner l'app **en local** (`streamlit run "
+                "app.py` sur un ordinateur — les données passent depuis une connexion "
+                "personnelle), ou la **déployer chez un autre hébergeur** dont les adresses ne "
+                "sont pas filtrées.")
     if primary == 404 and mirror == 404:
         return ("📭 **Session absente des deux serveurs (404).** Elle n'a pas encore été "
                 "publiée par la F1 — session pas (ou pas totalement) disputée. Choisis une "
@@ -1502,11 +1506,13 @@ except Exception as e:
             st.markdown(line)
         st.markdown("**Le blocage vise-t-il l'IP ou la signature de FastF1 ?**")
         with st.spinner("Test des identités…"):
-            for line in _probe_user_agents():
-                st.markdown(line)
+            _ua_lines = _probe_user_agents()
+        for line in _ua_lines:
+            st.markdown(line)
 
         st.markdown("**Verdict :**")
-        st.info(_probe_verdict(_probe["primary"], _probe["mirror"]))
+        st.info(_probe_verdict(_probe["primary"], _probe["mirror"],
+                               ua_any_ok=any("✅" in l for l in _ua_lines)))
         st.caption(
             f"FastF1 {fastf1.__version__} · Streamlit {st.__version__} · "
             f"serveur utilisé : `{fastf1._api.base_url}`. "
