@@ -86,13 +86,20 @@ pour du contenu principal.
 - **`d1 == d2` interdit** (index dupliqué) — gardé après les selectbox pilotes.
 - **Résultats Sprint** : colonnes `Points`/`Time` vides côté FastF1 → fallback
   barème officiel (`points_from_results`) et écarts reconstruits depuis les laps.
+- **F1 renvoie HTTP 403 aux IP de datacenter** — constaté en prod sur Streamlit
+  Cloud : `livetiming.formula1.com` refuse TOUS les flux, la session se charge
+  vide. D'où `select_data_host()` (sonde les deux serveurs au boot, cache 1 h,
+  bascule `fastf1._api.base_url` sur le miroir `livetiming-mirror.fastf1.dev`).
+  Symptôme distinctif : le **calendrier** se charge (autre hôte) mais **aucune
+  session** ne passe. Ne pas confondre avec « session pas encore publiée ».
 - **Repli miroir FastF1 incomplet** : `fetch_page` (`fastf1._api`) ne bascule
-  sur `livetiming-mirror.fastf1.dev` que si le serveur F1 répond HTTP >= 400.
-  Une *exception* de connexion (timeout, reset, blocage hébergeur) court-circuite
-  le repli → session vide. D'où `_patch_fastf1_mirror_fallback()` en haut de
-  `app.py`. Le parcours d'échec expose un panneau 🩺 Diagnostic
-  (`_capture_fastf1_logs` + `_network_diagnostic`) : c'est LUI qu'il faut lire
-  avant de supposer une cause.
+  sur le miroir que si le serveur répond HTTP >= 400. Une *exception* de
+  connexion (timeout, reset) court-circuite le repli → d'où aussi
+  `_patch_fastf1_mirror_fallback()`. Les deux correctifs sont complémentaires.
+  Le parcours d'échec expose un panneau 🩺 Diagnostic (`_capture_fastf1_logs`
+  + `_network_diagnostic`, qui sonde un VRAI fichier de données, pas la racine
+  du site) : c'est LUI qu'il faut lire avant de supposer une cause — c'est ce
+  qui a permis d'identifier le 403 sans pouvoir joindre les serveurs F1.
 - **Radios** : flux `TeamRadio.json` non documenté sur
   `livetiming.formula1.com/static/` + `session.api_path` ; miroir
   `livetiming-mirror.fastf1.dev` en secours ; JSON encodé `utf-8-sig`.

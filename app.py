@@ -33,14 +33,18 @@ Changements vs version précédente
        PL = pit lane), progression Q1→Q2→Q3 en qualif, arrêts aux stands
        (temps pit lane entrée→sortie), championnat constructeurs
        avant/après session.
-- FIX  Chargement de session impossible : FastF1 ne bascule sur son miroir
-       que si le serveur F1 répond HTTP >= 400 — si la CONNEXION échoue
-       (timeout, reset, filtrage réseau de l'hébergeur), l'exception remonte
-       et le miroir n'est jamais essayé, donc la session se charge vide.
-       `fetch_page` est désormais enveloppé pour rejouer ces échecs sur le
-       miroir. En cas d'échec malgré tout : panneau 🩺 Diagnostic (warnings
-       FastF1 capturés + joignabilité de chaque serveur) et boutons
-       Réessayer / Vider le cache.
+- FIX  Chargement de session impossible depuis Streamlit Cloud : F1 filtre
+       les IP de datacenter et renvoie **HTTP 403** sur tous les flux de
+       livetiming.formula1.com (diagnostiqué en prod). `select_data_host()`
+       sonde les deux serveurs au démarrage (cache 1 h) et bascule
+       `fastf1._api.base_url` sur le miroir FastF1 quand le principal est
+       bloqué : plus aucune requête ne part vers le serveur qui refuse.
+       En complément, `fetch_page` est enveloppé pour rejouer aussi les
+       échecs de CONNEXION sur le miroir (FastF1 ne bascule nativement que
+       sur une réponse HTTP >= 400 : un timeout court-circuitait le repli).
+       En cas d'échec malgré tout : panneau 🩺 Diagnostic (warnings FastF1
+       capturés + sondage d'un vrai fichier de données sur chaque serveur)
+       et boutons Réessayer / Vider le cache.
 - NOUVEAU Overview course : expander « 📈 Position des pilotes par tour » —
   évolution des positions tour par tour de tout le plateau (grille de départ
   en tour 0), filtrable par multiselect, replié par défaut.
@@ -193,6 +197,51 @@ def _patch_fastf1_mirror_fallback():
 
 _patch_fastf1_mirror_fallback()
 
+F1_HOST = fastf1._api.base_url            # serveur officiel
+F1_MIRROR = fastf1._api.base_url_mirror   # miroir communautaire FastF1
+_HOST_PROBE = "/static/Index.json"        # petit fichier réel, présent sur les deux
+
+
+def _probe_host(base, timeout=12):
+    """Code HTTP du serveur pour un vrai fichier de données, ou nom de
+    l'exception si la connexion échoue."""
+    import requests
+
+    try:
+        return requests.get(base + _HOST_PROBE, timeout=timeout,
+                            headers=fastf1._api.headers).status_code
+    except Exception as exc:
+        return type(exc).__name__
+
+
+@st.cache_resource(show_spinner=False, ttl=3600)
+def select_data_host():
+    """Choisit le serveur de données utilisé par toute l'app.
+
+    F1 filtre les IP de datacenter : depuis Streamlit Cloud,
+    livetiming.formula1.com répond **HTTP 403** sur tous les flux. FastF1 sait
+    basculer sur son miroir, mais requête par requête et seulement après avoir
+    perdu un aller-retour à chaque fois. On sonde donc les deux serveurs (une
+    fois par heure) et, si le principal est bloqué alors que le miroir répond,
+    on bascule `base_url` globalement : plus aucune requête ne part vers le
+    serveur bloqué.
+
+    Ne pas émettre de `st.*` ici (fonction cachée, rejouée à chaque hit)."""
+    primary = _probe_host(F1_HOST)
+    if primary == 200:
+        fastf1._api.base_url = F1_HOST
+        return {"host": F1_HOST, "primary": primary, "mirror": None, "switched": False}
+    mirror = _probe_host(F1_MIRROR)
+    if mirror == 200:
+        fastf1._api.base_url = F1_MIRROR  # relu à chaque appel par fetch_page
+        return {"host": F1_MIRROR, "primary": primary, "mirror": mirror, "switched": True}
+    # Les deux en carafe : on garde l'officiel, l'erreur restera explicite
+    fastf1._api.base_url = F1_HOST
+    return {"host": F1_HOST, "primary": primary, "mirror": mirror, "switched": False}
+
+
+DATA_HOST = select_data_host()
+
 
 class SessionLoadError(RuntimeError):
     """Échec de chargement, avec les warnings FastF1 qui expliquent pourquoi."""
@@ -224,24 +273,29 @@ def _capture_fastf1_logs():
 
 
 def _network_diagnostic():
-    """Joignabilité des serveurs de données depuis l'hébergeur (le calendrier
-    et les sessions vivent sur des hôtes différents : savoir lequel répond
-    localise la panne)."""
+    """Joignabilité des serveurs depuis l'hébergeur. On sonde un vrai fichier
+    de données (pas la racine du site, qui peut répondre 200 alors que les
+    données sont refusées) pour que le verdict soit sans ambiguïté."""
     import requests
 
-    targets = [
-        ("Serveur F1 (données de session)", "https://livetiming.formula1.com/static/"),
-        ("Miroir FastF1 (secours)", "https://livetiming-mirror.fastf1.dev/static/"),
-        ("Jolpica/Ergast (résultats)", "https://api.jolpi.ca/ergast/f1/2025/1/results.json"),
-    ]
     lines = []
-    for label, url in targets:
-        try:
-            r = requests.get(url, timeout=12, headers={"User-Agent": "BestHTTP"})
-            mark = "✅" if r.status_code < 400 else "⛔"
-            lines.append(f"- {mark} **{label}** : HTTP {r.status_code}")
-        except Exception as exc:
-            lines.append(f"- ❌ **{label}** : {type(exc).__name__} — {str(exc)[:150]}")
+    for label, base in (("Serveur F1 (données de session)", F1_HOST),
+                        ("Miroir FastF1 (secours)", F1_MIRROR)):
+        code = _probe_host(base)
+        if code == 200:
+            mark, txt = "✅", "HTTP 200"
+        elif isinstance(code, int):
+            mark, txt = "⛔", f"HTTP {code}" + (" (IP de l'hébergeur filtrée)" if code == 403 else "")
+        else:
+            mark, txt = "❌", str(code)
+        actif = " · **utilisé**" if base == fastf1._api.base_url else ""
+        lines.append(f"- {mark} **{label}** : {txt}{actif}")
+    try:
+        r = requests.get("https://api.jolpi.ca/ergast/f1/2025/1/results.json", timeout=12)
+        lines.append(f"- {'✅' if r.status_code < 400 else '⛔'} "
+                     f"**Jolpica/Ergast (résultats)** : HTTP {r.status_code}")
+    except Exception as exc:
+        lines.append(f"- ❌ **Jolpica/Ergast (résultats)** : {type(exc).__name__}")
     return lines
 
 # --- Couleurs équipes (mises à jour 2026) ---
@@ -1007,8 +1061,8 @@ def load_team_radio(year, gp, ses):
     if not path:
         return None
     captures, audio_base = None, None
-    for base in ("https://livetiming.formula1.com",
-                 "https://livetiming-mirror.fastf1.dev"):
+    # Serveur actif d'abord (cf. select_data_host), puis les autres en secours
+    for base in dict.fromkeys((fastf1._api.base_url, F1_HOST, F1_MIRROR)):
         try:
             r = requests.get(base + path + "TeamRadio.json", timeout=10,
                              headers={"User-Agent": "Mozilla/5.0"})
@@ -1165,6 +1219,12 @@ session_type = st.sidebar.selectbox(
 # session_loaded posé, chaque interaction recopiait les widgets dans le state
 # et changer de GP rechargeait tout sans clic.
 load_btn = st.sidebar.button("🚀 Charger la session", type="primary", width="stretch")
+
+if DATA_HOST["switched"]:
+    st.sidebar.caption(
+        f"🔀 Données via le **miroir FastF1** — le serveur F1 refuse l'IP de "
+        f"l'hébergeur (HTTP {DATA_HOST['primary']}). Rien à faire, c'est transparent."
+    )
 
 if load_btn:
     st.session_state.session_loaded = True
