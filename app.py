@@ -214,10 +214,22 @@ if not hasattr(fastf1._api, "_original_base_url"):
     fastf1._api._original_base_url = fastf1._api.base_url
 F1_HOST = fastf1._api._original_base_url   # serveur officiel (valeur d'origine)
 F1_MIRROR = fastf1._api.base_url_mirror    # miroir communautaire FastF1
-_HOST_PROBE = "/static/Index.json"         # petit fichier réel, présent sur les deux
+_HOST_PROBE = "/static/Index.json"         # léger, mais NON représentatif (cf. ci-dessous)
+# Témoin décisif : un vrai flux de session, ancien et forcément archivé. Sonder
+# Index.json ne suffit pas — le miroir le sert parfaitement tout en répondant
+# 404 sur TOUS les flux de session, ce qui donnait un faux « serveur ✅ ».
+_SESSION_PROBE = ("/static/2024/2024-03-02_Bahrain_Grand_Prix/"
+                  "2024-03-02_Race/SessionInfo.jsonStream")
 
 
-def _probe_host(base, timeout=12):
+# FastF1 s'annonce avec un User-Agent atypique ("BestHTTP", celui de l'appli F1
+# officielle). Un 403 peut donc venir de l'IP *ou* de cette signature : on teste
+# les deux avant de conclure.
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
+
+def _probe_host(base, timeout=12, ua=None, page=None):
     """Teste un serveur sur un vrai fichier de données. Renvoie 200 seulement
     si le contenu est réellement exploitable : un serveur peut répondre 200
     avec une page d'erreur ou une redirection HTML, ce qui fait échouer le
@@ -226,9 +238,11 @@ def _probe_host(base, timeout=12):
 
     import requests
 
+    headers = dict(fastf1._api.headers)
+    if ua:
+        headers["User-Agent"] = ua
     try:
-        r = requests.get(base + _HOST_PROBE, timeout=timeout,
-                         headers=fastf1._api.headers)
+        r = requests.get(base + (page or _HOST_PROBE), timeout=timeout, headers=headers)
         if r.status_code == 200:
             try:
                 json.loads(r.content.decode("utf-8-sig"))
@@ -237,6 +251,41 @@ def _probe_host(base, timeout=12):
         return r.status_code
     except Exception as exc:
         return type(exc).__name__
+
+
+def _probe_data(base, ua=None, timeout=12):
+    """Le serveur sert-il VRAIMENT des flux de session ? On demande un flux réel
+    et on refuse une réponse HTML : un serveur peut répondre 200 en renvoyant
+    sa page d'accueil ou une erreur habillée."""
+    import requests
+
+    headers = dict(fastf1._api.headers)
+    if ua:
+        headers["User-Agent"] = ua
+    try:
+        r = requests.get(base + _SESSION_PROBE, timeout=timeout, headers=headers)
+        if r.status_code != 200:
+            return r.status_code
+        if "html" in r.headers.get("Content-Type", "").lower() or len(r.content) < 20:
+            return "200 mais page HTML"
+        return 200
+    except Exception as exc:
+        return type(exc).__name__
+
+
+def _probe_user_agents(base=None):
+    """Rejoue la même requête sous plusieurs identités : si l'une passe alors
+    que « BestHTTP » est refusé, le blocage vise la signature de FastF1 (donc
+    contournable) et non l'adresse IP de l'hébergeur (rien à faire)."""
+    base = base or F1_HOST
+    out = []
+    for label, ua in (("FastF1 (« BestHTTP »)", None),
+                      ("Navigateur Chrome", BROWSER_UA),
+                      ("curl", "curl/8.4.0")):
+        code = _probe_data(base, ua=ua)
+        out.append(f"- {'✅' if code == 200 else '⛔'} **{label}** : "
+                   f"{'HTTP ' + str(code) if isinstance(code, int) else code}")
+    return out
 
 
 def _deep_probe(year, gp, ses):
@@ -278,13 +327,15 @@ def _probe_verdict(primary, mirror):
                 "d'un cache corrompu : utilise le bouton **🧹 Vider le cache et réessayer** "
                 "ci-dessus.")
     if primary == 403 and mirror == 404:
-        return ("🔒 **Deux causes cumulées.** Le serveur officiel refuse l'adresse IP de "
-                "Streamlit Cloud (403 — F1 filtre les hébergeurs, rien à faire côté app), "
-                "et le miroir de secours **n'a pas encore archivé cette session** (404). "
-                "Le miroir prend du retard sur les sessions très récentes.\n\n"
-                "👉 **Essaie une manche plus ancienne** (quelques semaines) ou la **saison "
-                "précédente** : ces sessions-là sont archivées sur le miroir et se chargeront "
-                "normalement.")
+        return ("🔒 **Aucune source disponible depuis cet hébergeur.** Le serveur officiel "
+                "refuse l'adresse IP de Streamlit Cloud (403 — F1 filtre les hébergeurs) et "
+                "le miroir de secours ne sert pas les flux de session (404), y compris pour "
+                "des courses anciennes.\n\n"
+                "👉 Regarde le test des identités juste au-dessus : si une ligne est ✅, le "
+                "blocage vise la signature de FastF1 et l'app se corrigera toute seule au "
+                "prochain démarrage. Si tout est ⛔, c'est bien l'IP qui est filtrée : **il "
+                "faut faire tourner l'app ailleurs que sur Streamlit Cloud** (en local, elle "
+                "fonctionne).")
     if primary == 404 and mirror == 404:
         return ("📭 **Session absente des deux serveurs (404).** Elle n'a pas encore été "
                 "publiée par la F1 — session pas (ou pas totalement) disputée. Choisis une "
@@ -312,17 +363,30 @@ def select_data_host():
     serveur bloqué.
 
     Ne pas émettre de `st.*` ici (fonction cachée, rejouée à chaque hit)."""
-    primary = _probe_host(F1_HOST)
+    base = {"primary": None, "mirror": None, "switched": False, "ua_fix": False}
+    primary = _probe_data(F1_HOST)
     if primary == 200:
         fastf1._api.base_url = F1_HOST
-        return {"host": F1_HOST, "primary": primary, "mirror": None, "switched": False}
-    mirror = _probe_host(F1_MIRROR)
+        return {**base, "host": F1_HOST, "primary": primary}
+
+    # 403 : est-ce l'IP de l'hébergeur, ou la signature « BestHTTP » de FastF1 ?
+    # Si une identité de navigateur passe, le blocage est contournable et on
+    # garde le serveur officiel — de loin la meilleure source.
+    if primary == 403:
+        with_ua = _probe_data(F1_HOST, ua=BROWSER_UA)
+        if with_ua == 200:
+            fastf1._api.headers["User-Agent"] = BROWSER_UA
+            fastf1._api.base_url = F1_HOST
+            return {**base, "host": F1_HOST, "primary": primary, "ua_fix": True}
+
+    mirror = _probe_data(F1_MIRROR)
     if mirror == 200:
         fastf1._api.base_url = F1_MIRROR  # relu à chaque appel par fetch_page
-        return {"host": F1_MIRROR, "primary": primary, "mirror": mirror, "switched": True}
-    # Les deux en carafe : on garde l'officiel, l'erreur restera explicite
+        return {**base, "host": F1_MIRROR, "primary": primary, "mirror": mirror,
+                "switched": True}
+    # Aucune source ne sert les données : on garde l'officiel, l'erreur sera explicite
     fastf1._api.base_url = F1_HOST
-    return {"host": F1_HOST, "primary": primary, "mirror": mirror, "switched": False}
+    return {**base, "host": F1_HOST, "primary": primary, "mirror": mirror}
 
 
 DATA_HOST = select_data_host()
@@ -366,7 +430,7 @@ def _network_diagnostic():
     lines = []
     for label, base in (("Serveur F1 (données de session)", F1_HOST),
                         ("Miroir FastF1 (secours)", F1_MIRROR)):
-        code = _probe_host(base)
+        code = _probe_data(base)  # vrai flux de session, pas la racine du site
         if code == 200:
             mark, txt = "✅", "HTTP 200"
         elif isinstance(code, int):
@@ -1436,6 +1500,11 @@ except Exception as e:
                                  st.session_state.session_type)
         for line in _probe["lines"]:
             st.markdown(line)
+        st.markdown("**Le blocage vise-t-il l'IP ou la signature de FastF1 ?**")
+        with st.spinner("Test des identités…"):
+            for line in _probe_user_agents():
+                st.markdown(line)
+
         st.markdown("**Verdict :**")
         st.info(_probe_verdict(_probe["primary"], _probe["mirror"]))
         st.caption(
