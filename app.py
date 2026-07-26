@@ -240,29 +240,63 @@ def _probe_host(base, timeout=12):
 
 
 def _deep_probe(year, gp, ses):
-    """Sonde le VRAI flux de la session sur chaque serveur et montre ce qui
-    revient (statut, type MIME, taille, début du contenu). C'est le seul moyen
-    de distinguer « serveur joignable » de « serveur qui sert les données »."""
+    """Sonde le VRAI flux de la session sur chaque serveur : statut, type MIME,
+    taille, début du contenu. Seul moyen de distinguer « serveur joignable » de
+    « serveur qui sert VRAIMENT cette session ». Renvoie aussi les codes bruts
+    pour en tirer un verdict."""
     import requests
 
+    res = {"lines": [], "primary": None, "mirror": None}
     try:
         path = fastf1.get_session(year, gp, ses).api_path
     except Exception as exc:
-        return [f"- ❌ Chemin API introuvable : {type(exc).__name__} — {str(exc)[:120]}"]
-    out = [f"Chemin demandé : `{path}SessionInfo.jsonStream`"]
-    for label, base in (("Serveur F1", F1_HOST), ("Miroir FastF1", F1_MIRROR)):
+        res["lines"] = [f"- ❌ Chemin API introuvable : {type(exc).__name__} — {str(exc)[:120]}"]
+        return res
+    res["lines"].append(f"Chemin demandé : `{path}SessionInfo.jsonStream`")
+    for key, label, base in (("primary", "Serveur F1", F1_HOST),
+                             ("mirror", "Miroir FastF1", F1_MIRROR)):
         try:
             r = requests.get(base + path + "SessionInfo.jsonStream", timeout=15,
                              headers=fastf1._api.headers)
+            res[key] = r.status_code
             head = r.text[:110].replace("\n", " ").replace("\r", " ")
-            out.append(
+            res["lines"].append(
                 f"- **{label}** : HTTP {r.status_code} · "
                 f"`{r.headers.get('Content-Type', '?')}` · {len(r.content)} octets\n\n"
                 f"  > `{head}`"
             )
         except Exception as exc:
-            out.append(f"- **{label}** : ❌ {type(exc).__name__} — {str(exc)[:120]}")
-    return out
+            res[key] = type(exc).__name__
+            res["lines"].append(f"- **{label}** : ❌ {type(exc).__name__} — {str(exc)[:120]}")
+    return res
+
+
+def _probe_verdict(primary, mirror):
+    """Traduit les deux codes en diagnostic actionnable, en français."""
+    if primary == 200 or mirror == 200:
+        return ("✅ **Les données sont pourtant servies.** L'échec vient très probablement "
+                "d'un cache corrompu : utilise le bouton **🧹 Vider le cache et réessayer** "
+                "ci-dessus.")
+    if primary == 403 and mirror == 404:
+        return ("🔒 **Deux causes cumulées.** Le serveur officiel refuse l'adresse IP de "
+                "Streamlit Cloud (403 — F1 filtre les hébergeurs, rien à faire côté app), "
+                "et le miroir de secours **n'a pas encore archivé cette session** (404). "
+                "Le miroir prend du retard sur les sessions très récentes.\n\n"
+                "👉 **Essaie une manche plus ancienne** (quelques semaines) ou la **saison "
+                "précédente** : ces sessions-là sont archivées sur le miroir et se chargeront "
+                "normalement.")
+    if primary == 404 and mirror == 404:
+        return ("📭 **Session absente des deux serveurs (404).** Elle n'a pas encore été "
+                "publiée par la F1 — session pas (ou pas totalement) disputée. Choisis une "
+                "session déjà terminée.")
+    if primary == 403 and mirror == 403:
+        return ("🔒 **Les deux serveurs refusent l'IP de l'hébergeur (403).** Rien n'est "
+                "récupérable depuis Streamlit Cloud pour le moment ; réessaie plus tard.")
+    if not isinstance(primary, int) and not isinstance(mirror, int):
+        return ("🌐 **Aucun des deux serveurs n'est joignable** : c'est le réseau sortant de "
+                "l'hébergeur qui est en cause, pas la F1. Réessaie dans quelques minutes.")
+    return ("ℹ️ Aucun serveur ne renvoie les données pour cette session. Essaie une autre "
+            "session, une manche plus ancienne, ou la saison précédente.")
 
 
 @st.cache_resource(show_spinner=False, ttl=3600)
@@ -706,12 +740,18 @@ def default_gp_index(sched):
     courue n'a aucune donnée et échoue au chargement, ce qui ressemble à s'y
     méprendre à une panne."""
     try:
-        past = sched[pd.to_datetime(sched["EventDate"]) <= pd.Timestamp.now()]
+        # Strictement AVANT aujourd'hui : le week-end du jour est peut-être en
+        # cours (course pas courue), et surtout les sessions de la veille ne
+        # sont pas encore archivées sur le miroir utilisé quand F1 nous bloque.
+        dates = pd.to_datetime(sched["EventDate"])
+        past = sched[dates < pd.Timestamp.now().normalize()]
         if len(past):
             return int(len(past) - 1)
+        if len(sched):
+            return 0  # saison pas encore commencée
     except Exception:
         pass
-    return 0  # saison pas encore commencée → première manche
+    return 0
 
 
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
@@ -1392,9 +1432,12 @@ except Exception as e:
 
         st.markdown("**Réponse réelle sur le flux de CETTE session :**")
         with st.spinner("Test du flux de données…"):
-            for line in _deep_probe(st.session_state.year, st.session_state.gp_name,
-                                    st.session_state.session_type):
-                st.markdown(line)
+            _probe = _deep_probe(st.session_state.year, st.session_state.gp_name,
+                                 st.session_state.session_type)
+        for line in _probe["lines"]:
+            st.markdown(line)
+        st.markdown("**Verdict :**")
+        st.info(_probe_verdict(_probe["primary"], _probe["mirror"]))
         st.caption(
             f"FastF1 {fastf1.__version__} · Streamlit {st.__version__} · "
             f"serveur utilisé : `{fastf1._api.base_url}`. "
