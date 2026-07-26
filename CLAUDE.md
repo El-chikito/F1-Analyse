@@ -86,6 +86,13 @@ pour du contenu principal.
 - **`d1 == d2` interdit** (index dupliqué) — gardé après les selectbox pilotes.
 - **Résultats Sprint** : colonnes `Points`/`Time` vides côté FastF1 → fallback
   barème officiel (`points_from_results`) et écarts reconstruits depuis les laps.
+- **Streamlit rejoue tout le script à chaque interaction** : ne JAMAIS capturer
+  dans une constante de module une valeur que l'app mute elle-même
+  (`F1_HOST = fastf1._api.base_url` récupérait l'URL déjà basculée sur le
+  miroir). Mémoriser l'originale une fois via `hasattr` sur le module.
+- **Session pas encore disputée = échec identique à une panne réseau.** Le
+  sélecteur de GP doit défaulter sur la dernière manche passée
+  (`default_gp_index`), sinon on diagnostique un faux bug réseau.
 - **F1 renvoie HTTP 403 aux IP de datacenter** — constaté en prod sur Streamlit
   Cloud : `livetiming.formula1.com` refuse TOUS les flux, la session se charge
   vide. D'où `select_data_host()` (sonde les deux serveurs au boot, cache 1 h,

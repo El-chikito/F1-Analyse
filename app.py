@@ -33,6 +33,15 @@ Changements vs version précédente
        PL = pit lane), progression Q1→Q2→Q3 en qualif, arrêts aux stands
        (temps pit lane entrée→sortie), championnat constructeurs
        avant/après session.
+- FIX  Grand Prix par défaut = dernière manche DÉJÀ DISPUTÉE (l'index fixe
+       pointait sur une course future en cours de saison → chargement voué à
+       l'échec, qui ressemblait à une panne). Message explicite si la session
+       demandée n'a pas encore eu lieu.
+- FIX  L'URL du serveur officiel était recapturée depuis la variable que
+       l'app venait elle-même de basculer sur le miroir : Streamlit rejouant
+       le script à chaque interaction, l'URL d'origine était perdue et les
+       deux serveurs devenaient identiques (tous deux marqués « utilisé »
+       dans le diagnostic). Mémorisée une seule fois sur le module.
 - FIX  Chargement de session impossible depuis Streamlit Cloud : F1 filtre
        les IP de datacenter et renvoie **HTTP 403** sur tous les flux de
        livetiming.formula1.com (diagnostiqué en prod). `select_data_host()`
@@ -197,21 +206,63 @@ def _patch_fastf1_mirror_fallback():
 
 _patch_fastf1_mirror_fallback()
 
-F1_HOST = fastf1._api.base_url            # serveur officiel
-F1_MIRROR = fastf1._api.base_url_mirror   # miroir communautaire FastF1
-_HOST_PROBE = "/static/Index.json"        # petit fichier réel, présent sur les deux
+# ⚠️ base_url est MUTÉ par select_data_host() et Streamlit rejoue tout le
+# script à chaque interaction : lire base_url ici recapturerait la valeur déjà
+# basculée (l'URL officielle serait perdue et les deux constantes deviendraient
+# identiques). On mémorise donc l'originale une seule fois sur le module.
+if not hasattr(fastf1._api, "_original_base_url"):
+    fastf1._api._original_base_url = fastf1._api.base_url
+F1_HOST = fastf1._api._original_base_url   # serveur officiel (valeur d'origine)
+F1_MIRROR = fastf1._api.base_url_mirror    # miroir communautaire FastF1
+_HOST_PROBE = "/static/Index.json"         # petit fichier réel, présent sur les deux
 
 
 def _probe_host(base, timeout=12):
-    """Code HTTP du serveur pour un vrai fichier de données, ou nom de
-    l'exception si la connexion échoue."""
+    """Teste un serveur sur un vrai fichier de données. Renvoie 200 seulement
+    si le contenu est réellement exploitable : un serveur peut répondre 200
+    avec une page d'erreur ou une redirection HTML, ce qui fait échouer le
+    parsing plus tard sans que le code HTTP ne trahisse quoi que ce soit."""
+    import json
+
     import requests
 
     try:
-        return requests.get(base + _HOST_PROBE, timeout=timeout,
-                            headers=fastf1._api.headers).status_code
+        r = requests.get(base + _HOST_PROBE, timeout=timeout,
+                         headers=fastf1._api.headers)
+        if r.status_code == 200:
+            try:
+                json.loads(r.content.decode("utf-8-sig"))
+            except Exception:
+                return "200 mais contenu illisible"
+        return r.status_code
     except Exception as exc:
         return type(exc).__name__
+
+
+def _deep_probe(year, gp, ses):
+    """Sonde le VRAI flux de la session sur chaque serveur et montre ce qui
+    revient (statut, type MIME, taille, début du contenu). C'est le seul moyen
+    de distinguer « serveur joignable » de « serveur qui sert les données »."""
+    import requests
+
+    try:
+        path = fastf1.get_session(year, gp, ses).api_path
+    except Exception as exc:
+        return [f"- ❌ Chemin API introuvable : {type(exc).__name__} — {str(exc)[:120]}"]
+    out = [f"Chemin demandé : `{path}SessionInfo.jsonStream`"]
+    for label, base in (("Serveur F1", F1_HOST), ("Miroir FastF1", F1_MIRROR)):
+        try:
+            r = requests.get(base + path + "SessionInfo.jsonStream", timeout=15,
+                             headers=fastf1._api.headers)
+            head = r.text[:110].replace("\n", " ").replace("\r", " ")
+            out.append(
+                f"- **{label}** : HTTP {r.status_code} · "
+                f"`{r.headers.get('Content-Type', '?')}` · {len(r.content)} octets\n\n"
+                f"  > `{head}`"
+            )
+        except Exception as exc:
+            out.append(f"- **{label}** : ❌ {type(exc).__name__} — {str(exc)[:120]}")
+    return out
 
 
 @st.cache_resource(show_spinner=False, ttl=3600)
@@ -647,6 +698,20 @@ def gp_options_from(sched):
         f"R{int(row.RoundNumber)} — {row.EventName} ({row.Country})": row.EventName
         for _, row in sched.iterrows()
     }
+
+
+def default_gp_index(sched):
+    """Index du dernier Grand Prix DÉJÀ DISPUTÉ. Un index fixe pointerait sur
+    une manche future en début/milieu de saison — or une session pas encore
+    courue n'a aucune donnée et échoue au chargement, ce qui ressemble à s'y
+    méprendre à une panne."""
+    try:
+        past = sched[pd.to_datetime(sched["EventDate"]) <= pd.Timestamp.now()]
+        if len(past):
+            return int(len(past) - 1)
+    except Exception:
+        pass
+    return 0  # saison pas encore commencée → première manche
 
 
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
@@ -1203,7 +1268,7 @@ gp_options = gp_options_from(schedule)
 gp_label = st.sidebar.selectbox(
     "Grand Prix",
     options=list(gp_options.keys()),
-    index=min(len(gp_options) - 1, 12),  # Spa par défaut souvent vers le milieu
+    index=default_gp_index(schedule),  # dernière manche disputée
 )
 gp_name = gp_options[gp_label]
 
@@ -1250,11 +1315,12 @@ if not st.session_state.get("session_loaded"):
         help="FastF1 supporte 2018 → présent.",
     )
     with st.spinner(f"Chargement du calendrier {home_year}…"):
-        gp_options_h = gp_options_from(load_schedule(home_year))
+        sched_h = load_schedule(home_year)
+    gp_options_h = gp_options_from(sched_h)
     labels_h = list(gp_options_h.keys())
     home_gp_label = c_gp.selectbox(
         "Grand Prix", options=labels_h, key="home_gp",
-        index=labels_h.index(gp_label) if gp_label in labels_h else min(len(labels_h) - 1, 12),
+        index=labels_h.index(gp_label) if gp_label in labels_h else default_gp_index(sched_h),
     )
     home_session = c_s.selectbox(
         "Session", options=SESSION_TYPES, index=SESSION_TYPES.index(session_type),
@@ -1285,6 +1351,21 @@ try:
 except Exception as e:
     st.error(f"❌ Impossible de charger la session : {e}")
 
+    # Cause n°1 des faux « bugs » : la manche n'a pas encore été courue.
+    try:
+        _sched = load_schedule(st.session_state.year)
+        _row = _sched[_sched["EventName"] == st.session_state.gp_name].iloc[0]
+        _date = pd.to_datetime(_row["EventDate"])
+        if _date > pd.Timestamp.now():
+            st.warning(
+                f"📅 **{st.session_state.gp_name} {st.session_state.year}** est programmé "
+                f"le **{_date:%d/%m/%Y}** : la manche n'a pas encore eu lieu, il n'y a donc "
+                f"aucune donnée à charger. Choisis un Grand Prix **déjà disputé** — le "
+                f"sélecteur propose par défaut le plus récent."
+            )
+    except Exception:
+        pass
+
     col_r1, col_r2 = st.columns(2)
     if col_r1.button("🔄 Réessayer", width="stretch"):
         st.rerun()
@@ -1308,13 +1389,19 @@ except Exception as e:
         with st.spinner("Test des serveurs…"):
             for line in _network_diagnostic():
                 st.markdown(line)
+
+        st.markdown("**Réponse réelle sur le flux de CETTE session :**")
+        with st.spinner("Test du flux de données…"):
+            for line in _deep_probe(st.session_state.year, st.session_state.gp_name,
+                                    st.session_state.session_type):
+                st.markdown(line)
         st.caption(
-            f"FastF1 {fastf1.__version__} · Streamlit {st.__version__}. "
-            "Si le serveur F1 répond ⛔ ou ❌ alors que le miroir répond ✅, "
-            "c'est un blocage de l'hébergeur côté F1 (le repli miroir est censé "
-            "prendre le relais). Si TOUT échoue, c'est le réseau sortant de "
-            "Streamlit Cloud. Si tout est ✅, la session n'est probablement pas "
-            "encore publiée côté F1."
+            f"FastF1 {fastf1.__version__} · Streamlit {st.__version__} · "
+            f"serveur utilisé : `{fastf1._api.base_url}`. "
+            "La dernière section est la plus parlante : un serveur peut répondre "
+            "HTTP 200 en renvoyant une page d'erreur au lieu du flux de données — "
+            "regarde le type MIME (`application/json` ou `text/plain` attendu, pas "
+            "`text/html`), la taille et le début du contenu."
         )
     st.stop()
 
