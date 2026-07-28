@@ -42,6 +42,25 @@ TIMEOUT = 30
 # Codes DRS OpenF1 : 0/1 = fermé, 8 = éligible, 10/12/14 = volet ouvert
 DRS_OPEN_CODES = (10, 12, 14)
 
+# Codes de mini-secteur (flux `segments_sector_*`). Repris du live timing F1 :
+# ce sont les couleurs affichées à l'écran, secteur par secteur.
+# ⚠️ à confirmer sur données réelles — la table officieuse peut varier.
+SEGMENT_COLORS = {
+    0: None,          # pas de donnée
+    2048: "yellow",   # plus lent que son propre référence
+    2049: "green",    # meilleur perso sur ce mini-secteur
+    2051: "purple",   # meilleur de la session
+    2064: "pit",      # passage par la voie des stands
+}
+
+
+def segment_label(code):
+    """Couleur d'un mini-secteur, ou None si le code est inconnu/absent."""
+    try:
+        return SEGMENT_COLORS.get(int(code))
+    except (TypeError, ValueError):
+        return None
+
 # session_name OpenF1 -> code utilisé par l'app
 SESSION_NAMES = {
     "Practice 1": "FP1", "Practice 2": "FP2", "Practice 3": "FP3",
@@ -437,6 +456,12 @@ class Session:
             "IsPitOutLap": raw.get("is_pit_out_lap", False).fillna(False)
             if "is_pit_out_lap" in raw.columns else False,
         })
+        # Mini-secteurs : listes de codes par secteur. Inaccessibles via FastF1
+        # en post-session (flux live SignalR) — OpenF1 les conserve, ce qui rend
+        # possible la comparaison mini-secteur par mini-secteur en qualif.
+        for i in (1, 2, 3):
+            col = f"segments_sector_{i}"
+            laps[f"Segments{i}"] = raw[col] if col in raw.columns else None
         # Temps de passage cumulé depuis le début de session (colonne `Time`)
         t0 = laps["LapStartDate"].min()
         laps["Time"] = (laps["LapStartDate"] - t0) + laps["LapTime"].fillna(pd.Timedelta(0))
