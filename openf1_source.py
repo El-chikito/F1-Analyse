@@ -137,6 +137,21 @@ def get_event_schedule(year, include_testing=False):
         "EventDate": df["date_start"],
         "_meeting_key": df["meeting_key"],
     })
+    # EventFormat : FastF1 le fournit, pas OpenF1. Sans lui, l'app ne détecte
+    # aucun week-end sprint et oublie ces points au championnat. On le déduit
+    # de la présence d'une session « Sprint », en une seule requête pour toute
+    # la saison.
+    sprint_meetings = set()
+    try:
+        for s in _get("sessions", year=int(year)) or []:
+            if "sprint" in str(s.get("session_name", "")).lower():
+                mk = s.get("meeting_key")
+                if mk is not None:
+                    sprint_meetings.add(int(mk))
+    except OpenF1Error:
+        pass
+    out["EventFormat"] = ["sprint_qualifying" if int(k) in sprint_meetings
+                          else "conventional" for k in df["meeting_key"]]
     return out
 
 

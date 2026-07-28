@@ -1133,8 +1133,10 @@ def season_points_before(year, round_number, session_type):
     positions d'arrivée en course [nb de P1, nb de P2, ...] pour départager
     les égalités de points comme la F1. Ne charge que les feuilles de
     résultats (laps/télémétrie exclus) → rapide, puis caches disque + app."""
-    sched = fastf1.get_event_schedule(year, include_testing=False)
-    pts, cb, team_pts = {}, {}, {}
+    # DATA (et non fastf1) : en mode OpenF1 le calendrier doit venir de la même
+    # source que les résultats, sinon numéros de manche et sessions divergent.
+    sched = DATA.get_event_schedule(year, include_testing=False)
+    pts, cb, team_pts, echecs = {}, {}, {}, []
     for _, ev_row in sched.iterrows():
         rnd = int(ev_row["RoundNumber"])
         if rnd > round_number:
@@ -1166,9 +1168,12 @@ def season_points_before(year, round_number, session_type):
                         pos = r.get("Position")
                         if pd.notna(pos) and 1 <= int(pos) <= 22:
                             cb.setdefault(code, [0] * 22)[int(pos) - 1] += 1
-            except Exception:
-                continue  # manche pas encore courue / résultats absents
-    return pts, cb, team_pts
+            except Exception as exc:
+                # Une manche non courue est normale ; une erreur récurrente
+                # fausserait silencieusement tout le championnat, on la remonte.
+                echecs.append(f"R{rnd} {ses} ({type(exc).__name__})")
+                continue
+    return pts, cb, team_pts, echecs
 
 
 def safe_circuit_info(sess):
@@ -3809,9 +3814,14 @@ def page_timing():
     st.markdown("---")
     st.markdown("#### 🏆 Championnat pilotes — impact de la session")
     with st.spinner("Calcul des points de la saison (long au premier chargement, ensuite en cache)…"):
-        pts_before, cb_before, team_before = season_points_before(
+        pts_before, cb_before, team_before, pts_echecs = season_points_before(
             st.session_state.year, int(ev["RoundNumber"]), st.session_state.session_type
         )
+    if pts_echecs:
+        st.caption(f"⚠️ Manches non comptabilisées ({len(pts_echecs)}) : "
+                   + ", ".join(pts_echecs[:8])
+                   + (" …" if len(pts_echecs) > 8 else "")
+                   + " — le total peut être incomplet.")
     pts_session = {}
     if results is not None:
         pts_session = points_from_results(results, st.session_state.session_type)
