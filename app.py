@@ -395,6 +395,17 @@ def select_data_host():
 
 DATA_HOST = select_data_host()
 
+# ============== CHOIX DE LA SOURCE DE DONNÉES ==============
+# Quand la F1 refuse l'IP de l'hébergeur (403) ET que son miroir ne sert pas
+# les flux de session (404), FastF1 est inexploitable : on bascule sur
+# l'adaptateur OpenF1, qui expose la même interface depuis une API non
+# filtrée. Voir openf1_source.py et CLAUDE.md.
+USE_OPENF1 = not (DATA_HOST["primary"] == 200 or DATA_HOST["mirror"] == 200)
+if USE_OPENF1:
+    import openf1_source as DATA
+else:
+    DATA = fastf1
+
 
 class SessionLoadError(RuntimeError):
     """Échec de chargement, avec les warnings FastF1 qui expliquent pourquoi."""
@@ -790,7 +801,11 @@ SESSION_LABELS = {
     "FP3": "Essais Libres 3", "FP2": "Essais Libres 2", "FP1": "Essais Libres 1",
 }
 SESSION_TYPES = list(SESSION_LABELS.keys())
-YEARS = list(range(2026, 2017, -1))
+# FastF1 remonte à 2018 ; OpenF1, utilisé quand la F1 filtre l'hébergeur,
+# ne couvre que 2023 et après. On n'affiche que les saisons réellement
+# chargeables, sinon l'utilisateur choisit une année vouée à l'échec.
+OPENF1_FIRST_YEAR = 2023
+YEARS = list(range(2026, (OPENF1_FIRST_YEAR if USE_OPENF1 else 2018) - 1, -1))
 
 
 def gp_options_from(sched):
@@ -1067,8 +1082,8 @@ def gg_envelope(a_lat, a_long, n_bins=36, q=95):
 # ============== CACHED LOADERS ==============
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def load_schedule(year):
-    """Charge le calendrier d'une année."""
-    sched = fastf1.get_event_schedule(year, include_testing=False)
+    """Charge le calendrier d'une année (FastF1 ou OpenF1 selon la source)."""
+    sched = DATA.get_event_schedule(year, include_testing=False)
     return sched[["RoundNumber", "EventName", "Country", "Location", "EventDate"]]
 
 
@@ -1081,6 +1096,16 @@ def load_session(year, gp, session_type):
     weather=True → bandeau météo + contexte pluie/température sur les graphes.
     messages=True → drapeaux/SC/pénalités, ET la colonne Deleted des laps :
     FastF1 ne marque les tours supprimés QUE si les messages sont chargés."""
+    if USE_OPENF1:
+        # L'adaptateur lève une erreur explicite si la session est absente ;
+        # pas de chargement silencieux à vide comme chez FastF1.
+        try:
+            return DATA.get_session(year, gp, session_type).load()
+        except Exception as exc:
+            raise SessionLoadError(
+                f"source OpenF1 : {exc}. Cette API couvre les saisons 2023 et "
+                f"suivantes — une session antérieure n'y figure pas.", [str(exc)]
+            ) from exc
     with _capture_fastf1_logs() as fastf1_logs:
         s = fastf1.get_session(year, gp, session_type)
         s.load(telemetry=True, laps=True, weather=True, messages=True)
@@ -1124,7 +1149,7 @@ def season_points_before(year, round_number, session_type):
             ses_list.append("S")
         for ses in ses_list:
             try:
-                s = fastf1.get_session(year, rnd, ses)
+                s = DATA.get_session(year, rnd, ses)
                 s.load(laps=False, telemetry=False, weather=False, messages=False)
                 res = s.results
                 if res is None or res.empty:
@@ -1230,6 +1255,14 @@ def load_team_radio(year, gp, ses):
     import requests
 
     sess = load_session(year, gp, ses)
+    if USE_OPENF1:
+        # OpenF1 expose directement les clips (/team_radio), déjà appariés
+        # au pilote et au tour par l'adaptateur.
+        try:
+            df = sess.team_radio
+        except Exception:
+            return None
+        return df if df is not None and len(df) else None
     path = getattr(sess, "api_path", None)
     if not path:
         return None
@@ -1369,7 +1402,8 @@ try:
     with st.spinner(f"Chargement du calendrier {year}…"):
         schedule = load_schedule(year)
 except Exception as e:
-    st.error(f"❌ Impossible de charger le calendrier {year} (API FastF1 injoignable ?) : {e}")
+    st.error(f"❌ Impossible de charger le calendrier {year} — source "
+             f"**{'OpenF1' if USE_OPENF1 else 'FastF1'}** injoignable : {e}")
     st.stop()
 
 gp_options = gp_options_from(schedule)
@@ -1393,7 +1427,13 @@ session_type = st.sidebar.selectbox(
 # et changer de GP rechargeait tout sans clic.
 load_btn = st.sidebar.button("🚀 Charger la session", type="primary", width="stretch")
 
-if DATA_HOST["switched"]:
+if USE_OPENF1:
+    st.sidebar.caption(
+        f"🔀 Données via **OpenF1** — la F1 refuse l'IP de cet hébergeur "
+        f"(HTTP {DATA_HOST['primary']}). Transparent, mais limité aux saisons "
+        f"{OPENF1_FIRST_YEAR}+."
+    )
+elif DATA_HOST["switched"]:
     st.sidebar.caption(
         f"🔀 Données via le **miroir FastF1** — le serveur F1 refuse l'IP de "
         f"l'hébergeur (HTTP {DATA_HOST['primary']}). Rien à faire, c'est transparent."
