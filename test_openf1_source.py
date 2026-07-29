@@ -182,3 +182,61 @@ def main():
 
 if __name__ == "__main__":
     main()
+    test_numerotation_manches()
+
+
+def test_numerotation_manches():
+    """Régression : les essais de pré-saison décalaient la numérotation.
+
+    `season_points_before` parcourt les manches 1..N du calendrier SANS
+    essais. Si `_find_meeting` numérotait AVEC les essais, la manche N
+    désignait la course N-1, la dernière course n'était jamais atteinte et
+    ses points disparaissaient du championnat (86 points manquants
+    constatés en production)."""
+    def iso(s):
+        return pd.Timestamp(s).isoformat() + "+00:00"
+
+    fake = {
+        "meetings": [
+            {"meeting_key": 1200, "meeting_name": "Pre-Season Testing",
+             "country_name": "Bahrain", "location": "Sakhir",
+             "date_start": iso("2026-02-11T08:00:00"), "circuit_key": 63},
+            {"meeting_key": 1201, "meeting_name": "Australian Grand Prix",
+             "country_name": "Australia", "location": "Melbourne",
+             "date_start": iso("2026-03-06T06:00:00"), "circuit_key": 10},
+            {"meeting_key": 1202, "meeting_name": "Chinese Grand Prix",
+             "country_name": "China", "location": "Shanghai",
+             "date_start": iso("2026-03-20T07:00:00"), "circuit_key": 49},
+            {"meeting_key": 1203, "meeting_name": "Japanese Grand Prix",
+             "country_name": "Japan", "location": "Suzuka",
+             "date_start": iso("2026-04-03T05:00:00"), "circuit_key": 46},
+        ],
+        # Les essais n'ont que des séances « Day N » : aucune course.
+        "sessions": [
+            {"meeting_key": 1200, "session_name": "Day 1", "session_key": 1},
+            {"meeting_key": 1201, "session_name": "Race", "session_key": 2},
+            {"meeting_key": 1202, "session_name": "Sprint", "session_key": 3},
+            {"meeting_key": 1202, "session_name": "Race", "session_key": 4},
+            {"meeting_key": 1203, "session_name": "Race", "session_key": 5},
+        ],
+    }
+    of1._get = lambda endpoint, **p: fake.get(endpoint, [])
+
+    gps = of1.get_event_schedule(2026, include_testing=False)
+    assert list(gps["EventName"]) == ["Australian Grand Prix", "Chinese Grand Prix",
+                                      "Japanese Grand Prix"], "essais non exclus"
+    assert list(gps["RoundNumber"]) == [1, 2, 3]
+
+    # Chaque numéro de manche doit résoudre la bonne course
+    for rnd, attendu in ((1, 1201), (2, 1202), (3, 1203)):
+        assert of1._find_meeting(2026, rnd) == attendu, f"manche {rnd} mal résolue"
+
+    # Le week-end sprint doit être reconnu, sinon ses points sont perdus
+    fmt = dict(zip(gps["EventName"], gps["EventFormat"]))
+    assert fmt["Chinese Grand Prix"] == "sprint_qualifying"
+    assert fmt["Australian Grand Prix"] == "conventional"
+
+    # Un meeting d'essais reste résoluble par son nom (mais hors championnat)
+    assert of1._find_meeting(2026, "Pre-Season Testing") == 1200
+    print("11) numérotation manches : essais exclus, sprint détecté, "
+          "dernière manche atteignable ✓")

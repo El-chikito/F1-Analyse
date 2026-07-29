@@ -125,10 +125,34 @@ def get_event_schedule(year, include_testing=False):
         raise OpenF1Error(f"aucun week-end trouvé pour {year}")
     df = _df(meetings, dates=("date_start",))
     df = df.sort_values("date_start").reset_index(drop=True)
+
+    # Sessions de la saison en une requête : sert à la fois à repérer les
+    # week-ends sprint et à distinguer un vrai Grand Prix des essais de
+    # pré-saison. Se fier au NOM du meeting serait fragile — un libellé
+    # inattendu décalerait toute la numérotation des manches, et donc le
+    # championnat (bug constaté).
+    race_meetings, sprint_meetings = set(), set()
+    try:
+        for s in _get("sessions", year=int(year)) or []:
+            mk = s.get("meeting_key")
+            if mk is None:
+                continue
+            nom = str(s.get("session_name", "")).lower()
+            if nom == "race":
+                race_meetings.add(int(mk))
+            if "sprint" in nom:
+                sprint_meetings.add(int(mk))
+    except OpenF1Error:
+        pass
+
     if not include_testing:
-        # Les essais de pré-saison n'ont pas de Grand Prix associé
-        mask = ~df["meeting_name"].astype(str).str.contains("Testing", case=False, na=False)
-        df = df[mask].reset_index(drop=True)
+        if race_meetings:
+            # Un Grand Prix = un week-end qui comporte une course
+            df = df[df["meeting_key"].astype(int).isin(race_meetings)].reset_index(drop=True)
+        else:  # repli si la liste des sessions n'a pas pu être récupérée
+            mask = ~df["meeting_name"].astype(str).str.contains("Testing|Test ", case=False,
+                                                                na=False, regex=True)
+            df = df[mask].reset_index(drop=True)
     out = pd.DataFrame({
         "RoundNumber": np.arange(1, len(df) + 1),
         "EventName": df["meeting_name"].astype(str),
@@ -138,18 +162,7 @@ def get_event_schedule(year, include_testing=False):
         "_meeting_key": df["meeting_key"],
     })
     # EventFormat : FastF1 le fournit, pas OpenF1. Sans lui, l'app ne détecte
-    # aucun week-end sprint et oublie ces points au championnat. On le déduit
-    # de la présence d'une session « Sprint », en une seule requête pour toute
-    # la saison.
-    sprint_meetings = set()
-    try:
-        for s in _get("sessions", year=int(year)) or []:
-            if "sprint" in str(s.get("session_name", "")).lower():
-                mk = s.get("meeting_key")
-                if mk is not None:
-                    sprint_meetings.add(int(mk))
-    except OpenF1Error:
-        pass
+    # aucun week-end sprint et oublie tous ces points au championnat.
     out["EventFormat"] = ["sprint_qualifying" if int(k) in sprint_meetings
                           else "conventional" for k in df["meeting_key"]]
     return out
@@ -158,13 +171,18 @@ def get_event_schedule(year, include_testing=False):
 def _find_meeting(year, gp):
     """Retrouve la clé du week-end depuis son nom, ou son numéro de manche
     (FastF1 accepte les deux, `season_points_before` s'en sert)."""
-    sched = get_event_schedule(year, include_testing=True)
-    if isinstance(gp, (int, np.integer)) or (isinstance(gp, str) and gp.isdigit()):
+    if isinstance(gp, (int, np.integer)) or (isinstance(gp, str) and str(gp).isdigit()):
+        # ⚠️ Les numéros de manche se comptent sur les SEULS Grands Prix.
+        # Inclure les essais de pré-saison décale toute la numérotation : la
+        # manche N désignait alors la course N-1, une course n'était jamais
+        # visitée et ses points disparaissaient du championnat.
         rnd = int(gp)
-        row = sched[sched["RoundNumber"] == rnd]
+        gps = get_event_schedule(year, include_testing=False)
+        row = gps[gps["RoundNumber"] == rnd]
         if len(row):
             return int(row.iloc[0]["_meeting_key"])
         raise OpenF1Error(f"manche {rnd} introuvable en {year}")
+    sched = get_event_schedule(year, include_testing=True)
     exact = sched[sched["EventName"] == gp]
     if len(exact):
         return int(exact.iloc[0]["_meeting_key"])
@@ -360,8 +378,13 @@ class Session:
         self._weather = None
         self._rcm = None
         self._tel_cache = {}
-        sched = get_event_schedule(year, include_testing=True)
+        # Numérotation prise sur les Grands Prix seuls, pour que le
+        # RoundNumber renvoyé à l'app corresponde à celui du championnat.
+        sched = get_event_schedule(year, include_testing=False)
         row = sched[sched["_meeting_key"] == self._meeting_key]
+        if not len(row):  # séance d'essais de pré-saison
+            sched = get_event_schedule(year, include_testing=True)
+            row = sched[sched["_meeting_key"] == self._meeting_key]
         self.event = (row.iloc[0] if len(row) else pd.Series(
             {"EventName": gp, "Country": info.get("country_name", ""),
              "Location": info.get("location", ""),
