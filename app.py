@@ -876,6 +876,21 @@ def hex_to_rgba(h, a):
     return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{a})"
 
 
+def lighten(h, amount=0.45):
+    """Éclaircit une couleur en la mélangeant vers le blanc.
+
+    Sert à distinguer deux coéquipiers sans changer de teinte : trait plein
+    dans les deux cas, le mieux classé garde la couleur d'écurie, l'autre en
+    reçoit une version pastel."""
+    h = str(h).lstrip("#")
+    if len(h) != 6:
+        return "#888888"
+    amount = max(0.0, min(1.0, amount))
+    canaux = [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+    canaux = [int(c + (255 - c) * amount) for c in canaux]
+    return "#{:02X}{:02X}{:02X}".format(*canaux)
+
+
 def text_on(bg):
     """Noir ou blanc selon la luminance du fond — garde les badges lisibles
     sur les couleurs claires (jaune Renault, gris Haas, pink Racing Point)."""
@@ -1179,7 +1194,10 @@ def season_points_before(year, round_number, session_type):
                         if pd.notna(pos) and 1 <= int(pos) <= 22:
                             cb.setdefault(code, [0] * 22)[int(pos) - 1] += 1
                             positions.setdefault(rnd, {})[code] = int(pos)
-                            manches[rnd] = str(ev_row["EventName"])
+                            # Nom du circuit plutôt que du GP : « Silverstone »
+                            # parle davantage que « British Grand Prix ».
+                            lieu = str(ev_row.get("Location") or "").strip()
+                            manches[rnd] = lieu or str(ev_row["EventName"])
             except Exception as exc:
                 # Une manche non courue est normale ; une erreur récurrente
                 # fausserait silencieusement tout le championnat, on la remonte.
@@ -3976,7 +3994,8 @@ def page_timing():
         if courante:
             rnd_courant = int(ev["RoundNumber"])
             pos_hist[rnd_courant] = courante
-            manches[rnd_courant] = str(ev["EventName"])
+            lieu_courant = str(ev.get("Location") or "").strip()
+            manches[rnd_courant] = lieu_courant or str(ev["EventName"])
 
     if not pos_hist:
         st.info("Aucune course terminée dans cette saison pour le moment.")
@@ -4000,34 +4019,48 @@ def page_timing():
             st.info("Sélectionne au moins une écurie.")
         else:
             fig_pos = go.Figure()
-            # Deux coéquipiers partagent la couleur d'équipe : le style de trait
-            # les distingue (le mieux classé en trait plein).
+            # Coéquipiers : même teinte, traits pleins tous les deux. Le mieux
+            # classé garde la couleur d'écurie, les suivants l'ont éclaircie.
             rang_dans_equipe = {}
-            for c in codes:
+            for c in codes:  # `codes` est déjà trié par équipe puis par moyenne
                 eq = equipes.get(c, "—")
                 rang_dans_equipe[c] = rang_dans_equipe.get(eq, 0)
                 rang_dans_equipe[eq] = rang_dans_equipe[c] + 1
-            styles = ["solid", "dash", "dot", "dashdot"]
+
+            abscisses = [manches.get(r, f"R{r}") for r in grille.index]
             for c in codes:
+                base = team_color(equipes.get(c, "—"))
+                nuance = base if rang_dans_equipe[c] == 0 else \
+                    lighten(base, 0.35 + 0.2 * (rang_dans_equipe[c] - 1))
                 serie = grille[c]
                 fig_pos.add_trace(go.Scatter(
-                    x=[manches.get(r, f"R{r}") for r in grille.index],
-                    y=serie.values, mode="lines+markers",
+                    x=abscisses, y=serie.values, mode="lines+markers",
                     name=f"{c} · moy. P{moyennes[c]:.1f}",
-                    line=dict(color=team_color(equipes.get(c, "—")), width=2,
-                              dash=styles[rang_dans_equipe[c] % len(styles)]),
+                    line=dict(color=nuance, width=2.2),
                     marker=dict(size=6),
                     connectgaps=False,  # un abandon ne doit pas être relié
                     hovertemplate=f"<b>{c}</b><br>%{{x}}<br>P%{{y:.0f}}<extra></extra>",
                 ))
+                # Code pilote en bout de ligne, à droite du dernier résultat
+                # classé (un abandon en fin de saison ne doit pas le déplacer
+                # vers une position qu'il n'a pas occupée).
+                connus = serie.dropna()
+                if len(connus):
+                    fig_pos.add_annotation(
+                        x=manches.get(connus.index[-1], f"R{connus.index[-1]}"),
+                        y=float(connus.iloc[-1]), text=f"<b>{c}</b>",
+                        showarrow=False, xanchor="left", xshift=10,
+                        font=dict(size=11, color=nuance),
+                    )
             fig_pos.update_layout(
                 height=560, template="plotly_dark",
-                xaxis=dict(title="Grand Prix", tickangle=45 if MOBILE else 30),
+                xaxis=dict(title="Circuit", tickangle=45 if MOBILE else 30),
                 yaxis=dict(title="Position finale", autorange="reversed", dtick=1),
                 hovermode="closest",
                 legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center",
                             font=dict(size=10)),
-                margin=dict(t=20, b=20, l=20, r=20),
+                # Marge droite élargie : sans elle les codes pilotes sont rognés
+                margin=dict(t=20, b=20, l=20, r=70),
             )
             plot(fig_pos)
 
