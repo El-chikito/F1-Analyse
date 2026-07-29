@@ -6,10 +6,21 @@ Projet et utilisateur francophones — réponds en français, commente en franç
 
 ## Ce que c'est
 
-« Analyse F1 » : app Streamlit mono-fichier (`app.py`, ~3000 lignes) d'analyse
-télémétrique F1 basée sur FastF1, déployée sur Streamlit Community Cloud depuis
-`main` (chaque push sur `main` redéploie l'app du user — voir README.md pour le
-setup). Le user la consulte surtout **sur téléphone**.
+« Analyse F1 » : app Streamlit (`app.py`, ~3200 lignes) d'analyse télémétrique
+F1, déployée sur Streamlit Community Cloud depuis `main` (chaque push sur
+`main` redéploie l'app du user — voir README.md). Le user la consulte surtout
+**sur téléphone**, et vise le GP de Zandvoort (23/08/2026), où il se rend.
+
+**Deux sources de données interchangeables** (choix automatique au démarrage) :
+- **FastF1** — historique 2018+, mais la F1 renvoie 403 aux IP d'hébergeurs :
+  inutilisable depuis le cloud ;
+- **OpenF1** (`openf1_source.py`) — 2023+, aucun filtrage d'hébergeur, donc
+  la source réellement active en production.
+
+Le module OpenF1 **imite l'interface FastF1** (Session, Laps.pick_drivers /
+pick_fastest, Lap.get_car_data / get_telemetry, results, weather_data…) : les
+14 onglets d'analyse n'ont pas été réécrits. Toucher à `openf1_source.py`
+signifie respecter ce contrat — `test_openf1_source.py` le fige.
 
 ## Commandes
 
@@ -18,6 +29,7 @@ pip install -r requirements.txt        # + playwright pour les tests navigateur
 streamlit run app.py                   # http://localhost:8501
 
 python3 -m py_compile app.py           # check syntaxe minimal
+python3 test_openf1_source.py          # contrat de l'adaptateur OpenF1
 
 # Test de démarrage sans navigateur (attrape les exceptions au boot) :
 python3 -c "
@@ -107,6 +119,22 @@ pour du contenu principal.
   + `_network_diagnostic`, qui sonde un VRAI fichier de données, pas la racine
   du site) : c'est LUI qu'il faut lire avant de supposer une cause — c'est ce
   qui a permis d'identifier le 403 sans pouvoir joindre les serveurs F1.
+- **Pièges OpenF1 spécifiques** (tous ont déjà cassé en prod) :
+  · horodatages à **précision variable** dans un même flux — sans
+    `format="ISO8601"`, pandas met la moitié des points à NaT en silence ;
+  · **numéros de manche** : ils se comptent sur les seuls Grands Prix. Inclure
+    les essais de pré-saison décale tout et fait disparaître des courses du
+    championnat. Un GP = un week-end qui a une session `Race` (ne PAS se fier
+    au nom du meeting) ;
+  · **rate-limiting** : le calcul du championnat crée une session par manche.
+    Sans le cache de `_cached()`, c'était 100+ requêtes en rafale et des
+    manches refusées silencieusement. Toute nouvelle boucle sur les sessions
+    doit passer par le cache ;
+  · pas de tour supprimé (`Deleted` toujours False), pas d'`EventFormat`
+    (déduit de la présence d'une session Sprint), distance parcourue et
+    `TrackStatus` **reconstruits** (intégration de la vitesse / messages FIA).
+- **Mini-secteurs disponibles via OpenF1** (`Segments1/2/3` + `segment_label`)
+  alors que FastF1 ne les expose pas en post-session.
 - **Radios** : flux `TeamRadio.json` non documenté sur
   `livetiming.formula1.com/static/` + `session.api_path` ; miroir
   `livetiming-mirror.fastf1.dev` en secours ; JSON encodé `utf-8-sig`.
