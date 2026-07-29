@@ -31,6 +31,8 @@ pour qu'une correction de schéma ne demande qu'une seule retouche.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 import requests
@@ -77,25 +79,70 @@ class OpenF1Error(RuntimeError):
     """Échec de récupération côté OpenF1 (réseau, schéma inattendu, vide)."""
 
 
-def _get(endpoint, **params):
+# Cache mémoire des réponses stables (calendrier, sessions). Le calcul du
+# championnat crée une session par manche : sans cache, le même calendrier
+# était retéléchargé à chaque tour de boucle — plus de 100 requêtes en rafale,
+# de quoi déclencher le rate-limiting d'OpenF1 et faire échouer des manches
+# entières (constaté : 9 manches perdues sur une saison).
+_CACHE = {}
+_CACHE_TTL = 3600
+
+
+def _cached(cle, produire):
+    maintenant = time.time()
+    entree = _CACHE.get(cle)
+    if entree is not None and maintenant - entree[0] < _CACHE_TTL:
+        return entree[1]
+    valeur = produire()
+    _CACHE[cle] = (maintenant, valeur)
+    return valeur
+
+
+def vider_cache():
+    """Purge le cache mémoire (utile si la session est en cours de publication)."""
+    _CACHE.clear()
+
+
+def _get(endpoint, _essais=4, **params):
     """Appel GET sur l'API, renvoie une liste de dicts (éventuellement vide).
 
+    Réessaie avec attente croissante sur 429 (quota) et 5xx : le calcul du
+    championnat enchaîne les requêtes et se faisait refouler par salves.
     OpenF1 renvoie toujours un tableau JSON ; un dict seul signale une erreur
-    applicative (ex. quota) qu'on remonte explicitement."""
+    applicative qu'on remonte explicitement."""
     url = f"{BASE_URL}/{endpoint}"
-    try:
-        r = requests.get(url, params=params, timeout=TIMEOUT)
-    except Exception as exc:
-        raise OpenF1Error(f"{endpoint} injoignable : {type(exc).__name__}") from exc
-    if r.status_code != 200:
-        raise OpenF1Error(f"{endpoint} : HTTP {r.status_code}")
-    try:
-        data = r.json()
-    except Exception as exc:
-        raise OpenF1Error(f"{endpoint} : réponse illisible") from exc
-    if isinstance(data, dict):
-        raise OpenF1Error(f"{endpoint} : {data.get('detail') or data}")
-    return data
+    dernier = ""
+    for essai in range(_essais):
+        try:
+            r = requests.get(url, params=params, timeout=TIMEOUT)
+        except Exception as exc:
+            dernier = f"injoignable ({type(exc).__name__})"
+            if essai < _essais - 1:
+                time.sleep(0.5 * 2 ** essai)
+                continue
+            raise OpenF1Error(f"{endpoint} {dernier}") from exc
+        if r.status_code == 429 or r.status_code >= 500:
+            dernier = f"HTTP {r.status_code}"
+            if essai < _essais - 1:
+                # Respecte Retry-After quand le serveur l'indique
+                attente = r.headers.get("Retry-After")
+                try:
+                    attente = float(attente)
+                except (TypeError, ValueError):
+                    attente = 1.0 * 2 ** essai
+                time.sleep(min(attente, 10.0))
+                continue
+            raise OpenF1Error(f"{endpoint} : {dernier} (quota atteint ?)")
+        if r.status_code != 200:
+            raise OpenF1Error(f"{endpoint} : HTTP {r.status_code}")
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise OpenF1Error(f"{endpoint} : réponse illisible") from exc
+        if isinstance(data, dict):
+            raise OpenF1Error(f"{endpoint} : {data.get('detail') or data}")
+        return data
+    raise OpenF1Error(f"{endpoint} : {dernier}")
 
 
 def _df(records, dates=()):
@@ -118,7 +165,14 @@ def _df(records, dates=()):
 def get_event_schedule(year, include_testing=False):
     """Calendrier d'une saison, au format attendu par l'app.
 
-    OpenF1 expose les week-ends via `/meetings` ; le numéro de manche n'y
+    Mis en cache : appelé une fois par manche lors du calcul du championnat,
+    il représentait à lui seul l'essentiel du trafic."""
+    return _cached(("schedule", int(year), bool(include_testing)),
+                   lambda: _build_schedule(year, include_testing)).copy()
+
+
+def _build_schedule(year, include_testing):
+    """OpenF1 expose les week-ends via `/meetings` ; le numéro de manche n'y
     figure pas, on le reconstruit par ordre chronologique."""
     meetings = _get("meetings", year=int(year))
     if not meetings:
@@ -133,7 +187,7 @@ def get_event_schedule(year, include_testing=False):
     # championnat (bug constaté).
     race_meetings, sprint_meetings = set(), set()
     try:
-        for s in _get("sessions", year=int(year)) or []:
+        for s in _sessions_of_year(year):
             mk = s.get("meeting_key")
             if mk is None:
                 continue
@@ -194,9 +248,24 @@ def _find_meeting(year, gp):
     raise OpenF1Error(f"week-end introuvable : {gp} ({year})")
 
 
-def _find_session_key(meeting_key, session_type):
-    """Clé de la session (Q, R, FP1…) dans un week-end donné."""
-    sessions = _get("sessions", meeting_key=meeting_key)
+def _sessions_of_year(year):
+    """Toutes les sessions d'une saison, en une requête mise en cache."""
+    return _cached(("sessions_year", int(year)),
+                   lambda: _get("sessions", year=int(year)) or [])
+
+
+def _find_session_key(meeting_key, session_type, year=None):
+    """Clé de la session (Q, R, FP1…) dans un week-end donné.
+
+    Quand l'année est connue, on puise dans la liste complète déjà en cache
+    plutôt que d'interroger l'API manche par manche."""
+    sessions = []
+    if year is not None:
+        sessions = [s for s in _sessions_of_year(year)
+                    if str(s.get("meeting_key")) == str(meeting_key)]
+    if not sessions:
+        sessions = _cached(("sessions_meeting", int(meeting_key)),
+                           lambda: _get("sessions", meeting_key=meeting_key) or [])
     if not sessions:
         raise OpenF1Error("aucune session pour ce week-end")
     wanted = CODE_TO_NAME.get(session_type, session_type)
@@ -369,7 +438,7 @@ class Session:
         self.name = session_type
         self._gp = gp
         self._meeting_key = _find_meeting(year, gp)
-        info = _find_session_key(self._meeting_key, session_type)
+        info = _find_session_key(self._meeting_key, session_type, year=self.year)
         self.session_key = int(info["session_key"])
         self.session_info = info
         self._laps = None

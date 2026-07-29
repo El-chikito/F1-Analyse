@@ -99,6 +99,7 @@ def build_fixtures():
 def main():
     fake = build_fixtures()
     of1._get = lambda endpoint, **p: fake.get(endpoint, [])
+    of1.vider_cache()  # isolation : le cache mémoire survit d'un test à l'autre
 
     # 1. Horodatages à précision mixte — la régression la plus vicieuse
     car = of1._df(fake["car_data"], dates=("date",))
@@ -216,6 +217,7 @@ def test_numerotation_manches():
         ],
     }
     of1._get = lambda endpoint, **p: fake.get(endpoint, [])
+    of1.vider_cache()  # isolation : sinon le calendrier du test précédent ressort
 
     gps = of1.get_event_schedule(2026, include_testing=False)
     assert list(gps["EventName"]) == ["Australian Grand Prix", "Chinese Grand Prix",
@@ -237,6 +239,50 @@ def test_numerotation_manches():
           "dernière manche atteignable ✓")
 
 
+
+def test_trafic_reseau():
+    """Régression : le calcul du championnat saturait le quota d'OpenF1.
+
+    Sans cache, chaque manche retéléchargeait le calendrier complet — plus
+    de 100 requêtes en rafale pour une saison, et 9 manches refusées par le
+    serveur (donc absentes du championnat, silencieusement)."""
+    from collections import Counter
+
+    fake = {"meetings": [], "sessions": []}
+    for i in range(1, 12):
+        mk = 1200 + i
+        fake["meetings"].append({
+            "meeting_key": mk, "meeting_name": f"GP {i}", "country_name": "X",
+            "location": "Y", "circuit_key": 10,
+            "date_start": pd.Timestamp(f"2026-{i:02d}-01T12:00:00").isoformat() + "+00:00"})
+        fake["sessions"].append({"meeting_key": mk, "session_key": mk * 10,
+                                 "session_name": "Race"})
+        if i in (6, 7, 11):  # week-ends sprint
+            fake["sessions"].append({"meeting_key": mk, "session_key": mk * 10 + 1,
+                                     "session_name": "Sprint"})
+
+    appels = []
+    of1._get = lambda endpoint, **p: (appels.append(endpoint), fake.get(endpoint, []))[1]
+    of1.vider_cache()
+
+    sched = of1.get_event_schedule(2026)
+    fmt = dict(zip(sched["RoundNumber"], sched["EventFormat"]))
+    charge = 0
+    for rnd in sched["RoundNumber"]:
+        for ses in (["S", "R"] if fmt[rnd] == "sprint_qualifying" else ["R"]):
+            of1.get_session(2026, int(rnd), ses)
+            charge += 1
+
+    assert charge == 14, charge
+    assert len(appels) <= 3, f"{len(appels)} requêtes : le cache ne fonctionne plus"
+    # Le cache ne doit pas fausser la résolution des sessions
+    assert of1.get_session(2026, 6, "S").session_key == 12061
+    assert of1.get_session(2026, 6, "R").session_key == 12060
+    print(f"12) trafic réseau        : {charge} sessions en {len(appels)} requêtes "
+          f"{dict(Counter(appels))} ✓")
+
+
 if __name__ == "__main__":
     main()
     test_numerotation_manches()
+    test_trafic_reseau()
