@@ -54,6 +54,11 @@ Changements vs version précédente
        En cas d'échec malgré tout : panneau 🩺 Diagnostic (warnings FastF1
        capturés + sondage d'un vrai fichier de données sur chaque serveur)
        et boutons Réessayer / Vider le cache.
+- NOUVEAU Overview : section « 📉 Position finale par course » sous le
+  championnat — une ligne par pilote sur toute la saison (couleur d'équipe,
+  trait plein/pointillé pour distinguer les coéquipiers), filtrable par
+  écurie, avec position moyenne et tableau des duels internes. Les positions
+  sont récoltées dans la boucle du championnat, sans requête supplémentaire.
 - NOUVEAU Overview course : expander « 📈 Position des pilotes par tour » —
   évolution des positions tour par tour de tout le plateau (grille de départ
   en tour 0), filtrable par multiselect, replié par défaut.
@@ -1137,6 +1142,10 @@ def season_points_before(year, round_number, session_type):
     # source que les résultats, sinon numéros de manche et sessions divergent.
     sched = DATA.get_event_schedule(year, include_testing=False)
     pts, cb, team_pts, echecs = {}, {}, {}, []
+    # Positions d'arrivée course par course + équipe de chaque pilote :
+    # récoltées dans CETTE boucle plutôt que dans une seconde passe, pour ne
+    # pas doubler le trafic (cf. le rate-limiting déjà rencontré).
+    positions, manches, equipes = {}, {}, {}
     for _, ev_row in sched.iterrows():
         rnd = int(ev_row["RoundNumber"])
         if rnd > round_number:
@@ -1164,16 +1173,21 @@ def season_points_before(year, round_number, session_type):
                     team = str(r.get("TeamName", "") or "")
                     if team:  # cumul constructeurs (somme des deux pilotes)
                         team_pts[team] = team_pts.get(team, 0.0) + pfr.get(code, 0.0)
+                        equipes[code] = team
                     if ses == "R":
                         pos = r.get("Position")
                         if pd.notna(pos) and 1 <= int(pos) <= 22:
                             cb.setdefault(code, [0] * 22)[int(pos) - 1] += 1
+                            positions.setdefault(rnd, {})[code] = int(pos)
+                            manches[rnd] = str(ev_row["EventName"])
             except Exception as exc:
                 # Une manche non courue est normale ; une erreur récurrente
                 # fausserait silencieusement tout le championnat, on la remonte.
                 echecs.append(f"R{rnd} {ses} ({type(exc).__name__})")
                 continue
-    return pts, cb, team_pts, echecs
+    # Dictionnaire plutôt qu'un n-uplet qui s'allonge à chaque besoin
+    return {"pts": pts, "cb": cb, "team_pts": team_pts, "echecs": echecs,
+            "positions": positions, "manches": manches, "equipes": equipes}
 
 
 def safe_circuit_info(sess):
@@ -3814,9 +3828,11 @@ def page_timing():
     st.markdown("---")
     st.markdown("#### 🏆 Championnat pilotes — impact de la session")
     with st.spinner("Calcul des points de la saison (long au premier chargement, ensuite en cache)…"):
-        pts_before, cb_before, team_before, pts_echecs = season_points_before(
+        hist = season_points_before(
             st.session_state.year, int(ev["RoundNumber"]), st.session_state.session_type
         )
+    pts_before, cb_before = hist["pts"], hist["cb"]
+    team_before, pts_echecs = hist["team_pts"], hist["echecs"]
     if pts_echecs:
         st.caption(f"⚠️ Manches non comptabilisées ({len(pts_echecs)}) : "
                    + ", ".join(pts_echecs[:8])
@@ -3940,6 +3956,113 @@ def page_timing():
         "Égalités départagées par points uniquement (le countback constructeurs "
         "n'est pas appliqué)."
     )
+
+    # --- Position finale course par course : régularité et duels internes ---
+    st.markdown("---")
+    st.markdown("#### 📉 Position finale par course")
+
+    pos_hist = dict(hist["positions"])
+    manches = dict(hist["manches"])
+    equipes = dict(hist["equipes"])
+    # La session en cours n'est pas dans l'historique (qui s'arrête AVANT elle)
+    if st.session_state.session_type == "R" and results is not None:
+        courante = {}
+        for _, r in results.iterrows():
+            p = r.get("Position")
+            if pd.notna(p) and 1 <= int(p) <= 22:
+                code = str(r["Abbreviation"])
+                courante[code] = int(p)
+                equipes.setdefault(code, str(r.get("TeamName", "") or "—"))
+        if courante:
+            rnd_courant = int(ev["RoundNumber"])
+            pos_hist[rnd_courant] = courante
+            manches[rnd_courant] = str(ev["EventName"])
+
+    if not pos_hist:
+        st.info("Aucune course terminée dans cette saison pour le moment.")
+    else:
+        rounds = sorted(pos_hist)
+        grille = pd.DataFrame(
+            {r: pd.Series(pos_hist[r]) for r in rounds}
+        ).T.sort_index()          # lignes = manches, colonnes = pilotes
+        moyennes = grille.mean(axis=0)
+
+        toutes_equipes = sorted({equipes.get(c, "—") for c in grille.columns})
+        sel_equipes = st.multiselect(
+            "Écuries affichées", options=toutes_equipes, default=toutes_equipes,
+            key="pos_race_teams",
+            help="Filtre pour comparer deux coéquipiers sans le bruit des autres.",
+        )
+        codes = [c for c in grille.columns if equipes.get(c, "—") in sel_equipes]
+        codes.sort(key=lambda c: (equipes.get(c, "—"), moyennes.get(c, 99)))
+
+        if not codes:
+            st.info("Sélectionne au moins une écurie.")
+        else:
+            fig_pos = go.Figure()
+            # Deux coéquipiers partagent la couleur d'équipe : le style de trait
+            # les distingue (le mieux classé en trait plein).
+            rang_dans_equipe = {}
+            for c in codes:
+                eq = equipes.get(c, "—")
+                rang_dans_equipe[c] = rang_dans_equipe.get(eq, 0)
+                rang_dans_equipe[eq] = rang_dans_equipe[c] + 1
+            styles = ["solid", "dash", "dot", "dashdot"]
+            for c in codes:
+                serie = grille[c]
+                fig_pos.add_trace(go.Scatter(
+                    x=[manches.get(r, f"R{r}") for r in grille.index],
+                    y=serie.values, mode="lines+markers",
+                    name=f"{c} · moy. P{moyennes[c]:.1f}",
+                    line=dict(color=team_color(equipes.get(c, "—")), width=2,
+                              dash=styles[rang_dans_equipe[c] % len(styles)]),
+                    marker=dict(size=6),
+                    connectgaps=False,  # un abandon ne doit pas être relié
+                    hovertemplate=f"<b>{c}</b><br>%{{x}}<br>P%{{y:.0f}}<extra></extra>",
+                ))
+            fig_pos.update_layout(
+                height=560, template="plotly_dark",
+                xaxis=dict(title="Grand Prix", tickangle=45 if MOBILE else 30),
+                yaxis=dict(title="Position finale", autorange="reversed", dtick=1),
+                hovermode="closest",
+                legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center",
+                            font=dict(size=10)),
+                margin=dict(t=20, b=20, l=20, r=20),
+            )
+            plot(fig_pos)
+
+            # Duels internes : qui devance qui, et de combien en moyenne
+            duels = []
+            for eq in sel_equipes:
+                pilotes = [c for c in codes if equipes.get(c, "—") == eq]
+                if len(pilotes) != 2:
+                    continue
+                a, b = pilotes
+                commun = grille[[a, b]].dropna()
+                if commun.empty:
+                    continue
+                va = int((commun[a] < commun[b]).sum())
+                vb = int((commun[b] < commun[a]).sum())
+                duels.append({
+                    "Écurie": eq,
+                    "Duel": f"{a} {va} – {vb} {b}",
+                    "Courses comparées": len(commun),
+                    f"Moyenne": f"{a} P{moyennes[a]:.1f} · {b} P{moyennes[b]:.1f}",
+                })
+            if duels:
+                st.markdown("##### 🤝 Duels entre coéquipiers")
+                show_table(pd.DataFrame(duels).style, force_html=True,
+                           height=min(40 * (len(duels) + 1) + 3, 460))
+                st.caption(
+                    "Nombre de courses où chaque pilote a devancé son coéquipier, "
+                    "sur les seules courses **terminées par les deux** — un abandon "
+                    "ne compte ni comme victoire ni comme défaite dans le duel."
+                )
+            st.caption(
+                "Position à l'arrivée, course par course. Les lignes s'interrompent "
+                "quand un pilote n'est pas classé (abandon, non-partant). "
+                "**moy.** = position moyenne sur ses courses classées."
+            )
 
 
 # ============== NAVIGATION ==============
