@@ -180,11 +180,6 @@ def main():
     print("\n✅ ADAPTATEUR OPENF1 VALIDÉ (contrat figé pour app.py)")
 
 
-if __name__ == "__main__":
-    main()
-    test_numerotation_manches()
-
-
 def test_numerotation_manches():
     """Régression : les essais de pré-saison décalaient la numérotation.
 
@@ -240,3 +235,8 @@ def test_numerotation_manches():
     assert of1._find_meeting(2026, "Pre-Season Testing") == 1200
     print("11) numérotation manches : essais exclus, sprint détecté, "
           "dernière manche atteignable ✓")
+
+
+if __name__ == "__main__":
+    main()
+    test_numerotation_manches()
