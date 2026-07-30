@@ -1226,7 +1226,11 @@ def safe_circuit_info(sess):
 def compute_race_gaps(year, gp, ses):
     """Écarts avant/arrière au passage de la ligne, pour chaque pilote et chaque tour."""
     sess = load_session(year, gp, ses)
-    laps = sess.laps[["Driver", "LapNumber", "Position", "Time", "PitInTime", "PitOutTime"]].copy()
+    # pd.DataFrame(...) et non .copy() : la source OpenF1 renvoie une sous-classe
+    # qui transporte une référence à la Session. st.cache_data sérialise ce
+    # qu'elle reçoit — on embarquerait toute la session dans le cache.
+    laps = pd.DataFrame(
+        sess.laps[["Driver", "LapNumber", "Position", "Time", "PitInTime", "PitOutTime"]])
     laps = laps.dropna(subset=["Position", "Time"])
     if laps.empty:
         return pd.DataFrame()

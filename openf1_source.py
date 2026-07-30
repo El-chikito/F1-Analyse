@@ -272,11 +272,13 @@ def _find_session_key(meeting_key, session_type, year=None):
     for s in sessions:
         if str(s.get("session_name", "")).lower() == wanted.lower():
             return s
-    # Sprint Shootout / Sprint Qualifying selon les saisons
+    # La qualification sprint a changé de nom : « Sprint Shootout » en 2023,
+    # « Sprint Qualifying » ensuite. Sans « shootout » ici, toute la saison
+    # 2023 était introuvable pour ce type de session.
     if session_type == "SQ":
         for s in sessions:
-            if "sprint" in str(s.get("session_name", "")).lower() \
-                    and "qualif" in str(s.get("session_name", "")).lower():
+            nom = str(s.get("session_name", "")).lower()
+            if "sprint" in nom and ("qualif" in nom or "shootout" in nom):
                 return s
     dispo = ", ".join(str(s.get("session_name")) for s in sessions)
     raise OpenF1Error(f"session {session_type} absente (disponibles : {dispo})")
@@ -817,7 +819,15 @@ class Session:
 
     @property
     def session_status(self):
-        return pd.DataFrame()
+        """Début/fin de séance, au format que l'app lit pour afficher la durée
+        de roulage. Reconstruit depuis les horaires de la session (OpenF1
+        n'expose pas le détail des changements d'état)."""
+        t0 = pd.to_datetime(self.session_info.get("date_start"), errors="coerce", utc=True)
+        t1 = pd.to_datetime(self.session_info.get("date_end"), errors="coerce", utc=True)
+        if pd.isna(t0) or pd.isna(t1):
+            return pd.DataFrame()
+        return pd.DataFrame({"Status": ["Started", "Finished"],
+                             "Time": [pd.Timedelta(0), t1 - t0]})
 
     def get_circuit_info(self):
         """Virages via l'API MultiViewer (OpenF1 ne les expose pas)."""
@@ -837,12 +847,39 @@ class Session:
             "Angle": [c.get("angle") for c in corners],
             "X": [c.get("trackPosition", {}).get("x") for c in corners],
             "Y": [c.get("trackPosition", {}).get("y") for c in corners],
-            "Distance": [c.get("distance") for c in corners],
+            "Distance": np.nan,
         })
-        if df["Distance"].isna().all():
-            df["Distance"] = np.nan
-        return CircuitInfo(df.sort_values("Number").reset_index(drop=True),
-                           float(data.get("rotation") or 0))
+        ci = CircuitInfo(df.sort_values("Number").reset_index(drop=True),
+                         float(data.get("rotation") or 0))
+        self._add_corner_distance(ci)
+        return ci
+
+    def _add_corner_distance(self, ci):
+        """Calcule la distance de chaque virage depuis la ligne de départ.
+
+        MultiViewer donne la POSITION des virages mais pas leur distance —
+        FastF1 la reconstruit depuis la télémétrie, on fait de même : pour
+        chaque virage, on retient la distance de l'échantillon dont les
+        coordonnées X/Y sont les plus proches (moindre écart quadratique).
+
+        Sans ça la colonne reste vide, et tout ce qui raisonne en distance
+        casse en silence : analyse virage par virage, repères sur l'overlay,
+        profil du plateau. Les cartes (qui utilisent X/Y) ne voyaient rien."""
+        try:
+            lap = self.laps.pick_fastest()
+            if lap is None:
+                return
+            tel = lap.get_telemetry().dropna(subset=["X", "Y", "Distance"])
+        except Exception:
+            return
+        if len(tel) < 20 or ci.corners[["X", "Y"]].isna().all().all():
+            return
+        xy_tel = tel[["X", "Y"]].to_numpy(dtype=float)
+        xy_corner = ci.corners[["X", "Y"]].to_numpy(dtype=float)
+        # Écart quadratique de chaque virage à chaque point du tour
+        ecarts = ((xy_tel[None, :, :] - xy_corner[:, None, :]) ** 2).sum(axis=2)
+        proches = np.nanargmin(ecarts, axis=1)
+        ci.corners["Distance"] = tel["Distance"].to_numpy()[proches]
 
 
 def get_session(year, gp, session_type):
