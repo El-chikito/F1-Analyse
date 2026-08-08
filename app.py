@@ -1174,7 +1174,7 @@ def season_points_before(year, round_number, session_type):
     # Positions d'arrivée course par course + équipe de chaque pilote :
     # récoltées dans CETTE boucle plutôt que dans une seconde passe, pour ne
     # pas doubler le trafic (cf. le rate-limiting déjà rencontré).
-    positions, manches, equipes = {}, {}, {}
+    positions, manches, equipes, noms = {}, {}, {}, {}
     for _, ev_row in sched.iterrows():
         rnd = int(ev_row["RoundNumber"])
         if rnd > round_number:
@@ -1203,6 +1203,9 @@ def season_points_before(year, round_number, session_type):
                     if team:  # cumul constructeurs (somme des deux pilotes)
                         team_pts[team] = team_pts.get(team, 0.0) + pfr.get(code, 0.0)
                         equipes[code] = team
+                    nom = str(r.get("FullName") or "").strip()
+                    if nom:
+                        noms[code] = nom
                     if ses == "R":
                         pos = r.get("Position")
                         if pd.notna(pos) and 1 <= int(pos) <= 22:
@@ -1219,7 +1222,8 @@ def season_points_before(year, round_number, session_type):
                 continue
     # Dictionnaire plutôt qu'un n-uplet qui s'allonge à chaque besoin
     return {"pts": pts, "cb": cb, "team_pts": team_pts, "echecs": echecs,
-            "positions": positions, "manches": manches, "equipes": equipes}
+            "positions": positions, "manches": manches, "equipes": equipes,
+            "noms": noms}
 
 
 def safe_circuit_info(sess):
@@ -1899,6 +1903,27 @@ isolée.*
 
     st.caption("Les tracés sont dessinés à partir des coordonnées officielles du "
                "circuit. Une manche grisée est déjà disputée.")
+
+    # Aucun tracé affiché : on explique pourquoi au lieu de laisser des cartes
+    # muettes. Le format de l'API MultiViewer n'étant pas documenté, ce
+    # diagnostic est le seul moyen de savoir ce qu'elle renvoie réellement.
+    if not any(track_svg(c["cle"], annee) for c in cartes):
+        with st.expander("🩺 Pourquoi les tracés ne s'affichent-ils pas ?"):
+            exemple = next((c for c in cartes if c["cle"] is not None), None)
+            if exemple is None:
+                st.markdown("- Le calendrier ne fournit **aucun identifiant de "
+                            "circuit** : impossible d'interroger le service des tracés.")
+            else:
+                with st.spinner("Test du service des tracés…"):
+                    try:
+                        raison = DATA.track_outline_info(exemple["cle"], annee)
+                    except Exception as exc:
+                        raison = f"{type(exc).__name__} : {exc}"
+                st.markdown(f"Test sur **{exemple['nom']}** "
+                            f"(circuit `{exemple['cle']}`, saison {annee}) :")
+                st.code(str(raison))
+            st.caption("Les cartes restent utilisables sans vignette — seul "
+                       "l'aperçu du tracé manque.")
 
 
 # ============== PAGE : ANALYSE DU STYLE ==============
@@ -4055,56 +4080,68 @@ def page_analyse_session():
 
 # ============== PAGE : CHAMPIONNAT ==============
 def page_championnat():
-    """Classements pilotes et constructeurs, et trajectoire de la saison.
+    """Classements pilotes et constructeurs à date.
 
-    Les totaux sont arrêtés à la session chargée : charger la dernière
-    course donne donc le classement à jour."""
-    if not _ensure_session():
-        return
-    is_race = st.session_state.session_type in ("R", "S")
+    Autonome : aucune session à charger. Les totaux sont arrêtés à la
+    dernière manche disputée de la saison sélectionnée, et la colonne
+    « + Dernier GP » isole l'apport de cette manche — obtenu en comparant
+    les cumuls avant et après elle."""
     try:
-        results = session.results
-        if results is None or results.empty:
-            results = None
-    except Exception:
-        results = None
-    if not is_race:
-        st.info("🏆 Le championnat se met à jour à l'issue d'une **course** ou d'un "
-                "**sprint**. Charge une session R ou S pour voir l'impact sur les "
-                "classements.")
+        with st.spinner(f"Chargement du calendrier {year}…"):
+            sched = load_schedule(year)
+    except Exception as exc:
+        st.error(f"❌ Calendrier {year} indisponible : {exc}")
         return
 
-    st.markdown("---")
-    st.markdown("#### 🏆 Championnat pilotes — impact de la session")
-    with st.spinner("Calcul des points de la saison (long au premier chargement, ensuite en cache)…"):
-        hist = season_points_before(
-            st.session_state.year, int(ev["RoundNumber"]), st.session_state.session_type
-        )
-    pts_before, cb_before = hist["pts"], hist["cb"]
-    team_before, pts_echecs = hist["team_pts"], hist["echecs"]
+    passees = sched[pd.to_datetime(sched["EventDate"]) < pd.Timestamp.now()]
+    if passees.empty:
+        st.info(f"Aucune manche disputée en {year} pour le moment.")
+        return
+    dernier_rnd = int(passees.iloc[-1]["RoundNumber"])
+    dernier_nom = str(passees.iloc[-1]["EventName"])
+
+    st.markdown(f"## 🏆 Championnat {year}")
+    st.caption(f"Classements arrêtés après la manche {dernier_rnd} — {dernier_nom}.")
+
+    with st.spinner("Calcul des points de la saison (long au premier chargement, "
+                    "ensuite en cache)…"):
+        # `season_points_before(N)` = cumul AVANT la manche N. Deux appels
+        # encadrent donc la dernière course et isolent son apport.
+        avant = season_points_before(year, dernier_rnd, "R")
+        hist = season_points_before(year, dernier_rnd + 1, "R")
+
+    pts_before, cb_before = avant["pts"], avant["cb"]
+    team_before, pts_echecs = avant["team_pts"], avant["echecs"]
+    equipes_all = {**avant.get("equipes", {}), **hist.get("equipes", {})}
+    noms_all = {**avant.get("noms", {}), **hist.get("noms", {})}
+
     if pts_echecs:
         st.caption(f"⚠️ Manches non comptabilisées ({len(pts_echecs)}) : "
                    + ", ".join(pts_echecs[:8])
                    + (" …" if len(pts_echecs) > 8 else "")
                    + " — le total peut être incomplet.")
-    pts_session = {}
-    if results is not None:
-        pts_session = points_from_results(results, st.session_state.session_type)
+
+    # Apport de la dernière course = écart entre les deux cumuls
+    pts_session = {d: hist["pts"].get(d, 0.0) - pts_before.get(d, 0.0)
+                   for d in hist["pts"]}
+    pts_session = {d: v for d, v in pts_session.items() if v}
+
+    def _full_name(drv):
+        return noms_all.get(drv, drv)
+
+    def driver_color(drv):  # sans session : on passe par l'équipe du pilote
+        return team_color(equipes_all.get(drv, "—"))
+
     all_drv = set(pts_before) | set(pts_session)
     if not all_drv:
-        st.info("Points indisponibles pour cette session.")
+        st.info("Points indisponibles pour cette saison.")
         return
     after = {d: pts_before.get(d, 0.0) + pts_session.get(d, 0.0) for d in all_drv}
 
     # Countback après : les positions de CETTE course s'ajoutent au décompte
     # (les sprints ne comptent pas dans le départage réglementaire)
-    cb_after = {d: list(cb_before.get(d, [0] * 22)) for d in all_drv}
-    if st.session_state.session_type == "R" and results is not None:
-        for _, r in results.iterrows():
-            code = str(r["Abbreviation"])
-            pos = r.get("Position")
-            if code in cb_after and pd.notna(pos) and 1 <= int(pos) <= 22:
-                cb_after[code][int(pos) - 1] += 1
+    # Countback réglementaire : celui de hist inclut déjà la dernière course
+    cb_after = {d: list(hist["cb"].get(d, [0] * 22)) for d in all_drv}
 
     def _ranks(pts, cb):
         def key(k):
@@ -4115,12 +4152,6 @@ def page_championnat():
                   {d: cb_before.get(d, [0] * 22) for d in all_drv})
     rk_a = _ranks(after, cb_after)
 
-    def _full_name(drv):
-        try:
-            return session.get_driver(drv)["FullName"]
-        except Exception:
-            return drv
-
     rows_c = []
     for d in sorted(all_drv, key=lambda k: rk_a[k]):
         delta = rk_b[d] - rk_a[d]
@@ -4129,12 +4160,12 @@ def page_championnat():
             "Pilote": _full_name(d),
             "_code": d,
             "Points": f"{after[d]:g}",
-            "+ Session": f"+{pts_session.get(d, 0):g}" if pts_session.get(d, 0) else "–",
+            "+ Dernier GP": f"+{pts_session.get(d, 0):g}" if pts_session.get(d, 0) else "–",
             "Δ Pos": (f"+{delta}" if delta > 0 else f"−{abs(delta)}") if delta else "–",
             "_delta": delta,
         })
     dcp = pd.DataFrame(rows_c)
-    disp_c = dcp[["Pos", "Pilote", "Points", "+ Session", "Δ Pos"]]
+    disp_c = dcp[["Pos", "Pilote", "Points", "+ Dernier GP", "Δ Pos"]]
     styles_c = pd.DataFrame("", index=disp_c.index, columns=disp_c.columns)
     for i in disp_c.index:
         colr = driver_color(dcp["_code"].iloc[i])
@@ -4150,8 +4181,8 @@ def page_championnat():
                force_html=True, mono=True)
     st.caption(
         "Points cumulés courses + sprints, recalculés depuis les feuilles de résultats "
-        "FastF1 · **+ Session** = points marqués dans cette session · **Δ Pos** = places "
-        "gagnées/perdues au général grâce à cette session. Les égalités de points sont "
+        "FastF1 · **+ Dernier GP** = points marqués lors de la dernière course · **Δ Pos** = places "
+        "gagnées/perdues au général grâce à la dernière course. Les égalités de points sont "
         "départagées comme au règlement : décompte des meilleures positions d'arrivée "
         "en course (les sprints ne comptent pas dans le départage)."
     )
@@ -4159,16 +4190,14 @@ def page_championnat():
     # --- Championnat constructeurs : impact de la session ---
     st.markdown("---")
     st.markdown("#### 🏭 Championnat constructeurs — impact de la session")
-    team_session = {}
-    if results is not None:
-        for _, r in results.iterrows():
-            team = str(r.get("TeamName", "") or "")
-            if team:
-                team_session[team] = (team_session.get(team, 0.0)
-                                      + pts_session.get(str(r["Abbreviation"]), 0.0))
+    # Apport constructeurs de la dernière course : même principe que pour les
+    # pilotes, l'écart entre les deux cumuls encadrant la manche.
+    team_session = {t: hist["team_pts"].get(t, 0.0) - team_before.get(t, 0.0)
+                    for t in hist["team_pts"]}
+    team_session = {t: v for t, v in team_session.items() if v}
     all_teams = set(team_before) | set(team_session)
     if not all_teams:
-        st.info("Points constructeurs indisponibles pour cette session.")
+        st.info("Points constructeurs indisponibles pour cette saison.")
         return
     t_after = {t: team_before.get(t, 0.0) + team_session.get(t, 0.0) for t in all_teams}
     trk_b = {t: i + 1 for i, t in enumerate(
@@ -4181,12 +4210,12 @@ def page_championnat():
         rows_t.append({
             "Pos": trk_a[t], "Équipe": t,
             "Points": f"{t_after[t]:g}",
-            "+ Session": f"+{team_session.get(t, 0):g}" if team_session.get(t, 0) else "–",
+            "+ Dernier GP": f"+{team_session.get(t, 0):g}" if team_session.get(t, 0) else "–",
             "Δ Pos": (f"+{dlt}" if dlt > 0 else f"−{abs(dlt)}") if dlt else "–",
             "_delta": dlt,
         })
     dct = pd.DataFrame(rows_t)
-    disp_t = dct[["Pos", "Équipe", "Points", "+ Session", "Δ Pos"]]
+    disp_t = dct[["Pos", "Équipe", "Points", "+ Dernier GP", "Δ Pos"]]
     styles_t = pd.DataFrame("", index=disp_t.index, columns=disp_t.columns)
     for i in disp_t.index:
         colr = team_color(dct["Équipe"].iloc[i])
@@ -4210,24 +4239,10 @@ def page_championnat():
     st.markdown("---")
     st.markdown("#### 📉 Position finale par course")
 
+    # `hist` va jusqu'à la dernière manche incluse : rien à compléter.
     pos_hist = dict(hist["positions"])
     manches = dict(hist["manches"])
-    equipes = dict(hist["equipes"])
-    # La session en cours n'est pas dans l'historique (qui s'arrête AVANT elle)
-    if st.session_state.session_type == "R" and results is not None:
-        courante = {}
-        for _, r in results.iterrows():
-            p = r.get("Position")
-            if pd.notna(p) and 1 <= int(p) <= 22:
-                code = str(r["Abbreviation"])
-                courante[code] = int(p)
-                equipes.setdefault(code, str(r.get("TeamName", "") or "—"))
-        if courante:
-            rnd_courant = int(ev["RoundNumber"])
-            pos_hist[rnd_courant] = courante
-            lieu_courant = str(ev.get("Location") or "").strip()
-            manches[rnd_courant] = lieu_courant or str(ev["EventName"])
-
+    equipes = dict(equipes_all)
     if not pos_hist:
         st.info("Aucune course terminée dans cette saison pour le moment.")
     else:

@@ -917,7 +917,50 @@ def track_outline(circuit_key, year):
         data = r.json()
     except Exception:
         return None
-    xs, ys = data.get("x"), data.get("y")
-    if not xs or not ys or len(xs) != len(ys) or len(xs) < 10:
+    return _outline_from(data)
+
+
+def _outline_from(data):
+    """Extrait le tracé de la réponse MultiViewer.
+
+    Le nom des champs n'est pas documenté : on essaie les graphies plausibles
+    plutôt que d'en supposer une seule."""
+    if not isinstance(data, dict):
         return None
-    return [float(v) for v in xs], [float(v) for v in ys]
+    for cx, cy in (("x", "y"), ("X", "Y"), ("trackX", "trackY")):
+        xs, ys = data.get(cx), data.get(cy)
+        if isinstance(xs, list) and isinstance(ys, list) \
+                and len(xs) == len(ys) >= 10:
+            try:
+                return [float(v) for v in xs], [float(v) for v in ys]
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def track_outline_info(circuit_key, year):
+    """Diagnostic : pourquoi un tracé n'est-il pas disponible ?
+
+    Renvoie une description lisible plutôt qu'un simple None, pour éviter de
+    supposer la cause (identifiant manquant, appel refusé, format inattendu)."""
+    if circuit_key is None or (isinstance(circuit_key, float) and np.isnan(circuit_key)):
+        return "identifiant de circuit absent du calendrier"
+    url = f"{MV_URL}/circuits/{int(circuit_key)}/{int(year)}"
+    try:
+        r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": "analyse-f1"})
+    except Exception as exc:
+        return f"appel impossible : {type(exc).__name__}"
+    if r.status_code != 200:
+        return f"HTTP {r.status_code} sur {url}"
+    try:
+        data = r.json()
+    except Exception:
+        return "réponse illisible (JSON invalide)"
+    if not isinstance(data, dict):
+        return f"réponse de type {type(data).__name__}, dictionnaire attendu"
+    if _outline_from(data) is not None:
+        return "tracé disponible"
+    apercu = []
+    for k, v in list(data.items())[:25]:
+        apercu.append(f"{k}[{len(v)}]" if isinstance(v, list) else k)
+    return "aucun champ de coordonnées reconnu — champs reçus : " + ", ".join(apercu)
