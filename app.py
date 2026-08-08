@@ -14,6 +14,14 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FORMAT des temps au tour en notation course « 1:22.433 » partout où un
+  chrono est affiché, au lieu des « 83.433s » d'avant : helper `fmt_lap_s()`
+  (repris par `_fmt_lap`) pour les métriques, tableaux et infobulles, et
+  `lap_axis()` pour les graduations d'axe (Plotly ne sait pas formater des
+  durées — on lui fournit positions + étiquettes, avec une précision adaptée
+  au pas : « 1:23 » sur un axe au pas de 2 s, « 1:23.4 » au pas de 0,25 s).
+  Les ÉCARTS et dispersions restent en secondes : « +1.433s » se lit mieux
+  que « 0:01.433 ».
 - REFONTE de la navigation en trois sections (bulles horizontales via
   st.navigation(position="top")) :
   · 🏠 Accueil — présentation du site et calendrier de la saison : drapeau,
@@ -802,12 +810,45 @@ def show_table(styler, height=None, force_html=False, mono=False):
     )
 
 
-def _fmt_lap(td):
-    """Temps au tour 'm:ss.mmm', ou — si manquant."""
-    if pd.isna(td):
+def fmt_lap_s(secondes, decimales=3):
+    """Temps au tour au format course '1:22.433', depuis un nombre de secondes.
+
+    `decimales` sert aux graduations d'axe, où le millième est illisible.
+    Les écarts et dispersions restent en secondes : « +1.433s » se lit mieux
+    que « 0:01.433 »."""
+    if secondes is None or pd.isna(secondes):
         return "—"
-    s = td.total_seconds()
-    return f"{int(s // 60)}:{s % 60:06.3f}"
+    s = float(secondes)
+    largeur = 2 + (decimales + 1 if decimales else 0)
+    return f"{int(s // 60)}:{s % 60:0{largeur}.{decimales}f}"
+
+
+def _fmt_lap(td):
+    """Temps au tour 'm:ss.mmm' depuis un Timedelta, ou — si manquant."""
+    return "—" if pd.isna(td) else fmt_lap_s(td.total_seconds())
+
+
+def lap_axis(valeurs, pas=None):
+    """Graduations d'axe en 'm:ss.mmm' pour des temps au tour en secondes.
+
+    Plotly ne sait pas formater des durées : on lui fournit donc les positions
+    et leurs étiquettes. Le pas est choisi pour tenir ~8 graduations, arrondi à
+    une valeur lisible (0.5 s, 1 s, 2 s, 5 s…)."""
+    v = pd.Series(list(valeurs), dtype="float64").dropna()
+    if v.empty:
+        return {}
+    lo, hi = float(v.min()), float(v.max())
+    if pas is None:
+        etendue = max(hi - lo, 0.5)
+        for candidat in (0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60):
+            pas = candidat
+            if etendue / candidat <= 8:
+                break
+    debut = np.floor(lo / pas) * pas
+    ticks = [debut + i * pas for i in range(int((hi - debut) / pas) + 2)]
+    dec = 0 if pas >= 1 else (1 if pas >= 0.1 else 3)
+    return dict(tickmode="array", tickvals=ticks,
+                ticktext=[fmt_lap_s(t, dec) for t in ticks])
 
 
 def _fmt_sec(td):
@@ -1992,7 +2033,7 @@ def page_style():
             is_fastest_marker = " ⚡" if n == fastest_num else ""
             acc = row.get("IsAccurate")
             warn = " ⚠" if (pd.notna(acc) and not bool(acc)) else ""
-            time_str = f"{int(lt // 60)}:{lt % 60:06.3f}"
+            time_str = fmt_lap_s(lt)
             options.append(n)
             descriptions[n] = f"L{n:>2} — {time_str} ({compound}){is_fastest_marker}{warn}"
         return options, descriptions, fastest_num
@@ -2054,7 +2095,7 @@ def page_style():
                 "Pilote": name,
                 "Équipe": team,
                 "_lap_seconds": lap_s,
-                "Meilleur tour": f"{int(lap_s // 60)}:{lap_s % 60:06.3f}",
+                "Meilleur tour": fmt_lap_s(lap_s),
                 "Pneu": fast.get("Compound", "—"),
             })
         if not rows:
@@ -2152,9 +2193,9 @@ def page_style():
     t2 = lap2["LapTime"].total_seconds()
     lap_label1 = f"L{lap_n1} {'⚡' if lap_n1 == fast1 else ''}"
     lap_label2 = f"L{lap_n2} {'⚡' if lap_n2 == fast2 else ''}"
-    col1.metric(f"{d1} — {lap_label1}", f"{t1:.3f}s",
+    col1.metric(f"{d1} — {lap_label1}", fmt_lap_s(t1),
                 help=f"Tour {lap_n1} de {d1}" + (" (le plus rapide)" if lap_n1 == fast1 else ""))
-    col2.metric(f"{d2} — {lap_label2}", f"{t2:.3f}s",
+    col2.metric(f"{d2} — {lap_label2}", fmt_lap_s(t2),
                 help=f"Tour {lap_n2} de {d2}" + (" (le plus rapide)" if lap_n2 == fast2 else ""))
     col3.metric("Écart", f"{abs(t1-t2):.3f}s",
                 delta=f"{d1 if t1 < t2 else d2} plus rapide", delta_color="off")
@@ -3175,10 +3216,11 @@ def page_style():
                             line=dict(color=line_color, width=2),
                         ),
                         name=f"{drv} - Stint {int(stint_num)} ({compound})",
+                        customdata=[fmt_lap_s(t) for t in stint_laps["LapTimeSeconds"]],
                         hovertemplate=(
                             f"<b>{drv}</b><br>"
                             "Tour %{x}<br>"
-                            "Temps: %{y:.3f}s<br>"
+                            "Temps: %{customdata}<br>"
                             f"Compound: {compound}<extra></extra>"
                         ),
                     ))
@@ -3241,7 +3283,9 @@ def page_style():
             fig_stint.update_layout(
                 height=500, template="plotly_dark",
                 xaxis_title="Numéro de tour",
-                yaxis_title="Temps au tour (s)",
+                yaxis=dict(title="Temps au tour",
+                           **lap_axis(pd.concat([laps_d1_s["LapTimeSeconds"],
+                                                 laps_d2_s["LapTimeSeconds"]]))),
                 yaxis2=dict(title="Temp. piste (°C)", overlaying="y", side="right",
                             showgrid=False, tickfont=dict(color="rgba(255,255,255,0.5)")),
                 hovermode="closest",
@@ -3288,8 +3332,8 @@ def page_style():
                         "Stint": int(stint_num),
                         "Compound": compound,
                         "Tours": len(stint_laps),
-                        "Best": f"{lt.min():.3f}s",
-                        "Moyenne": f"{lt.mean():.3f}s",
+                        "Best": fmt_lap_s(lt.min()),
+                        "Moyenne": fmt_lap_s(lt.mean()),
                         "Écart-type": f"{lt.std():.3f}s" if len(lt) > 1 else "—",
                         "Dégradation": degrad,
                     })
