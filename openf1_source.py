@@ -186,16 +186,25 @@ def _build_schedule(year, include_testing):
     # inattendu décalerait toute la numérotation des manches, et donc le
     # championnat (bug constaté).
     race_meetings, sprint_meetings = set(), set()
+    bornes = {}  # meeting_key -> [début, fin] du week-end
     try:
         for s in _sessions_of_year(year):
             mk = s.get("meeting_key")
             if mk is None:
                 continue
+            mk = int(mk)
             nom = str(s.get("session_name", "")).lower()
             if nom == "race":
-                race_meetings.add(int(mk))
+                race_meetings.add(mk)
             if "sprint" in nom:
-                sprint_meetings.add(int(mk))
+                sprint_meetings.add(mk)
+            # Bornes du week-end : première et dernière séance du meeting
+            d = pd.to_datetime(s.get("date_start"), format="ISO8601",
+                               utc=True, errors="coerce")
+            if pd.notna(d):
+                d = d.tz_localize(None)
+                lo, hi = bornes.get(mk, (d, d))
+                bornes[mk] = (min(lo, d), max(hi, d))
     except OpenF1Error:
         pass
 
@@ -214,6 +223,11 @@ def _build_schedule(year, include_testing):
         "Location": df.get("location", pd.Series([""] * len(df))).astype(str),
         "EventDate": df["date_start"],
         "_meeting_key": df["meeting_key"],
+        # Pour la page d'accueil : identifiant de circuit (tracé) et bornes
+        # réelles du week-end, calculées depuis les séances du meeting.
+        "CircuitKey": df.get("circuit_key", pd.Series([None] * len(df))),
+        "DateStart": [bornes.get(int(k), (pd.NaT, pd.NaT))[0] for k in df["meeting_key"]],
+        "DateEnd": [bornes.get(int(k), (pd.NaT, pd.NaT))[1] for k in df["meeting_key"]],
     })
     # EventFormat : FastF1 le fournit, pas OpenF1. Sans lui, l'app ne détecte
     # aucun week-end sprint et oublie tous ces points au championnat.
@@ -885,3 +899,25 @@ class Session:
 def get_session(year, gp, session_type):
     """Point d'entrée équivalent à `fastf1.get_session()`."""
     return Session(year, gp, session_type)
+
+
+def track_outline(circuit_key, year):
+    """Coordonnées du tracé d'un circuit, via l'API MultiViewer.
+
+    Renvoie (xs, ys) ou None. Sert à dessiner les vignettes de la page
+    d'accueil sans dépendre d'images sous droits. La réponse contient aussi
+    les virages, déjà exploités par `get_circuit_info`."""
+    if circuit_key is None or (isinstance(circuit_key, float) and np.isnan(circuit_key)):
+        return None
+    try:
+        r = requests.get(f"{MV_URL}/circuits/{int(circuit_key)}/{int(year)}",
+                         timeout=TIMEOUT, headers={"User-Agent": "analyse-f1"})
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    xs, ys = data.get("x"), data.get("y")
+    if not xs or not ys or len(xs) != len(ys) or len(xs) < 10:
+        return None
+    return [float(v) for v in xs], [float(v) for v in ys]

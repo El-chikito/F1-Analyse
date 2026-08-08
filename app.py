@@ -14,6 +14,20 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- REFONTE de la navigation en trois sections (bulles horizontales via
+  st.navigation(position="top")) :
+  · 🏠 Accueil — présentation du site et calendrier de la saison : drapeau,
+    circuit, dates du week-end et vignette du tracé (SVG généré depuis les
+    coordonnées MultiViewer, donc rien à héberger), manche à venir mise en
+    avant, manches disputées grisées ;
+  · 🏆 Championnat — classements pilotes et constructeurs, positions course
+    par course, duels entre coéquipiers ;
+  · 📊 Analyse — vue session et comparaison de pilotes, avec la sélection
+    dans la barre latérale.
+  Le chargement de session devient PARESSEUX (`_ensure_session`) : l'accueil
+  s'affiche sans qu'aucune session ne soit chargée, alors que l'ancien écran
+  de bienvenue bloquait toute l'app. Le calendrier n'est plus chargé au
+  niveau module — un échec réseau y interrompait l'application entière.
 - DATA session.load(weather=True, messages=True) — nouvelles données exploitées :
        · bandeau météo (air, piste, vent, pluie) + durée de roulage dans
          l'en-tête de session ;
@@ -1361,6 +1375,80 @@ def _render_radio_clips(df_clips, max_clips=50):
                    f"pour les voir.")
 
 
+# ============== PAGE D'ACCUEIL : CALENDRIER ==============
+# Drapeau par pays du calendrier. On mappe le NOM du pays (fourni par les deux
+# sources) plutôt qu'un code ISO : OpenF1 renvoie des codes à 3 lettres que les
+# émojis n'utilisent pas, et la liste des pays du championnat est courte.
+COUNTRY_FLAGS = {
+    "Australia": "🇦🇺", "China": "🇨🇳", "Japan": "🇯🇵", "Bahrain": "🇧🇭",
+    "Saudi Arabia": "🇸🇦", "United States": "🇺🇸", "USA": "🇺🇸", "Italy": "🇮🇹",
+    "Monaco": "🇲🇨", "Spain": "🇪🇸", "Canada": "🇨🇦", "Austria": "🇦🇹",
+    "United Kingdom": "🇬🇧", "Great Britain": "🇬🇧", "UK": "🇬🇧",
+    "Hungary": "🇭🇺", "Belgium": "🇧🇪", "Netherlands": "🇳🇱", "Azerbaijan": "🇦🇿",
+    "Singapore": "🇸🇬", "Mexico": "🇲🇽", "Brazil": "🇧🇷", "Qatar": "🇶🇦",
+    "United Arab Emirates": "🇦🇪", "UAE": "🇦🇪", "France": "🇫🇷",
+    "Germany": "🇩🇪", "Portugal": "🇵🇹", "Russia": "🇷🇺", "Turkey": "🇹🇷",
+    "Vietnam": "🇻🇳", "Korea": "🇰🇷", "Malaysia": "🇲🇾", "India": "🇮🇳",
+}
+
+MOIS_FR = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+           "août", "septembre", "octobre", "novembre", "décembre")
+
+
+def flag_for(country):
+    return COUNTRY_FLAGS.get(str(country).strip(), "🏁")
+
+
+def format_weekend(debut, fin):
+    """Dates d'un week-end en français : « 21-23 août », ou « 30 août - 1 sept. »
+    quand il chevauche deux mois."""
+    if pd.isna(debut):
+        return ""
+    if pd.isna(fin) or fin < debut:
+        fin = debut
+    if debut.month == fin.month:
+        jours = f"{debut.day}-{fin.day}" if fin.day != debut.day else f"{debut.day}"
+        return f"{jours} {MOIS_FR[debut.month - 1]}"
+    # Week-end à cheval sur deux mois : mois entiers, plusieurs d'entre eux
+    # (mai, juin, août) ne s'abrègent pas correctement.
+    return (f"{debut.day} {MOIS_FR[debut.month - 1]} - "
+            f"{fin.day} {MOIS_FR[fin.month - 1]}")
+
+
+@st.cache_data(show_spinner=False, ttl=7 * 24 * 3600)
+def track_svg(circuit_key, year, largeur=220, hauteur=120):
+    """Vignette SVG du tracé d'un circuit.
+
+    SVG plutôt qu'image : rien à héberger, aucun problème de droits, net à
+    toute taille et léger — 24 vignettes sur une page, des graphiques Plotly
+    seraient beaucoup trop lourds sur téléphone. Renvoie None si le tracé
+    n'est pas disponible (la carte s'affiche alors sans vignette)."""
+    if not USE_OPENF1:
+        return None  # le tracé vient de MultiViewer, via l'adaptateur OpenF1
+    try:
+        trace = DATA.track_outline(circuit_key, year)
+    except Exception:
+        trace = None
+    if not trace:
+        return None
+    xs, ys = trace
+    # Sous-échantillonnage : un tracé complet fait des milliers de points,
+    # inutile pour une vignette de 220 px.
+    pas = max(1, len(xs) // 400)
+    xs, ys = xs[::pas], ys[::pas]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    ech = min((largeur - 16) / max(x1 - x0, 1e-9), (hauteur - 16) / max(y1 - y0, 1e-9))
+    # Y inversé : les coordonnées F1 montent, l'axe SVG descend
+    dx = (largeur - (x1 - x0) * ech) / 2
+    dy = (hauteur - (y1 - y0) * ech) / 2
+    pts = " ".join(f"{(x - x0) * ech + dx:.1f},{hauteur - ((y - y0) * ech + dy):.1f}"
+                   for x, y in zip(xs, ys))
+    return (f'<svg viewBox="0 0 {largeur} {hauteur}" width="100%" '
+            f'preserveAspectRatio="xMidYMid meet" role="img">'
+            f'<polyline points="{pts}" fill="none" stroke="#E10600" '
+            f'stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/></svg>')
+
+
 # ============== HEADER ==============
 st.markdown("""
 # 🏎️ Analyse F1
@@ -1439,280 +1527,378 @@ year = st.sidebar.selectbox(
     help="FastF1 supporte 2018 → présent. Les données 2026 récentes peuvent être partielles.",
 )
 
-try:
-    with st.spinner(f"Chargement du calendrier {year}…"):
-        schedule = load_schedule(year)
-except Exception as e:
-    st.error(f"❌ Impossible de charger le calendrier {year} — source "
-             f"**{'OpenF1' if USE_OPENF1 else 'FastF1'}** injoignable : {e}")
-    st.stop()
+# ============== CHARGEMENT PARESSEUX DE LA SESSION ==============
+# Résultat de la préparation, mémorisé pour la durée d'un affichage. Streamlit
+# ré-exécute tout le script à chaque interaction, donc cette variable repart à
+# None : la mémorisation ne fige rien d'un rerun à l'autre. Sans elle, une page
+# qui délègue à une sous-vue préparerait la session deux fois et Streamlit
+# refuserait les widgets de barre latérale en double.
+_SESSION_PRETE = None
 
-gp_options = gp_options_from(schedule)
-gp_label = st.sidebar.selectbox(
-    "Grand Prix",
-    options=list(gp_options.keys()),
-    index=default_gp_index(schedule),  # dernière manche disputée
-)
-gp_name = gp_options[gp_label]
 
-session_type = st.sidebar.selectbox(
-    "Session",
-    options=SESSION_TYPES,
-    index=0,
-    format_func=lambda x: SESSION_LABELS.get(x, x),
-)
+def _ensure_session():
+    """Prépare la session une seule fois par affichage."""
+    global _SESSION_PRETE
+    if _SESSION_PRETE is None:
+        _SESSION_PRETE = _prepare_session()
+    return _SESSION_PRETE
 
-# Bouton pour déclencher le chargement.
-# On n'écrit dans le session_state QUE lors d'un clic : sinon, une fois
-# session_loaded posé, chaque interaction recopiait les widgets dans le state
-# et changer de GP rechargeait tout sans clic.
-load_btn = st.sidebar.button("🚀 Charger la session", type="primary", width="stretch")
 
-if USE_OPENF1:
-    st.sidebar.caption(
-        f"🔀 Données via **OpenF1** — la F1 refuse l'IP de cet hébergeur "
-        f"(HTTP {DATA_HOST['primary']}). Transparent, mais limité aux saisons "
-        f"{OPENF1_FIRST_YEAR}+."
-    )
-elif DATA_HOST["switched"]:
-    st.sidebar.caption(
-        f"🔀 Données via le **miroir FastF1** — le serveur F1 refuse l'IP de "
-        f"l'hébergeur (HTTP {DATA_HOST['primary']}). Rien à faire, c'est transparent."
-    )
+def _prepare_session():
+    """Prépare la session demandée et les données qui en dépendent.
 
-if load_btn:
-    st.session_state.session_loaded = True
-    st.session_state.year = year
-    st.session_state.gp_name = gp_name
-    st.session_state.session_type = session_type
+    Appelée par les pages qui ont besoin de données de piste. L'Accueil
+    s'en passe : elle ne consomme que le calendrier. Renvoie False si rien
+    n'est chargé — la page appelante doit alors s'interrompre.
 
-if not st.session_state.get("session_loaded"):
-    # Écran de bienvenue : les mêmes réglages que la sidebar, au centre de la
-    # page — un premier visiteur (sidebar repliée sur mobile) n'est pas perdu.
-    st.markdown("### 👋 Bienvenue !")
-    st.markdown(
-        "Choisis la **session à analyser** ci-dessous, puis clique sur **Charger la session**. "
-        "Tu retrouveras ces réglages à tout moment dans la barre latérale "
-        "(sur mobile : icône **»** en haut à gauche)."
-    )
-    if MOBILE:
-        c_y = c_gp = c_s = st  # empilé verticalement sur petit écran
-    else:
-        c_y, c_gp, c_s = st.columns([1, 2, 1])
-    home_year = c_y.selectbox(
-        "Saison", options=YEARS, index=YEARS.index(year), key="home_year",
-        help="FastF1 supporte 2018 → présent.",
-    )
-    with st.spinner(f"Chargement du calendrier {home_year}…"):
-        sched_h = load_schedule(home_year)
-    gp_options_h = gp_options_from(sched_h)
-    labels_h = list(gp_options_h.keys())
-    home_gp_label = c_gp.selectbox(
-        "Grand Prix", options=labels_h, key="home_gp",
-        index=labels_h.index(gp_label) if gp_label in labels_h else default_gp_index(sched_h),
-    )
-    home_session = c_s.selectbox(
-        "Session", options=SESSION_TYPES, index=SESSION_TYPES.index(session_type),
-        format_func=lambda x: SESSION_LABELS.get(x, x), key="home_session",
-    )
-    if st.button("🚀 Charger la session", type="primary", key="home_load"):
-        st.session_state.session_loaded = True
-        st.session_state.year = home_year
-        st.session_state.gp_name = gp_options_h[home_gp_label]
-        st.session_state.session_type = home_session
-        st.rerun()  # repart proprement, sans laisser le formulaire d'accueil affiché
-    st.stop()
+    Les objets produits sont volontairement globaux : les ~2500 lignes
+    d'analyse les référencent directement, les passer en paramètres
+    reviendrait à réécrire toute la couche de présentation."""
+    global session, circuit_info, corners_df, TRACK_ROTATION
+    global drivers_in_session, driver_full, ev
+    global _rotate_xy, _add_corner_labels, _nearest_corner
+    global team_color, driver_color
 
-# Hint si les widgets de la sidebar diffèrent de la session actuellement chargée
-if (year, gp_name, session_type) != (
-    st.session_state.year, st.session_state.gp_name, st.session_state.session_type
-):
-    st.sidebar.info("⚙️ Paramètres modifiés — clique sur **Charger la session** pour les appliquer.")
-
-# ============== CHARGEMENT DE LA SESSION ==============
-try:
-    with st.spinner(f"Chargement {st.session_state.gp_name} {st.session_state.year} {st.session_state.session_type}…"):
-        session = load_session(
-            st.session_state.year,
-            st.session_state.gp_name,
-            st.session_state.session_type,
-        )
-except Exception as e:
-    st.error(f"❌ Impossible de charger la session : {e}")
-
-    # Cause n°1 des faux « bugs » : la manche n'a pas encore été courue.
+    global schedule
     try:
-        _sched = load_schedule(st.session_state.year)
-        _row = _sched[_sched["EventName"] == st.session_state.gp_name].iloc[0]
-        _date = pd.to_datetime(_row["EventDate"])
-        if _date > pd.Timestamp.now():
-            st.warning(
-                f"📅 **{st.session_state.gp_name} {st.session_state.year}** est programmé "
-                f"le **{_date:%d/%m/%Y}** : la manche n'a pas encore eu lieu, il n'y a donc "
-                f"aucune donnée à charger. Choisis un Grand Prix **déjà disputé** — le "
-                f"sélecteur propose par défaut le plus récent."
+        with st.spinner(f"Chargement du calendrier {year}…"):
+            schedule = load_schedule(year)
+    except Exception as exc:
+        st.error(f"❌ Impossible de charger le calendrier {year} — source "
+                 f"**{'OpenF1' if USE_OPENF1 else 'FastF1'}** injoignable : {exc}")
+        return False
+
+    gp_options = gp_options_from(schedule)
+    gp_label = st.sidebar.selectbox(
+        "Grand Prix",
+        options=list(gp_options.keys()),
+        index=default_gp_index(schedule),  # dernière manche disputée
+    )
+    gp_name = gp_options[gp_label]
+
+    session_type = st.sidebar.selectbox(
+        "Session",
+        options=SESSION_TYPES,
+        index=0,
+        format_func=lambda x: SESSION_LABELS.get(x, x),
+    )
+
+    # Bouton pour déclencher le chargement.
+    # On n'écrit dans le session_state QUE lors d'un clic : sinon, une fois
+    # session_loaded posé, chaque interaction recopiait les widgets dans le state
+    # et changer de GP rechargeait tout sans clic.
+    load_btn = st.sidebar.button("🚀 Charger la session", type="primary", width="stretch")
+
+    if USE_OPENF1:
+        st.sidebar.caption(
+            f"🔀 Données via **OpenF1** — la F1 refuse l'IP de cet hébergeur "
+            f"(HTTP {DATA_HOST['primary']}). Transparent, mais limité aux saisons "
+            f"{OPENF1_FIRST_YEAR}+."
+        )
+    elif DATA_HOST["switched"]:
+        st.sidebar.caption(
+            f"🔀 Données via le **miroir FastF1** — le serveur F1 refuse l'IP de "
+            f"l'hébergeur (HTTP {DATA_HOST['primary']}). Rien à faire, c'est transparent."
+        )
+
+    if load_btn:
+        st.session_state.session_loaded = True
+        st.session_state.year = year
+        st.session_state.gp_name = gp_name
+        st.session_state.session_type = session_type
+
+    if not st.session_state.get("session_loaded"):
+        # Pas encore de session : on invite à en choisir une dans la barre
+        # latérale plutôt que de dupliquer les sélecteurs ici (la page
+        # Accueil joue désormais ce rôle d'entrée).
+        st.info("👈 Choisis une **saison**, un **Grand Prix** et une **session** dans la "
+                "barre latérale, puis clique sur **Charger la session**. "
+                "Sur téléphone, la barre s'ouvre par l'icône **»** en haut à gauche.")
+        return False
+
+    # Hint si les widgets de la sidebar diffèrent de la session actuellement chargée
+    if (year, gp_name, session_type) != (
+        st.session_state.year, st.session_state.gp_name, st.session_state.session_type
+    ):
+        st.sidebar.info("⚙️ Paramètres modifiés — clique sur **Charger la session** pour les appliquer.")
+
+    # ============== CHARGEMENT DE LA SESSION ==============
+    try:
+        with st.spinner(f"Chargement {st.session_state.gp_name} {st.session_state.year} {st.session_state.session_type}…"):
+            session = load_session(
+                st.session_state.year,
+                st.session_state.gp_name,
+                st.session_state.session_type,
+            )
+    except Exception as e:
+        st.error(f"❌ Impossible de charger la session : {e}")
+
+        # Cause n°1 des faux « bugs » : la manche n'a pas encore été courue.
+        try:
+            _sched = load_schedule(st.session_state.year)
+            _row = _sched[_sched["EventName"] == st.session_state.gp_name].iloc[0]
+            _date = pd.to_datetime(_row["EventDate"])
+            if _date > pd.Timestamp.now():
+                st.warning(
+                    f"📅 **{st.session_state.gp_name} {st.session_state.year}** est programmé "
+                    f"le **{_date:%d/%m/%Y}** : la manche n'a pas encore eu lieu, il n'y a donc "
+                    f"aucune donnée à charger. Choisis un Grand Prix **déjà disputé** — le "
+                    f"sélecteur propose par défaut le plus récent."
+                )
+        except Exception:
+            pass
+
+        col_r1, col_r2 = st.columns(2)
+        if col_r1.button("🔄 Réessayer", width="stretch"):
+            st.rerun()
+        if col_r2.button("🧹 Vider le cache et réessayer", width="stretch",
+                         help="Un cache corrompu (redémarrage du serveur en pleine écriture) "
+                              "peut bloquer tous les chargements."):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            try:
+                fastf1.Cache.clear_cache("cache_f1", deep=True)
+            except Exception:
+                pass
+            st.rerun()
+
+        with st.expander("🩺 Diagnostic — pourquoi ça échoue", expanded=True):
+            details = getattr(e, "details", [])
+            if details:
+                st.markdown("**Ce que FastF1 a signalé pendant le chargement :**")
+                st.code("\n".join(details[:15]))
+            st.markdown("**Joignabilité des serveurs depuis l'hébergeur :**")
+            with st.spinner("Test des serveurs…"):
+                for line in _network_diagnostic():
+                    st.markdown(line)
+
+            st.markdown("**Réponse réelle sur le flux de CETTE session :**")
+            with st.spinner("Test du flux de données…"):
+                _probe = _deep_probe(st.session_state.year, st.session_state.gp_name,
+                                     st.session_state.session_type)
+            for line in _probe["lines"]:
+                st.markdown(line)
+            st.markdown("**Le blocage vise-t-il l'IP ou la signature de FastF1 ?**")
+            with st.spinner("Test des identités…"):
+                _ua_lines = _probe_user_agents()
+            for line in _ua_lines:
+                st.markdown(line)
+
+            st.markdown("**Verdict :**")
+            st.info(_probe_verdict(_probe["primary"], _probe["mirror"],
+                                   ua_any_ok=any("✅" in l for l in _ua_lines)))
+            st.caption(
+                f"FastF1 {fastf1.__version__} · Streamlit {st.__version__} · "
+                f"serveur utilisé : `{fastf1._api.base_url}`. "
+                "La dernière section est la plus parlante : un serveur peut répondre "
+                "HTTP 200 en renvoyant une page d'erreur au lieu du flux de données — "
+                "regarde le type MIME (`application/json` ou `text/plain` attendu, pas "
+                "`text/html`), la taille et le début du contenu."
+            )
+        return False
+
+    # Position des virages — calculée UNE seule fois (le warning éventuel ne sort qu'ici)
+    circuit_info = safe_circuit_info(session)
+    corners_df = None
+    if circuit_info is not None and circuit_info.corners is not None and len(circuit_info.corners):
+        corners_df = circuit_info.corners.sort_values("Distance").reset_index(drop=True)
+
+    # Rotation officielle du tracé (degrés) : oriente les cartes comme à la TV
+    TRACK_ROTATION = float(getattr(circuit_info, "rotation", 0) or 0) if circuit_info is not None else 0.0
+
+
+    def _rotate_xy(x, y):
+        """Applique la rotation officielle du circuit aux coordonnées X/Y
+        (télémétrie et virages partagent le même repère)."""
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if not TRACK_ROTATION:
+            return x, y
+        rad = np.deg2rad(TRACK_ROTATION)
+        return x * np.cos(rad) - y * np.sin(rad), x * np.sin(rad) + y * np.cos(rad)
+
+
+    def _add_corner_labels(fig, row=None, col=None):
+        """Écrit T1, T2… sur une carte du circuit (si les positions sont dispo)."""
+        if corners_df is None or "X" not in corners_df.columns:
+            return
+        cx, cy = _rotate_xy(corners_df["X"].values, corners_df["Y"].values)
+        fig.add_trace(go.Scatter(
+            x=cx, y=cy, mode="text",
+            text=[f"T{int(r['Number'])}{r['Letter']}" for _, r in corners_df.iterrows()],
+            textfont=dict(size=10, color="rgba(255,255,255,0.65)"),
+            hoverinfo="skip", showlegend=False,
+        ), row=row, col=col)
+
+
+    def _nearest_corner(d):
+        """Étiquette du virage le plus proche d'une distance donnée (si dispo)."""
+        if corners_df is None:
+            return ""
+        i = int((corners_df["Distance"] - d).abs().values.argmin())
+        row = corners_df.iloc[i]
+        return f" · ≈ T{int(row['Number'])}{row['Letter']}"
+
+
+    # Pilotes disponibles
+    drivers_in_session = sorted(session.laps["Driver"].dropna().unique().tolist())
+    if len(drivers_in_session) < 2:
+        st.error("⚠️ Il faut au moins deux pilotes avec des tours dans cette session pour comparer "
+                 "(données partielles ou session pas encore roulée ?).")
+        return False
+
+    # Récupère les noms complets pour l'UX
+    driver_full = {}
+    for d in drivers_in_session:
+        try:
+            info = session.get_driver(d)
+            driver_full[d] = f"{d} — {info['FullName']} ({info['TeamName']})"
+        except Exception:
+            driver_full[d] = d
+
+    # ============== HEADER DE SESSION (commun aux pages) ==============
+    ev = session.event
+    st.markdown(f"### {ev['EventName']} {st.session_state.year} — {st.session_state.session_type}")
+
+    # Durée de roulage effective (session_status : Started → Finished/Ends)
+    _dur = ""
+    try:
+        _ss = session.session_status
+        _t0 = _ss.loc[_ss["Status"] == "Started", "Time"].iloc[0]
+        _t1 = _ss.loc[_ss["Status"].isin(("Finished", "Finalised", "Ends")), "Time"].iloc[-1]
+        _dur = f" · ⏱️ ~{(_t1 - _t0).total_seconds() / 60:.0f} min de roulage"
+    except Exception:
+        pass
+    st.caption(f"📍 {ev['Location']}, {ev['Country']} · {ev['EventDate'].strftime('%d %B %Y')}{_dur}")
+
+    # Bandeau météo (session.weather_data, échantillonné ~1/min sur la session)
+    try:
+        _wx = session.weather_data
+        if _wx is not None and len(_wx):
+            _rain_pct = float(_wx["Rainfall"].mean() * 100) if "Rainfall" in _wx.columns else 0.0
+            _rain_txt = (f"🌧️ pluie ~{_rain_pct:.0f} % de la session" if _rain_pct > 0
+                         else "☀️ pas de pluie")
+            st.caption(
+                f"🌡️ Air {_wx['AirTemp'].mean():.0f} °C · Piste {_wx['TrackTemp'].min():.0f}–"
+                f"{_wx['TrackTemp'].max():.0f} °C · 💨 vent {_wx['WindSpeed'].mean():.1f} m/s · {_rain_txt}"
             )
     except Exception:
         pass
 
-    col_r1, col_r2 = st.columns(2)
-    if col_r1.button("🔄 Réessayer", width="stretch"):
-        st.rerun()
-    if col_r2.button("🧹 Vider le cache et réessayer", width="stretch",
-                     help="Un cache corrompu (redémarrage du serveur en pleine écriture) "
-                          "peut bloquer tous les chargements."):
-        st.cache_data.clear()
-        st.cache_resource.clear()
+
+    def team_color(team):
+        """Couleur d'équipe : notre palette d'abord, sinon le référentiel officiel
+        de fastf1.plotting (couvre toutes les équipes de toutes les saisons)."""
+        if team in TEAM_COLORS:
+            return TEAM_COLORS[team]
         try:
-            fastf1.Cache.clear_cache("cache_f1", deep=True)
+            import fastf1.plotting as f1plt
+            c = f1plt.get_team_color(team, session=session)
+            if c:
+                return c
         except Exception:
             pass
-        st.rerun()
-
-    with st.expander("🩺 Diagnostic — pourquoi ça échoue", expanded=True):
-        details = getattr(e, "details", [])
-        if details:
-            st.markdown("**Ce que FastF1 a signalé pendant le chargement :**")
-            st.code("\n".join(details[:15]))
-        st.markdown("**Joignabilité des serveurs depuis l'hébergeur :**")
-        with st.spinner("Test des serveurs…"):
-            for line in _network_diagnostic():
-                st.markdown(line)
-
-        st.markdown("**Réponse réelle sur le flux de CETTE session :**")
-        with st.spinner("Test du flux de données…"):
-            _probe = _deep_probe(st.session_state.year, st.session_state.gp_name,
-                                 st.session_state.session_type)
-        for line in _probe["lines"]:
-            st.markdown(line)
-        st.markdown("**Le blocage vise-t-il l'IP ou la signature de FastF1 ?**")
-        with st.spinner("Test des identités…"):
-            _ua_lines = _probe_user_agents()
-        for line in _ua_lines:
-            st.markdown(line)
-
-        st.markdown("**Verdict :**")
-        st.info(_probe_verdict(_probe["primary"], _probe["mirror"],
-                               ua_any_ok=any("✅" in l for l in _ua_lines)))
-        st.caption(
-            f"FastF1 {fastf1.__version__} · Streamlit {st.__version__} · "
-            f"serveur utilisé : `{fastf1._api.base_url}`. "
-            "La dernière section est la plus parlante : un serveur peut répondre "
-            "HTTP 200 en renvoyant une page d'erreur au lieu du flux de données — "
-            "regarde le type MIME (`application/json` ou `text/plain` attendu, pas "
-            "`text/html`), la taille et le début du contenu."
-        )
-    st.stop()
-
-# Position des virages — calculée UNE seule fois (le warning éventuel ne sort qu'ici)
-circuit_info = safe_circuit_info(session)
-corners_df = None
-if circuit_info is not None and circuit_info.corners is not None and len(circuit_info.corners):
-    corners_df = circuit_info.corners.sort_values("Distance").reset_index(drop=True)
-
-# Rotation officielle du tracé (degrés) : oriente les cartes comme à la TV
-TRACK_ROTATION = float(getattr(circuit_info, "rotation", 0) or 0) if circuit_info is not None else 0.0
-
-
-def _rotate_xy(x, y):
-    """Applique la rotation officielle du circuit aux coordonnées X/Y
-    (télémétrie et virages partagent le même repère)."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if not TRACK_ROTATION:
-        return x, y
-    rad = np.deg2rad(TRACK_ROTATION)
-    return x * np.cos(rad) - y * np.sin(rad), x * np.sin(rad) + y * np.cos(rad)
-
-
-def _add_corner_labels(fig, row=None, col=None):
-    """Écrit T1, T2… sur une carte du circuit (si les positions sont dispo)."""
-    if corners_df is None or "X" not in corners_df.columns:
-        return
-    cx, cy = _rotate_xy(corners_df["X"].values, corners_df["Y"].values)
-    fig.add_trace(go.Scatter(
-        x=cx, y=cy, mode="text",
-        text=[f"T{int(r['Number'])}{r['Letter']}" for _, r in corners_df.iterrows()],
-        textfont=dict(size=10, color="rgba(255,255,255,0.65)"),
-        hoverinfo="skip", showlegend=False,
-    ), row=row, col=col)
-
-
-def _nearest_corner(d):
-    """Étiquette du virage le plus proche d'une distance donnée (si dispo)."""
-    if corners_df is None:
-        return ""
-    i = int((corners_df["Distance"] - d).abs().values.argmin())
-    row = corners_df.iloc[i]
-    return f" · ≈ T{int(row['Number'])}{row['Letter']}"
-
-
-# Pilotes disponibles
-drivers_in_session = sorted(session.laps["Driver"].dropna().unique().tolist())
-if len(drivers_in_session) < 2:
-    st.error("⚠️ Il faut au moins deux pilotes avec des tours dans cette session pour comparer "
-             "(données partielles ou session pas encore roulée ?).")
-    st.stop()
-
-# Récupère les noms complets pour l'UX
-driver_full = {}
-for d in drivers_in_session:
-    try:
-        info = session.get_driver(d)
-        driver_full[d] = f"{d} — {info['FullName']} ({info['TeamName']})"
-    except Exception:
-        driver_full[d] = d
-
-# ============== HEADER DE SESSION (commun aux pages) ==============
-ev = session.event
-st.markdown(f"### {ev['EventName']} {st.session_state.year} — {st.session_state.session_type}")
-
-# Durée de roulage effective (session_status : Started → Finished/Ends)
-_dur = ""
-try:
-    _ss = session.session_status
-    _t0 = _ss.loc[_ss["Status"] == "Started", "Time"].iloc[0]
-    _t1 = _ss.loc[_ss["Status"].isin(("Finished", "Finalised", "Ends")), "Time"].iloc[-1]
-    _dur = f" · ⏱️ ~{(_t1 - _t0).total_seconds() / 60:.0f} min de roulage"
-except Exception:
-    pass
-st.caption(f"📍 {ev['Location']}, {ev['Country']} · {ev['EventDate'].strftime('%d %B %Y')}{_dur}")
-
-# Bandeau météo (session.weather_data, échantillonné ~1/min sur la session)
-try:
-    _wx = session.weather_data
-    if _wx is not None and len(_wx):
-        _rain_pct = float(_wx["Rainfall"].mean() * 100) if "Rainfall" in _wx.columns else 0.0
-        _rain_txt = (f"🌧️ pluie ~{_rain_pct:.0f} % de la session" if _rain_pct > 0
-                     else "☀️ pas de pluie")
-        st.caption(
-            f"🌡️ Air {_wx['AirTemp'].mean():.0f} °C · Piste {_wx['TrackTemp'].min():.0f}–"
-            f"{_wx['TrackTemp'].max():.0f} °C · 💨 vent {_wx['WindSpeed'].mean():.1f} m/s · {_rain_txt}"
-        )
-except Exception:
-    pass
-
-
-def team_color(team):
-    """Couleur d'équipe : notre palette d'abord, sinon le référentiel officiel
-    de fastf1.plotting (couvre toutes les équipes de toutes les saisons)."""
-    if team in TEAM_COLORS:
-        return TEAM_COLORS[team]
-    try:
-        import fastf1.plotting as f1plt
-        c = f1plt.get_team_color(team, session=session)
-        if c:
-            return c
-    except Exception:
-        pass
-    return "#888888"
-
-
-def driver_color(drv):
-    try:
-        return team_color(session.get_driver(drv)["TeamName"])
-    except Exception:
         return "#888888"
+
+
+    def driver_color(drv):
+        try:
+            return team_color(session.get_driver(drv)["TeamName"])
+        except Exception:
+            return "#888888"
+
+
+
+    return True
+
+# ============== PAGE : ACCUEIL ==============
+def page_accueil():
+    """Présentation du site et calendrier de la saison.
+
+    Seule page qui ne nécessite aucune session chargée : elle ne consomme que
+    le calendrier, déjà en cache."""
+    st.markdown("""
+## Bienvenue sur **Analyse F1**
+
+Ce site décortique les données de la Formule 1 bien au-delà du classement.
+Il puise dans la **télémétrie officielle** — vitesse, freinage, accélérateur,
+rapport engagé, position sur la piste, relevée plusieurs fois par seconde — pour
+montrer *comment* un tour se gagne, et pas seulement de combien.
+
+**Ce que vous y trouverez :**
+
+- le **championnat** à jour, pilotes et constructeurs, avec la trajectoire de
+  chacun course après course et les duels entre coéquipiers ;
+- l'**analyse d'un week-end** : feuille des temps, écarts, stratégies pneus,
+  évolution des positions, direction de course et radios d'équipe ;
+- la **comparaison de deux pilotes** au tour près : télémétries superposées,
+  carte du circuit colorée selon qui gagne du temps et où, analyse virage par
+  virage, diagramme du cercle de friction.
+
+*Données 2023 à aujourd'hui. Les temps sont ceux du chronométrage officiel ;
+la télémétrie est échantillonnée à quelques hertz, ce qui suffit largement pour
+comparer deux pilotes mais interdit de raisonner au centième sur une valeur
+isolée.*
+""")
+
+    st.markdown("---")
+    annee = year  # suit le sélecteur de saison de la barre latérale
+    st.markdown(f"### 📅 Calendrier {annee}")
+
+    try:
+        with st.spinner("Chargement du calendrier…"):
+            sched = DATA.get_event_schedule(annee, include_testing=False)
+    except Exception as exc:
+        st.error(f"Calendrier indisponible : {exc}")
+        return
+
+    aujourdhui = pd.Timestamp.now().normalize()
+    colonnes = 1 if MOBILE else 3
+    cartes = []
+    for _, ev in sched.iterrows():
+        debut = pd.to_datetime(ev.get("DateStart", ev.get("EventDate")), errors="coerce")
+        fin = pd.to_datetime(ev.get("DateEnd", ev.get("EventDate")), errors="coerce")
+        if pd.isna(debut):
+            debut = pd.to_datetime(ev.get("EventDate"), errors="coerce")
+        passe = pd.notna(fin) and fin < aujourdhui
+        # Prochaine manche = la première non terminée
+        cartes.append({
+            "round": int(ev["RoundNumber"]),
+            "nom": str(ev.get("Location") or ev["EventName"]),
+            "gp": str(ev["EventName"]),
+            "pays": str(ev.get("Country") or ""),
+            "dates": format_weekend(debut, fin),
+            "cle": ev.get("CircuitKey"),
+            "passe": passe,
+        })
+    prochaine = next((c["round"] for c in cartes if not c["passe"]), None)
+
+    for i in range(0, len(cartes), colonnes):
+        cols = st.columns(colonnes)
+        for col, carte in zip(cols, cartes[i:i + colonnes]):
+            with col:
+                svg = track_svg(carte["cle"], annee) or ""
+                est_prochaine = carte["round"] == prochaine
+                bordure = "#E10600" if est_prochaine else "rgba(255,255,255,.15)"
+                opacite = ".55" if carte["passe"] else "1"
+                badge = ('<span style="background:#E10600;color:#fff;font-size:.7rem;'
+                         'padding:2px 8px;border-radius:10px;margin-left:6px">PROCHAINE</span>'
+                         if est_prochaine else "")
+                st.markdown(
+                    f'<div style="border:1px solid {bordure};border-radius:10px;'
+                    f'padding:10px 12px;margin-bottom:10px;opacity:{opacite}">'
+                    f'<div style="font-size:.75rem;color:#9aa0a6">R{carte["round"]}'
+                    f' · {carte["dates"]}{badge}</div>'
+                    f'<div style="font-size:1.05rem;font-weight:600;margin:2px 0 6px">'
+                    f'{flag_for(carte["pays"])} {carte["nom"]}</div>'
+                    f'{svg}'
+                    f'<div style="font-size:.72rem;color:#9aa0a6;margin-top:4px">'
+                    f'{carte["gp"]}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.caption("Les tracés sont dessinés à partir des coordonnées officielles du "
+               "circuit. Une manche grisée est déjà disputée.")
 
 
 # ============== PAGE : ANALYSE DU STYLE ==============
@@ -1721,6 +1907,8 @@ def page_style():
     leurs tours, puis les onglets d'analyse (overlay, delta, g-g, feuille des
     temps, etc.). Les widgets sidebar de cette page (pilotes, tours) ne sont
     créés que lorsqu'elle est active."""
+    if not _ensure_session():
+        return
     # --- Sélection des pilotes ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Pilotes à comparer")
@@ -3427,6 +3615,8 @@ def page_timing():
     perso), badges couleur équipe, fonds violet (record session) / vert
     (record perso). Les mini-secteurs n'existent que dans le flux live
     SignalR — absents des données post-session FastF1, donc non affichés."""
+    if not _ensure_session():
+        return
     st.markdown(f"## 📊 Overview — {SESSION_LABELS.get(st.session_state.session_type, st.session_state.session_type)}")
 
     VIOLET_BG = "background-color: #7C3AED; color: #FFFFFF; font-weight: bold; border-radius: 6px; text-align: center"
@@ -3844,9 +4034,46 @@ def page_timing():
             shown = radio_df[radio_df["Pilote"].isin(drv_sel)] if drv_sel else radio_df
             _render_radio_clips(shown)
 
-    # --- Championnat pilotes : impact de la session ---
-    if not is_race:
+
+# ============== PAGE : ANALYSE ==============
+def page_analyse_session():
+    """Toutes les analyses d'un week-end, en deux vues.
+
+    La sélection de session et de pilotes vit dans la barre latérale ; ces
+    deux vues partagent la même session chargée, d'où le regroupement."""
+    if not _ensure_session():
         return
+    vue = st.segmented_control(
+        "Vue", options=["📋 Vue session", "🎨 Comparaison pilotes"],
+        default="📋 Vue session", key="vue_analyse", label_visibility="collapsed",
+    ) or "📋 Vue session"
+    if vue.startswith("📋"):
+        page_timing()
+    else:
+        page_style()
+
+
+# ============== PAGE : CHAMPIONNAT ==============
+def page_championnat():
+    """Classements pilotes et constructeurs, et trajectoire de la saison.
+
+    Les totaux sont arrêtés à la session chargée : charger la dernière
+    course donne donc le classement à jour."""
+    if not _ensure_session():
+        return
+    is_race = st.session_state.session_type in ("R", "S")
+    try:
+        results = session.results
+        if results is None or results.empty:
+            results = None
+    except Exception:
+        results = None
+    if not is_race:
+        st.info("🏆 Le championnat se met à jour à l'issue d'une **course** ou d'un "
+                "**sprint**. Charge une session R ou S pour voir l'impact sur les "
+                "classements.")
+        return
+
     st.markdown("---")
     st.markdown("#### 🏆 Championnat pilotes — impact de la session")
     with st.spinner("Calcul des points de la saison (long au premier chargement, ensuite en cache)…"):
@@ -4103,10 +4330,15 @@ def page_timing():
 
 
 # ============== NAVIGATION ==============
+
+# Navigation en bulles horizontales (position="top", natif depuis Streamlit
+# 1.46) : les trois sections demandées, l'Accueil servant de point d'entrée
+# sans exiger de session chargée.
 pg = st.navigation([
-    st.Page(page_timing, title="Overview session", icon="📊", default=True),
-    st.Page(page_style, title="Style de pilotage", icon="🎨"),
-])
+    st.Page(page_accueil, title="Accueil", icon="🏠", default=True),
+    st.Page(page_championnat, title="Championnat", icon="🏆"),
+    st.Page(page_analyse_session, title="Analyse", icon="📊"),
+], position="top")
 pg.run()
 
 # ============== FOOTER ==============
