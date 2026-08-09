@@ -14,6 +14,25 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX page Championnat : NameError sur `team_color`. La fonction était définie
+  À L'INTÉRIEUR de `_prepare_session` et exportée en `global` — or la page
+  Championnat est autonome (aucune session chargée), donc le nom n'existait
+  pas et la page plantait au premier badge d'équipe. `team_color` et
+  `driver_color` remontent au niveau module. Garde-fou : plus AUCUNE page
+  autonome ne dépend d'un global produit par `_prepare_session`.
+- ROBUSTESSE des points du championnat : les manches en échec (rate-limiting
+  OpenF1, une session par manche = rafale) sont désormais REJOUÉES une fois
+  après une pause, au lieu de disparaître du total. `_cumuler` est atomique
+  (calcul en local, fusion à la fin) pour qu'un rejeu ne double-compte pas.
+  Le message d'échec porte enfin le détail de l'erreur — « 404 » (session
+  absente) et « 429 » (débit) appellent des réactions opposées.
+- OVERVIEW : le tableau devient TRIABLE (helper `sort_table`) — les en-têtes
+  ne peuvent pas être cliquables, `show_table` rendant du HTML statique et
+  Streamlit retirant le JS du markdown, donc le tri se fait côté serveur sur
+  des clés numériques (« 1:22.433 » se trierait alphabétiquement). La colonne
+  « Pos » garde le classement officiel quel que soit le tri.
+- OVERVIEW : « Best lap » indique le TOUR du meilleur temps (« 1:22.433 T34 ») ;
+  les secteurs restent sans numéro de tour.
 - FORMAT des temps au tour en notation course « 1:22.433 » partout où un
   chrono est affiché, au lieu des « 83.433s » d'avant : helper `fmt_lap_s()`
   (repris par `_fmt_lap`) pour les métriques, tableaux et infobulles, et
@@ -172,6 +191,7 @@ Changements vs version précédente
 import contextlib
 import logging
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -810,6 +830,34 @@ def show_table(styler, height=None, force_html=False, mono=False):
     )
 
 
+def sort_table(disp, styles, cles, key, defaut=None):
+    """Contrôles de tri pour les tableaux rendus par `show_table`.
+
+    Les en-têtes ne peuvent pas être cliquables : `show_table` produit du HTML
+    statique (st.dataframe est flou sur les écrans Retina, cf. son docstring) et
+    Streamlit retire le JS des blocs markdown. Le tri se fait donc côté serveur.
+
+    `cles` associe un nom de colonne AFFICHÉE à des valeurs triables — presque
+    toujours numériques, puisque les colonnes sont du texte formaté (« 1:22.433 »
+    se trierait alphabétiquement). Les valeurs doivent suivre l'ordre courant des
+    lignes. Renvoie (disp, styles) permutés de la même façon : le Styler applique
+    les styles par position, les deux doivent rester alignés."""
+    colonnes = [c for c in disp.columns if c in cles]
+    if not colonnes:
+        return disp, styles
+    defaut = defaut if defaut in colonnes else colonnes[0]
+    c1, c2 = st.columns([3, 2])
+    col = c1.selectbox("Trier par", colonnes, index=colonnes.index(defaut),
+                       key=f"{key}_col")
+    sens = c2.segmented_control("Ordre", ["↑ croissant", "↓ décroissant"],
+                                default="↑ croissant", key=f"{key}_sens")
+    v = pd.Series(list(cles[col]), index=range(len(disp)))
+    ordre = v.sort_values(ascending=not str(sens).startswith("↓"),
+                          na_position="last", kind="stable").index
+    return (disp.iloc[ordre].reset_index(drop=True),
+            styles.iloc[ordre].reset_index(drop=True))
+
+
 def fmt_lap_s(secondes, decimales=3):
     """Temps au tour au format course '1:22.433', depuis un nombre de secondes.
 
@@ -952,6 +1000,36 @@ def text_on(bg):
     h = bg.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return "#111111" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#FFFFFF"
+
+
+def team_color(team):
+    """Couleur d'équipe : notre palette d'abord, sinon le référentiel officiel
+    de fastf1.plotting (couvre toutes les équipes de toutes les saisons).
+
+    Défini au niveau module et SANS session : la page Championnat est autonome
+    (aucune session chargée) et l'appelait quand même — quand la fonction était
+    imbriquée dans `_prepare_session`, le nom n'existait pas et la page plantait
+    en NameError."""
+    if team in TEAM_COLORS:
+        return TEAM_COLORS[team]
+    try:
+        import fastf1.plotting as f1plt
+        c = f1plt.get_team_color(team, session=globals().get("session"))
+        if c:
+            return c
+    except Exception:
+        pass
+    return "#888888"
+
+
+def driver_color(drv):
+    """Couleur du pilote via son équipe dans la session courante. Sans session
+    chargée, l'appelant doit passer par `team_color` avec l'équipe qu'il connaît
+    (la page Championnat le fait depuis les feuilles de résultats)."""
+    try:
+        return team_color(session.get_driver(drv)["TeamName"])
+    except Exception:
+        return "#888888"
 
 
 def _chan(tel, ch):
@@ -1216,6 +1294,51 @@ def season_points_before(year, round_number, session_type):
     # récoltées dans CETTE boucle plutôt que dans une seconde passe, pour ne
     # pas doubler le trafic (cf. le rate-limiting déjà rencontré).
     positions, manches, equipes, noms = {}, {}, {}, {}
+
+    def _cumuler(rnd, ses, ev_row):
+        """Ajoute une session au cumul. Isolée pour pouvoir être REJOUÉE : un
+        échec ponctuel (rate-limiting OpenF1) retirait sinon définitivement une
+        manche du championnat, et le total affiché était faux sans recours."""
+        s = DATA.get_session(year, rnd, ses)
+        s.load(laps=False, telemetry=False, weather=False, messages=False)
+        res = s.results
+        if res is None or res.empty:
+            return
+        # Tout se calcule dans des variables locales, la fusion n'a lieu qu'à la
+        # fin : une exception en cours de route ne laisse aucun cumul partiel,
+        # donc le rejeu ne peut pas compter une manche deux fois.
+        pfr = points_from_results(res, ses)
+        d_team, d_equipes, d_noms, d_pos = {}, {}, {}, {}
+        for _, r in res.iterrows():
+            code = str(r["Abbreviation"])
+            team = str(r.get("TeamName", "") or "")
+            if team:  # cumul constructeurs (somme des deux pilotes)
+                d_team[team] = d_team.get(team, 0.0) + pfr.get(code, 0.0)
+                d_equipes[code] = team
+            nom = str(r.get("FullName") or "").strip()
+            if nom:
+                d_noms[code] = nom
+            if ses == "R":
+                pos = r.get("Position")
+                if pd.notna(pos) and 1 <= int(pos) <= 22:
+                    d_pos[code] = int(pos)
+
+        for code, p in pfr.items():
+            pts[code] = pts.get(code, 0.0) + p
+        for team, p in d_team.items():
+            team_pts[team] = team_pts.get(team, 0.0) + p
+        equipes.update(d_equipes)
+        noms.update(d_noms)
+        for code, pos in d_pos.items():
+            cb.setdefault(code, [0] * 22)[pos - 1] += 1
+        if d_pos:
+            positions[rnd] = d_pos
+            # Nom du circuit plutôt que du GP : « Silverstone » parle
+            # davantage que « British Grand Prix ».
+            lieu = str(ev_row.get("Location") or "").strip()
+            manches[rnd] = lieu or str(ev_row["EventName"])
+
+    a_rejouer = []
     for _, ev_row in sched.iterrows():
         rnd = int(ev_row["RoundNumber"])
         if rnd > round_number:
@@ -1230,37 +1353,26 @@ def season_points_before(year, round_number, session_type):
             ses_list.append("S")
         for ses in ses_list:
             try:
-                s = DATA.get_session(year, rnd, ses)
-                s.load(laps=False, telemetry=False, weather=False, messages=False)
-                res = s.results
-                if res is None or res.empty:
-                    continue
-                pfr = points_from_results(res, ses)
-                for code, p in pfr.items():
-                    pts[code] = pts.get(code, 0.0) + p
-                for _, r in res.iterrows():
-                    code = str(r["Abbreviation"])
-                    team = str(r.get("TeamName", "") or "")
-                    if team:  # cumul constructeurs (somme des deux pilotes)
-                        team_pts[team] = team_pts.get(team, 0.0) + pfr.get(code, 0.0)
-                        equipes[code] = team
-                    nom = str(r.get("FullName") or "").strip()
-                    if nom:
-                        noms[code] = nom
-                    if ses == "R":
-                        pos = r.get("Position")
-                        if pd.notna(pos) and 1 <= int(pos) <= 22:
-                            cb.setdefault(code, [0] * 22)[int(pos) - 1] += 1
-                            positions.setdefault(rnd, {})[code] = int(pos)
-                            # Nom du circuit plutôt que du GP : « Silverstone »
-                            # parle davantage que « British Grand Prix ».
-                            lieu = str(ev_row.get("Location") or "").strip()
-                            manches[rnd] = lieu or str(ev_row["EventName"])
+                _cumuler(rnd, ses, ev_row)
             except Exception as exc:
                 # Une manche non courue est normale ; une erreur récurrente
                 # fausserait silencieusement tout le championnat, on la remonte.
-                echecs.append(f"R{rnd} {ses} ({type(exc).__name__})")
-                continue
+                a_rejouer.append((rnd, ses, ev_row, exc))
+
+    # Seconde passe : les échecs sont presque toujours du rate-limiting (une
+    # session par manche = rafale de requêtes). On laisse retomber la pression
+    # puis on rejoue UNIQUEMENT les manquants — un cumul partiel n'a pas pu
+    # avoir lieu, `_cumuler` n'écrit rien avant d'avoir les résultats en main.
+    if a_rejouer:
+        time.sleep(2)
+        for rnd, ses, ev_row, exc in a_rejouer:
+            try:
+                _cumuler(rnd, ses, ev_row)
+            except Exception as exc2:
+                # Le message compte autant que le type : « 404 » (session
+                # absente) et « 429 » (débit) appellent des réactions opposées.
+                detail = str(exc2).strip() or str(exc).strip()
+                echecs.append(f"R{rnd} {ses} ({type(exc2).__name__}: {detail[:120]})")
     # Dictionnaire plutôt qu'un n-uplet qui s'allonge à chaque besoin
     return {"pts": pts, "cb": cb, "team_pts": team_pts, "echecs": echecs,
             "positions": positions, "manches": manches, "equipes": equipes,
@@ -1602,7 +1714,6 @@ def _prepare_session():
     global session, circuit_info, corners_df, TRACK_ROTATION
     global drivers_in_session, driver_full, ev
     global _rotate_xy, _add_corner_labels, _nearest_corner
-    global team_color, driver_color
 
     global schedule
     try:
@@ -1829,29 +1940,6 @@ def _prepare_session():
             )
     except Exception:
         pass
-
-
-    def team_color(team):
-        """Couleur d'équipe : notre palette d'abord, sinon le référentiel officiel
-        de fastf1.plotting (couvre toutes les équipes de toutes les saisons)."""
-        if team in TEAM_COLORS:
-            return TEAM_COLORS[team]
-        try:
-            import fastf1.plotting as f1plt
-            c = f1plt.get_team_color(team, session=session)
-            if c:
-                return c
-        except Exception:
-            pass
-        return "#888888"
-
-
-    def driver_color(drv):
-        try:
-            return team_color(session.get_driver(drv)["TeamName"])
-        except Exception:
-            return "#888888"
-
 
 
     return True
@@ -3725,6 +3813,11 @@ def page_timing():
         if timed_raw.empty:
             continue
         best_td = timed_ok["LapTime"].min() if len(timed_ok) else pd.NaT
+        # Tour du meilleur temps : « quand » vaut souvent autant que « combien »
+        # (un best au tour 3 en course = tour d'attaque sur gomme neuve, un best
+        # au dernier tour = piste qui s'améliore ou relais gratuit).
+        best_n = (int(timed_ok.loc[timed_ok["LapTime"].idxmin(), "LapNumber"])
+                  if len(timed_ok) and pd.notna(best_td) else None)
         last = timed_raw.iloc[-1]
         # Pneu courant : compound + âge du dernier tour
         comp = str(last.get("Compound", "—")) if pd.notna(last.get("Compound")) else "—"
@@ -3738,6 +3831,7 @@ def page_timing():
             "fin_laps": int(last["LapNumber"]),
             "fin_t": last["Time"].total_seconds() if pd.notna(last.get("Time")) else np.nan,
             "best": best_td,
+            "best_n": best_n,
             "best_s": best_td.total_seconds() if pd.notna(best_td) else np.inf,
             "last_lap": last["LapTime"],
             "lS1": last.get("Sector1Time"), "lS2": last.get("Sector2Time"), "lS3": last.get("Sector3Time"),
@@ -3820,6 +3914,11 @@ def page_timing():
         letter = r["comp"][:1] if r["comp"] != "—" else "—"
         return f"{r['tyre_age']} {letter}" if r["tyre_age"] is not None else letter
 
+    def _best_str(r):
+        """Meilleur tour + le tour où il a été signé, ex. « 1:22.433 T34 »."""
+        t = _fmt_lap(r["best"])
+        return f"{t} T{r['best_n']}" if r["best_n"] is not None and t != "—" else t
+
     disp = pd.DataFrame({
         "Pos": dfr.index + 1,
         "Pilote": dfr["drv"],
@@ -3827,7 +3926,7 @@ def page_timing():
         "Interval": intervals,
         "Écart": gaps,
         "Pneu": dfr.apply(_tyre_str, axis=1),
-        "Best lap": dfr["best"].apply(_fmt_lap),
+        "Best lap": dfr.apply(_best_str, axis=1),
         "Dernier tour": dfr["last_lap"].apply(_fmt_lap),
         "S1": dfr["lS1"].apply(_fmt_sec),
         "S2": dfr["lS2"].apply(_fmt_sec),
@@ -3885,6 +3984,31 @@ def page_timing():
     _mark("S2★", dfr["bS2"], sess_best["S2"])
     _mark("S3★", dfr["bS3"], sess_best["S3"])
 
+    # Tri à la demande. Les clés sont numériques car les colonnes affichées sont
+    # du texte formaté : trier « 1:22.433 » ou « +1.234 » alphabétiquement
+    # donnerait n'importe quoi. « Pos » = ordre du classement, donc l'identité.
+    def _sec(series):
+        return series.apply(lambda t: t.total_seconds() if pd.notna(t) else np.nan)
+
+    cles = {
+        "Pos": list(range(len(disp))),
+        "Pilote": list(dfr["drv"]),
+        "Pit": list(dfr["pits"]),
+        "Interval": gap_num,
+        "Écart": gap_num,
+        "Pneu": [a if a is not None else np.nan for a in dfr["tyre_age"]],
+        "Best lap": [s if np.isfinite(s) else np.nan for s in dfr["best_s"]],
+        "Dernier tour": list(_sec(dfr["last_lap"])),
+        "S1": list(_sec(dfr["lS1"])), "S2": list(_sec(dfr["lS2"])), "S3": list(_sec(dfr["lS3"])),
+        "S1★": list(_sec(dfr["bS1"])), "S2★": list(_sec(dfr["bS2"])), "S3★": list(_sec(dfr["bS3"])),
+    }
+    if "Δ Grille" in disp.columns:
+        cles["Δ Grille"] = [(r["grid"] - r["res_pos"])
+                            if pd.notna(r["grid"]) and pd.notna(r["res_pos"]) and r["grid"] > 0
+                            else np.nan for _, r in dfr.iterrows()]
+
+    disp, styles = sort_table(disp, styles, cles, key="tri_overview", defaut="Pos")
+
     show_table(
         disp.style.apply(lambda _: styles, axis=None),
         height=min(40 * (len(disp) + 1) + 3, 780),
@@ -3892,6 +4016,7 @@ def page_timing():
     )
     st.caption(
         "🟣 fond violet = record de la session · 🟢 fond vert = record perso · "
+        "**Best lap** suivi du tour où il a été signé (T34 = tour 34) · "
         "**S1-S3** = secteurs du dernier tour bouclé · **S1★-S3★** = meilleurs secteurs "
         "individuels · **Pneu** = âge (tours) + compound du dernier relais · "
         "les tours supprimés (track limits) sont exclus des records. "
@@ -4160,10 +4285,12 @@ def page_championnat():
     noms_all = {**avant.get("noms", {}), **hist.get("noms", {})}
 
     if pts_echecs:
-        st.caption(f"⚠️ Manches non comptabilisées ({len(pts_echecs)}) : "
-                   + ", ".join(pts_echecs[:8])
-                   + (" …" if len(pts_echecs) > 8 else "")
-                   + " — le total peut être incomplet.")
+        st.warning(f"⚠️ Manches non comptabilisées ({len(pts_echecs)}) — le total "
+                   "est incomplet. Un rechargement de la page suffit souvent : "
+                   "l'échec vient en général du débit de l'API, pas d'une donnée "
+                   "absente.")
+        with st.expander("Détail des échecs"):
+            st.code("\n".join(pts_echecs))
 
     # Apport de la dernière course = écart entre les deux cumuls
     pts_session = {d: hist["pts"].get(d, 0.0) - pts_before.get(d, 0.0)
