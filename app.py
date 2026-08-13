@@ -14,6 +14,10 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- ORDRE du sélecteur de session par importance décroissante : Course,
+  Qualifications, Sprint, Sprint Shootout, puis Essais Libres 3 → 1. La
+  session par défaut devient donc la Course (index désigné par son code et
+  non par sa position, pour survivre au prochain réordonnancement).
 - FIX page Championnat : NameError sur `team_color`. La fonction était définie
   À L'INTÉRIEUR de `_prepare_session` et exportée en `global` — or la page
   Championnat est autonome (aucune session chargée), donc le nom n'existait
@@ -904,8 +908,11 @@ def _fmt_sec(td):
     return f"{td.total_seconds():.3f}" if pd.notna(td) else "—"
 
 
+# Ordre du sélecteur : par importance décroissante du week-end — course, puis
+# qualifications, puis le format sprint, puis les essais du plus récent au plus
+# ancien (FP3 est le plus représentatif des conditions de qualif).
 SESSION_LABELS = {
-    "Q": "Qualifications", "R": "Course", "SQ": "Sprint Shootout", "S": "Sprint",
+    "R": "Course", "Q": "Qualifications", "S": "Sprint", "SQ": "Sprint Shootout",
     "FP3": "Essais Libres 3", "FP2": "Essais Libres 2", "FP1": "Essais Libres 1",
 }
 SESSION_TYPES = list(SESSION_LABELS.keys())
@@ -1735,7 +1742,7 @@ def _prepare_session():
     session_type = st.sidebar.selectbox(
         "Session",
         options=SESSION_TYPES,
-        index=0,
+        index=SESSION_TYPES.index("R"),  # explicite : survit à un réordonnancement
         format_func=lambda x: SESSION_LABELS.get(x, x),
     )
 
