@@ -282,7 +282,78 @@ def test_trafic_reseau():
           f"{dict(Counter(appels))} ✓")
 
 
+def test_seances_du_weekend():
+    """Session1..Session5 : le programme réel de chaque week-end.
+
+    L'app s'en sert pour ne proposer que les séances existantes — un week-end
+    sprint n'a qu'un essai libre, en proposer trois mène droit à une erreur de
+    chargement. Les colonnes doivent porter les MÊMES libellés que FastF1, en
+    ordre chronologique, et rester à None si OpenF1 ne date pas les séances
+    (l'app retombe alors sur le programme type du format)."""
+    def iso(s):
+        return pd.Timestamp(s).isoformat() + "+00:00"
+
+    fake = {
+        "meetings": [
+            {"meeting_key": 1301, "meeting_name": "Dutch Grand Prix",
+             "country_name": "Netherlands", "location": "Zandvoort",
+             "date_start": iso("2026-08-21T09:30:00"), "circuit_key": 55},
+            {"meeting_key": 1302, "meeting_name": "Chinese Grand Prix",
+             "country_name": "China", "location": "Shanghai",
+             "date_start": iso("2026-03-20T03:30:00"), "circuit_key": 49},
+        ],
+        # Volontairement dans le désordre : le tri est fait par l'adaptateur.
+        "sessions": [
+            {"meeting_key": 1301, "session_name": "Race", "session_key": 20,
+             "date_start": iso("2026-08-23T13:00:00")},
+            {"meeting_key": 1301, "session_name": "Practice 1", "session_key": 21,
+             "date_start": iso("2026-08-21T09:30:00")},
+            {"meeting_key": 1301, "session_name": "Qualifying", "session_key": 22,
+             "date_start": iso("2026-08-22T13:00:00")},
+            {"meeting_key": 1301, "session_name": "Practice 3", "session_key": 23,
+             "date_start": iso("2026-08-22T10:30:00")},
+            {"meeting_key": 1301, "session_name": "Practice 2", "session_key": 24,
+             "date_start": iso("2026-08-21T13:00:00")},
+            # Week-end sprint : un seul essai libre, plus SQ et Sprint
+            {"meeting_key": 1302, "session_name": "Practice 1", "session_key": 30,
+             "date_start": iso("2026-03-20T03:30:00")},
+            {"meeting_key": 1302, "session_name": "Sprint Qualifying", "session_key": 31,
+             "date_start": iso("2026-03-20T07:30:00")},
+            {"meeting_key": 1302, "session_name": "Sprint", "session_key": 32,
+             "date_start": iso("2026-03-21T03:00:00")},
+            {"meeting_key": 1302, "session_name": "Qualifying", "session_key": 33,
+             "date_start": iso("2026-03-21T07:00:00")},
+            {"meeting_key": 1302, "session_name": "Race", "session_key": 34,
+             "date_start": iso("2026-03-22T07:00:00")},
+        ],
+    }
+    of1._get = lambda endpoint, **p: fake.get(endpoint, [])
+    of1.vider_cache()
+
+    sched = of1.get_event_schedule(2026, include_testing=False)
+    prog = {r["EventName"]: [r[f"Session{i}"] for i in range(1, 6)]
+            for _, r in sched.iterrows()}
+
+    assert prog["Dutch Grand Prix"] == ["Practice 1", "Practice 2", "Practice 3",
+                                        "Qualifying", "Race"], prog["Dutch Grand Prix"]
+    assert prog["Chinese Grand Prix"] == ["Practice 1", "Sprint Qualifying", "Sprint",
+                                          "Qualifying", "Race"], prog["Chinese Grand Prix"]
+    # Un sprint ne doit JAMAIS annoncer d'essais 2 ou 3
+    assert "Practice 2" not in prog["Chinese Grand Prix"]
+    assert "Practice 3" not in prog["Chinese Grand Prix"]
+
+    # Sans date_start, les colonnes restent vides plutôt que d'inventer un
+    # programme : l'app bascule alors sur le repli par format.
+    fake["sessions"] = [{"meeting_key": 1301, "session_name": "Race", "session_key": 20}]
+    of1.vider_cache()
+    sched2 = of1.get_event_schedule(2026, include_testing=False)
+    assert sched2.loc[0, "Session1"] is None, sched2.loc[0, "Session1"]
+
+    print("13) séances du week-end  : Session1..5 chronologiques, sprint sans FP2/FP3 ✓")
+
+
 if __name__ == "__main__":
     main()
     test_numerotation_manches()
     test_trafic_reseau()
+    test_seances_du_weekend()

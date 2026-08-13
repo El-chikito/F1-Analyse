@@ -14,6 +14,12 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- SÉANCES du week-end : le sélecteur ne propose plus que les sessions
+  réellement au programme (`sessions_of_event`). Un week-end sprint n'a qu'un
+  essai libre — proposer « Essais Libres 2 » y menait droit à une erreur de
+  chargement. L'adaptateur OpenF1 remplit désormais Session1..Session5 comme
+  FastF1 (mêmes libellés, ordre chronologique) ; à défaut, repli sur le
+  programme type du format, les trois variantes sprint depuis 2021 comprises.
 - ORDRE du sélecteur de session par importance décroissante : Course,
   Qualifications, Sprint, Sprint Shootout, puis Essais Libres 3 → 1. La
   session par défaut devient donc la Course (index désigné par son code et
@@ -916,6 +922,46 @@ SESSION_LABELS = {
     "FP3": "Essais Libres 3", "FP2": "Essais Libres 2", "FP1": "Essais Libres 1",
 }
 SESSION_TYPES = list(SESSION_LABELS.keys())
+
+# Libellés de séance (colonnes Session1..Session5 du calendrier) -> nos codes.
+# FastF1 et l'adaptateur OpenF1 emploient les mêmes intitulés officiels.
+SESSION_NOM_VERS_CODE = {
+    "practice 1": "FP1", "practice 2": "FP2", "practice 3": "FP3",
+    "qualifying": "Q", "sprint": "S", "race": "R",
+    "sprint qualifying": "SQ", "sprint shootout": "SQ",
+}
+# Repli quand le calendrier ne détaille pas les séances : programme type de
+# chaque format. Le format sprint a changé trois fois — en 2021-22 la qualif du
+# vendredi précédait un « Sprint » sans shootout et il y avait deux essais ;
+# depuis 2023 les essais tombent à un seul, avec SQ.
+SESSIONS_PAR_FORMAT = {
+    "conventional": ["FP1", "FP2", "FP3", "Q", "R"],
+    "sprint": ["FP1", "FP2", "Q", "S", "R"],
+    "sprint_shootout": ["FP1", "Q", "SQ", "S", "R"],
+    "sprint_qualifying": ["FP1", "SQ", "S", "Q", "R"],
+}
+
+
+def sessions_of_event(ev_row):
+    """Codes des séances RÉELLEMENT au programme d'un week-end, classés par
+    importance (l'ordre de SESSION_TYPES).
+
+    Un week-end sprint n'a qu'un essai libre : proposer « Essais Libres 2 » y
+    mène droit à une erreur de chargement. On lit donc les colonnes
+    Session1..Session5 du calendrier, et on retombe sur le programme type du
+    format si la source ne les fournit pas."""
+    codes = set()
+    for i in range(1, 6):
+        nom = ev_row.get(f"Session{i}") if hasattr(ev_row, "get") else None
+        if nom is None or (isinstance(nom, float) and pd.isna(nom)):
+            continue
+        code = SESSION_NOM_VERS_CODE.get(str(nom).strip().lower())
+        if code:
+            codes.add(code)
+    if not codes:
+        fmt = str(ev_row.get("EventFormat", "") or "").lower()
+        codes = set(SESSIONS_PAR_FORMAT.get(fmt, SESSIONS_PAR_FORMAT["conventional"]))
+    return [c for c in SESSION_TYPES if c in codes]
 # FastF1 remonte à 2018 ; OpenF1, utilisé quand la F1 filtre l'hébergeur,
 # ne couvre que 2023 et après. On n'affiche que les saisons réellement
 # chargeables, sinon l'utilisateur choisit une année vouée à l'échec.
@@ -1739,10 +1785,17 @@ def _prepare_session():
     )
     gp_name = gp_options[gp_label]
 
+    # Le programme dépend du week-end : un sprint n'a qu'un essai libre, un
+    # week-end classique n'a ni sprint ni shootout. On n'affiche donc que les
+    # séances réellement au calendrier, plutôt que la liste complète dont les
+    # trois quarts échoueraient au chargement.
+    _ev_sel = schedule[schedule["EventName"] == gp_name]
+    ses_options = (sessions_of_event(_ev_sel.iloc[0]) if len(_ev_sel)
+                   else list(SESSION_TYPES))
     session_type = st.sidebar.selectbox(
         "Session",
-        options=SESSION_TYPES,
-        index=SESSION_TYPES.index("R"),  # explicite : survit à un réordonnancement
+        options=ses_options,
+        index=ses_options.index("R") if "R" in ses_options else 0,
         format_func=lambda x: SESSION_LABELS.get(x, x),
     )
 

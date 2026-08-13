@@ -132,7 +132,12 @@ pour du contenu principal.
     doit passer par le cache ;
   · pas de tour supprimé (`Deleted` toujours False), pas d'`EventFormat`
     (déduit de la présence d'une session Sprint), distance parcourue et
-    `TrackStatus` **reconstruits** (intégration de la vitesse / messages FIA).
+    `TrackStatus` **reconstruits** (intégration de la vitesse / messages FIA) ;
+  · `Session1..Session5` du calendrier (programme du week-end, libellés
+    FastF1, ordre chronologique) sont reconstruits depuis `/sessions` — c'est
+    ce qui permet à `sessions_of_event` de ne proposer que les séances
+    existantes. Elles restent à `None` si OpenF1 ne date pas les séances,
+    l'app retombant alors sur le programme type du format.
 - **Mini-secteurs disponibles via OpenF1** (`Segments1/2/3` + `segment_label`)
   alors que FastF1 ne les expose pas en post-session.
 - **Radios** : flux `TeamRadio.json` non documenté sur

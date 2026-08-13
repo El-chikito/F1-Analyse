@@ -187,6 +187,7 @@ def _build_schedule(year, include_testing):
     # championnat (bug constaté).
     race_meetings, sprint_meetings = set(), set()
     bornes = {}  # meeting_key -> [début, fin] du week-end
+    seances = {}  # meeting_key -> [(début, nom de séance), ...]
     try:
         for s in _sessions_of_year(year):
             mk = s.get("meeting_key")
@@ -205,6 +206,8 @@ def _build_schedule(year, include_testing):
                 d = d.tz_localize(None)
                 lo, hi = bornes.get(mk, (d, d))
                 bornes[mk] = (min(lo, d), max(hi, d))
+                seances.setdefault(mk, []).append(
+                    (d, str(s.get("session_name", "")).strip()))
     except OpenF1Error:
         pass
 
@@ -233,6 +236,16 @@ def _build_schedule(year, include_testing):
     # aucun week-end sprint et oublie tous ces points au championnat.
     out["EventFormat"] = ["sprint_qualifying" if int(k) in sprint_meetings
                           else "conventional" for k in df["meeting_key"]]
+
+    # Session1..Session5 : mêmes colonnes que FastF1, mêmes libellés, dans
+    # l'ordre chronologique. C'est la liste RÉELLE des séances du week-end —
+    # l'app s'en sert pour n'afficher que les sessions au programme, plutôt que
+    # de les déduire d'un format qui a changé trois fois depuis 2021.
+    ordonnees = {mk: [nom for _, nom in sorted(v)] for mk, v in seances.items()}
+    for i in range(1, 6):
+        out[f"Session{i}"] = [
+            (ordonnees.get(int(k), []) + [None] * 5)[i - 1] for k in df["meeting_key"]
+        ]
     return out
 
 
