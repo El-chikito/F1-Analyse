@@ -352,8 +352,65 @@ def test_seances_du_weekend():
     print("13) séances du week-end  : Session1..5 chronologiques, sprint sans FP2/FP3 ✓")
 
 
+def test_positions_interpolees():
+    """Positions X/Y : interpolation temporelle, pas d'appariement au plus proche.
+
+    Régression : `merge_asof` recopiait la dernière position connue. Le flux
+    `location` étant plus lâche que `car_data`, des points de télémétrie
+    consécutifs sortaient aux MÊMES coordonnées — la carte du circuit se
+    réduisait à une poignée de marqueurs empilés au lieu d'un tracé continu.
+    Contrepartie à préserver : ne rien inventer là où le flux s'est tu."""
+    t0 = pd.Timestamp("2026-08-23T13:00:00")
+    n = 60
+    car = pd.DataFrame({"Date": [t0 + pd.Timedelta(milliseconds=270 * i) for i in range(n)],
+                        "Speed": np.linspace(100, 300, n)})
+    # `location` quatre fois plus lâche, avec un long silence au milieu
+    idx = [i for i in range(0, n, 4) if not (20 < i < 44)]
+    loc = pd.DataFrame({"Date": [car["Date"].iloc[i] for i in idx],
+                        "x": [float(i) for i in idx],
+                        "y": [float(2 * i) for i in idx],
+                        "z": [0.0] * len(idx)})
+
+    out = of1._merge_location(car.copy(), loc)
+    X = out["X"].to_numpy()
+
+    # 1. Plus d'escalier : la position suit le temps au lieu de stagner. Les
+    #    positions valent i par construction, donc X[i] == i si l'on interpole.
+    assert np.allclose(X[:20], np.arange(20.0), atol=1e-5), X[:20]
+
+    # 2. Le silence est comblé jusqu'à 2 s, pas au-delà — vérifié contre la
+    #    règle elle-même plutôt que sur des index en dur.
+    ns_pos = pd.DatetimeIndex(loc["Date"]).to_numpy(dtype="int64")
+    ns_car = pd.DatetimeIndex(car["Date"]).to_numpy(dtype="int64")
+    ecart = np.abs(ns_car[:, None] - ns_pos[None, :]).min(axis=1)
+    trop_loin = ecart > of1._POS_TROU_MAX.value
+    # Hors de la plage couverte par `location`, il n'y a rien à interpoler :
+    # extrapoler inventerait une position, on laisse le trou.
+    dedans = (ns_car >= ns_pos.min()) & (ns_car <= ns_pos.max())
+    assert trop_loin.any() and not trop_loin.all(), "le cas de test doit couvrir les deux"
+    assert (~dedans).any(), "le cas de test doit aussi couvrir les bords"
+    assert np.isnan(X[trop_loin]).all(), "silence long comblé à tort"
+    assert np.isnan(X[~dedans]).all(), "extrapolation hors des relevés connus"
+    calculable = ~trop_loin & dedans
+    assert not np.isnan(X[calculable]).any(), "position perdue alors qu'elle est calculable"
+
+    # 3. Le premier relevé est repris tel quel, sans décalage
+    assert X[0] == 0.0
+
+    # 4. Horodatages dupliqués côté location : pas d'exception
+    of1._merge_location(car.copy(), pd.concat([loc, loc.iloc[:3]], ignore_index=True))
+
+    # 5. Aucune position du tout : colonnes vides, pas d'exception
+    assert of1._merge_location(car.copy(), pd.DataFrame())["X"].isna().all()
+
+    comble = int((~np.isnan(X)).sum())
+    print(f"14) positions X/Y        : {comble}/{n} points positionnés, "
+          f"escalier supprimé, silence long préservé ✓")
+
+
 if __name__ == "__main__":
     main()
     test_numerotation_manches()
     test_trafic_reseau()
     test_seances_du_weekend()
+    test_positions_interpolees()

@@ -339,24 +339,60 @@ class Telemetry(pd.DataFrame):
         return self
 
 
+# Silence maximal du flux `location` que l'on accepte de combler par
+# interpolation. Au-delà, la position redevient inconnue plutôt qu'inventée.
+_POS_TROU_MAX = pd.Timedelta(seconds=2)
+
+
 def _merge_location(car, loc):
-    """Associe les positions X/Y aux points de télémétrie les plus proches
-    dans le temps. Les deux flux ont des cadences différentes : `merge_asof`
-    apparie chaque échantillon à la position la plus récente."""
+    """Ajoute les positions X/Y/Z aux points de télémétrie, par interpolation
+    temporelle. Les deux flux ont des cadences différentes et `location` a des
+    trous : voir le corps pour le détail du rattrapage."""
     if loc is None or loc.empty:
         for c in ("X", "Y", "Z"):
             car[c] = np.nan
         return car
-    # merge_asof refuse les clés nulles : on écarte les points sans horodatage
+    # Les points sans horodatage ne sont positionnables d'aucune façon
     left = car.dropna(subset=["Date"]).sort_values("Date")
     right = loc.dropna(subset=["Date"]).sort_values("Date")[["Date", "x", "y", "z"]]
     if left.empty or right.empty:
         for c in ("X", "Y", "Z"):
             car[c] = np.nan
         return car
-    merged = pd.merge_asof(left, right, on="Date", direction="nearest",
-                           tolerance=pd.Timedelta(seconds=1))
-    return merged.rename(columns={"x": "X", "y": "Y", "z": "Z"})
+    # On INTERPOLE la position au lieu d'apparier au plus proche. `merge_asof`
+    # recopiait la dernière position connue : quand `location` est plus lâche
+    # que `car_data`, plusieurs points de télémétrie consécutifs se retrouvaient
+    # aux MÊMES coordonnées et la carte du circuit se réduisait à une poignée de
+    # marqueurs empilés au lieu d'un tracé continu. Une voiture se déplace de
+    # façon continue : entre deux relevés, l'interpolation temporelle est
+    # nettement plus fidèle qu'un palier.
+    pos = (right.set_index("Date")[["x", "y", "z"]].astype("float64")
+                .groupby(level=0).mean())          # index unique exigé par reindex
+    cible = pd.DatetimeIndex(left["Date"])
+    # `cible` PEUT contenir des doublons : les horodatages d'OpenF1 ont une
+    # précision variable, et une date écrite sans fraction de seconde retombe
+    # sur la précédente. L'index d'interpolation doit donc être dédoublonné —
+    # sinon `reindex` refuse de travailler sur un axe à étiquettes répétées.
+    grille = pos.index.append(cible).unique().sort_values()
+    comble = (pos.reindex(grille)
+                 .interpolate(method="time", limit_area="inside")  # jamais d'extrapolation
+                 .reindex(cible))
+
+    # Garde-fou : ne rien inventer là où le flux s'est tu longtemps. Au-delà de
+    # `_POS_TROU_MAX` sans relevé, on préfère un trou dans le tracé à une corde
+    # tirée en travers du circuit.
+    if len(pos):
+        ns_pos = pos.index.to_numpy(dtype="int64")
+        ns_cible = cible.to_numpy(dtype="int64")
+        i = np.searchsorted(ns_pos, ns_cible)
+        av = np.abs(ns_cible - ns_pos[np.clip(i - 1, 0, len(ns_pos) - 1)])
+        ap = np.abs(ns_pos[np.clip(i, 0, len(ns_pos) - 1)] - ns_cible)
+        trop_loin = np.minimum(av, ap) > _POS_TROU_MAX.value
+        comble.loc[trop_loin, :] = np.nan
+
+    left = left.copy()
+    left[["X", "Y", "Z"]] = comble.to_numpy()
+    return left
 
 
 class Lap(pd.Series):

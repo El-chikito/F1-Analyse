@@ -14,6 +14,21 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX carte du circuit (« Vue circuit ») réduite à quelques marqueurs épars au
+  lieu d'un tracé continu. Deux causes cumulées : `_merge_location` appariait
+  chaque point de télémétrie à la position la PLUS PROCHE, si bien que des
+  points consécutifs se retrouvaient aux mêmes coordonnées quand le flux
+  `location` d'OpenF1 est plus lâche que `car_data` (escalier) ; et la cadence
+  brute (~3,7 Hz) ne suffit pas à faire un tracé là où FastF1 fournit des
+  milliers de points. L'adaptateur INTERPOLE désormais la position dans le
+  temps (sans extrapoler, et sans combler les silences > 2 s : mieux vaut un
+  trou qu'une corde en travers du circuit) et `track_points()` ré-échantillonne
+  le tracé le long de la distance parcourue.
+- SIMPLIFICATION de la comparaison pilotes : la carte du circuit ne propose
+  plus que la vitesse (frein, throttle, rapport et DRS retirés), et les onglets
+  ⭕ Diagramme g-g et 🕸️ Radar multi-pilotes disparaissent, avec leurs helpers.
+- ORDRE des onglets revu : feuille des temps, overlay, puis le déroulé de la
+  course (évolution, race craft, secteurs), puis les analyses fines.
 - SÉANCES du week-end : le sélecteur ne propose plus que les sessions
   réellement au programme (`sessions_of_event`). Un week-end sprint n'a qu'un
   essai libre — proposer « Essais Libres 2 » y menait droit à une erreur de
@@ -998,6 +1013,41 @@ def default_gp_index(sched):
     return 0
 
 
+def track_points(tel, valeurs, n=1800):
+    """Tracé dense (X, Y, valeur) pour colorier le circuit point par point.
+
+    Deux problèmes se cumulaient sur les cartes : les points sans position
+    (le flux `location` d'OpenF1 a des trous) apparaissaient comme des
+    marqueurs isolés, et la cadence brute — ~3,7 Hz, soit quelques centaines
+    de points par tour — ne suffit pas à faire un tracé continu là où FastF1
+    en fournit des milliers. On écarte donc les points sans position, puis on
+    ré-échantillonne le long de la DISTANCE parcourue : la densité du rendu
+    ne dépend plus de la cadence de la source.
+
+    Interpoler sur la distance plutôt que sur le temps garde un pas
+    géométrique régulier — sinon les lignes droites, avalées vite, ressortent
+    clairsemées face aux virages lents."""
+    x, y = _rotate_xy(tel["X"], tel["Y"])
+    v = np.asarray(valeurs, dtype="float64")
+    d = np.asarray(tel["Distance"], dtype="float64")
+    x, y = np.asarray(x, dtype="float64"), np.asarray(y, dtype="float64")
+
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(v) & np.isfinite(d)
+    x, y, v, d = x[ok], y[ok], v[ok], d[ok]
+    if len(d) < 2:
+        return x, y, v
+    # np.interp exige une abscisse strictement croissante : la distance stagne
+    # quand la voiture est presque à l'arrêt, d'où le dédoublonnage.
+    d, garde = np.unique(d, return_index=True)
+    x, y, v = x[garde], y[garde], v[garde]
+    if len(d) < 2:
+        return x, y, v
+    if len(d) >= n:
+        return x, y, v
+    grille = np.linspace(d[0], d[-1], n)
+    return np.interp(grille, d, x), np.interp(grille, d, y), np.interp(grille, d, v)
+
+
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 SPRINT_POINTS = {1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1}
 
@@ -1203,86 +1253,6 @@ def style_sig(tel, name):
     brake_diff = np.diff((tel["Brake"] > 0).astype(int))
     sig["Nb phases de freinage"] = int((brake_diff == 1).sum())
     return sig
-
-
-# ============== HELPERS DIAGRAMME G-G ==============
-def compute_gg(lap, ds=2.0, window_m=40.0):
-    """Accélérations latérale et longitudinale (en g) le long d'un tour.
-
-    - a_long = v·dv/ds : dérivée spatiale de la vitesse lissée.
-    - a_lat  = v²·κ : courbure κ calculée depuis X/Y resamplés en distance
-      (Savitzky-Golay deriv 1 et 2). ⚠️ X/Y FastF1 sont en 1/10 de mètre
-      → division par 10 obligatoire, sinon a_lat est fausse d'un facteur 10.
-
-    Le flux position est du GPS ~4-5 Hz interpolé : valeurs absolues
-    indicatives (±10-15 %, dénivelé non pris en compte), mais la comparaison
-    entre deux pilotes sur le même tracé reste valide.
-    Retourne dict {a_lat, a_long, s} en g / g / m, ou None si données insuffisantes.
-    """
-    tel = lap.get_telemetry().dropna(subset=["X", "Y", "Speed", "Distance"])
-    if len(tel) < 30:
-        return None
-    s_raw = tel["Distance"].values.astype(float)
-    keep = np.diff(s_raw, prepend=s_raw[0] - 1.0) > 0  # interp exige s strictement croissant
-    s_raw = s_raw[keep]
-    x_raw = tel["X"].values.astype(float)[keep] / 10.0
-    y_raw = tel["Y"].values.astype(float)[keep] / 10.0
-    v_raw = tel["Speed"].values.astype(float)[keep] / 3.6
-
-    # Resampling uniforme en distance → dérivées spatiales propres
-    s = np.arange(s_raw[0], s_raw[-1], ds)
-    if len(s) < 50:
-        return None
-    x = np.interp(s, s_raw, x_raw)
-    y = np.interp(s, s_raw, y_raw)
-    v = np.interp(s, s_raw, v_raw)
-
-    win = int(window_m / ds)
-    win = max(7, win + (win % 2 == 0))  # fenêtre impaire, >= 7 points
-
-    dx = savgol_filter(x, win, 3, deriv=1, delta=ds)
-    ddx = savgol_filter(x, win, 3, deriv=2, delta=ds)
-    dy = savgol_filter(y, win, 3, deriv=1, delta=ds)
-    ddy = savgol_filter(y, win, 3, deriv=2, delta=ds)
-    denom = np.power(dx * dx + dy * dy, 1.5)
-    denom[denom < 1e-9] = 1e-9
-    kappa = (dx * ddy - dy * ddx) / denom  # courbure signée (gauche/droite)
-
-    v_s = savgol_filter(v, win, 3)
-    dv = savgol_filter(v, win, 3, deriv=1, delta=ds)
-    a_long = v_s * dv / 9.81
-    a_lat = v_s ** 2 * kappa / 9.81
-
-    # Bords du lissage + artefacts GPS : on écarte les extrémités du tour
-    # et les valeurs physiquement irréalistes pour une F1
-    trim = win
-    a_lat, a_long, s_out, v_out = a_lat[trim:-trim], a_long[trim:-trim], s[trim:-trim], v_s[trim:-trim]
-    ok = (np.abs(a_lat) < 6.5) & (a_long > -7.0) & (a_long < 3.0) & (v_out > 8.0)
-    if ok.sum() < 50:
-        return None
-    return {"a_lat": a_lat[ok], "a_long": a_long[ok], "s": s_out[ok]}
-
-
-def gg_envelope(a_lat, a_long, n_bins=36, q=95):
-    """Enveloppe du nuage g-g : percentile q du rayon par secteur angulaire.
-    Rend les deux pilotes comparables d'un coup d'œil là où deux nuages
-    superposés sont illisibles. Retourne (x, y) du polygone fermé, ou None."""
-    theta = np.arctan2(a_long, a_lat)
-    r = np.hypot(a_lat, a_long)
-    bins = np.linspace(-np.pi, np.pi, n_bins + 1)
-    idx = np.digitize(theta, bins) - 1
-    centers, radii = [], []
-    for b in range(n_bins):
-        m = idx == b
-        if m.sum() >= 3:
-            centers.append((bins[b] + bins[b + 1]) / 2)
-            radii.append(float(np.percentile(r[m], q)))
-    if len(centers) < 8:
-        return None
-    centers.append(centers[0])
-    radii.append(radii[0])  # ferme le polygone
-    c, rr = np.array(centers), np.array(radii)
-    return rr * np.cos(c), rr * np.sin(c)
 
 
 # ============== CACHED LOADERS ==============
@@ -2118,8 +2088,8 @@ isolée.*
 # ============== PAGE : ANALYSE DU STYLE ==============
 def page_style():
     """Page d'analyse du style de pilotage : sélection de deux pilotes et de
-    leurs tours, puis les onglets d'analyse (overlay, delta, g-g, feuille des
-    temps, etc.). Les widgets sidebar de cette page (pilotes, tours) ne sont
+    leurs tours, puis les onglets d'analyse (feuille des temps, overlay,
+    évolution course, etc.). Les widgets sidebar de cette page (pilotes, tours) ne sont
     créés que lorsqu'elle est active."""
     if not _ensure_session():
         return
@@ -2350,20 +2320,23 @@ def page_style():
     col4.metric("Circuit", f"{tel1['Distance'].max():.0f} m")
 
     # ============== TABS ==============
-    tab_sheet, tab1, tab_map, tab2, tab_corners, tab3, tab_gg, tab4, tab5, tab_stint, tab_craft, tab_fit, tab6, tab_radio = st.tabs([
+    # L'ordre des onglets est celui de la lecture d'une session : les temps,
+    # puis la comparaison des deux tours, puis le déroulé de la course, puis
+    # les analyses fines. Les blocs `with tabX` plus bas peuvent rester dans
+    # n'importe quel ordre — seule cette liste décide de l'affichage.
+    (tab_sheet, tab1, tab_stint, tab_craft, tab5, tab_map, tab2, tab_corners,
+     tab3, tab4, tab_fit, tab_radio) = st.tabs([
         "📋 Feuille des temps",
         "🎯 Overlay télémétrie",
+        "📈 Évolution course",
+        "🥊 Race craft",
+        "📊 Secteurs",
         "🗺️ Vue circuit",
         "⏱️ Delta time",
         "🧠 Virage par virage",
         "🎨 Signatures de style",
-        "⭕ Diagramme g-g",
         "🔍 Zoom virage",
-        "📊 Secteurs",
-        "📈 Évolution course",
-        "🥊 Race craft",
         "🏟️ Auto vs circuit",
-        "🕸️ Radar multi-pilotes",
         "📻 Radios",
     ])
 
@@ -2627,27 +2600,18 @@ def page_style():
 
     # --- TAB MAP : VUE CIRCUIT ---
     with tab_map:
-        st.markdown("Le tracé du circuit, colorié selon le paramètre choisi. Repère **où** chaque pilote roule fort, où il freine, où il prend du temps.")
+        st.markdown("Le tracé du circuit, colorié par la **vitesse**. Repère **où** chaque pilote roule fort, où il freine, où il prend du temps.")
 
         # Télémétrie complète avec X/Y (position GPS sur le tracé)
         tel1_full = lap1.get_telemetry()
         tel2_full = lap2.get_telemetry()
 
-        color_by = st.radio(
-            "Colorer par",
-            options=["Speed", "Throttle", "Brake", "nGear", "DRS"],
-            format_func=lambda x: {"Speed": "Vitesse", "Throttle": "Throttle",
-                                   "Brake": "Frein", "nGear": "Rapport",
-                                   "DRS": "DRS ouvert"}[x],
-            horizontal=True,
-            key="map_color_by",
-        )
-
-        # Échelle commune aux deux pilotes pour comparabilité
+        color_by = "Speed"
         vals1, vals2 = _chan(tel1_full, color_by), _chan(tel2_full, color_by)
+        # Échelle commune aux deux pilotes pour comparabilité
         vmin = float(min(vals1.min(), vals2.min()))
         vmax = float(max(vals1.max(), vals2.max()))
-        colorscale = "Plasma" if color_by == "Speed" else "Viridis"
+        colorscale = "Plasma"
 
         # Côte à côte sur desktop, empilés en mode compact (sinon chaque tracé
         # devient un timbre-poste sur un écran de téléphone)
@@ -2665,12 +2629,12 @@ def page_style():
             )
         for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
             r, c = (i, 1) if MOBILE else (1, i)
-            xr, yr = _rotate_xy(tel["X"], tel["Y"])
+            xr, yr, vr = track_points(tel, vals)
             fig_map.add_trace(go.Scatter(
                 x=xr, y=yr,
                 mode="markers",
                 marker=dict(
-                    color=vals,
+                    color=vr,
                     colorscale=colorscale,
                     cmin=vmin, cmax=vmax,
                     size=4,
@@ -2722,12 +2686,12 @@ def page_style():
         # Échelle symétrique pour que 0 = blanc soit toujours au milieu
         abs_max = float(np.percentile(np.abs(speed_delta), 95))  # robuste aux outliers
 
-        xb, yb = _rotate_xy(tel1_full["X"], tel1_full["Y"])
+        xb, yb, db = track_points(tel1_full, speed_delta)
         fig_battle = go.Figure(go.Scatter(
             x=xb, y=yb,
             mode="markers",
             marker=dict(
-                color=speed_delta,
+                color=db,
                 colorscale=custom_scale,
                 cmin=-abs_max, cmax=abs_max,
                 size=6,
@@ -3051,119 +3015,6 @@ def page_style():
             - **`V_min médiane courbes`** élevée = style **momentum** (porte de la vitesse en courbe, Norris, Hamilton). Basse = style **rotation** (V-shape, Verstappen).
             - **`Nb phases de freinage`** : indicateur indirect du nombre de virages où on freine. Diffère peu entre 2 pilotes sur même circuit, mais utile pour repérer des freinages "manqués" ou ajoutés.
             """)
-
-    # --- TAB GG : DIAGRAMME G-G (CERCLE DE FRICTION) ---
-    with tab_gg:
-        st.markdown(
-            "Le **cercle de friction** : accélération latérale vs longitudinale sur tout le tour. "
-            "C'est la représentation canonique du style de pilotage — un pilote *V-shape* dessine "
-            "une croix (freinage roues droites, puis rotation), un pilote *momentum* remplit les "
-            "diagonales basses (trail-braking = frein et charge latérale simultanés). "
-            "Basé sur les tours sélectionnés dans la barre latérale."
-        )
-
-        gg1 = gg2 = None
-        try:
-            with st.spinner("Reconstruction des accélérations…"):
-                gg1 = compute_gg(lap1)
-                gg2 = compute_gg(lap2)
-        except Exception as e:
-            st.warning(f"Impossible de calculer le diagramme g-g : {e}")
-
-        if gg1 is None or gg2 is None:
-            if gg1 is not None or gg2 is not None:
-                st.warning("Flux position X/Y insuffisant pour un des deux tours — "
-                           "essaie un autre tour ou une autre session.")
-        else:
-            fig_gg = go.Figure()
-
-            # Cercles de référence 1 à 5 g
-            for r in range(1, 6):
-                fig_gg.add_shape(type="circle", x0=-r, y0=-r, x1=r, y1=r,
-                                 line=dict(color="rgba(255,255,255,0.15)", width=1, dash="dot"))
-                fig_gg.add_annotation(x=0, y=r, text=f"{r}g", showarrow=False, yshift=8,
-                                      font=dict(color="rgba(255,255,255,0.35)", size=10))
-
-            for gg, drv, col in [(gg1, d1, c1), (gg2, d2, c2)]:
-                fig_gg.add_trace(go.Scatter(
-                    x=gg["a_lat"], y=gg["a_long"], mode="markers",
-                    marker=dict(color=col, size=3, opacity=0.25),
-                    name=f"{drv} — points", legendgroup=drv,
-                    customdata=gg["s"],
-                    hovertemplate=(f"<b>{drv}</b><br>Distance: %{{customdata:.0f}} m<br>"
-                                   "a_lat: %{x:+.2f} g<br>a_long: %{y:+.2f} g<extra></extra>"),
-                ))
-                env = gg_envelope(gg["a_lat"], gg["a_long"])
-                if env is not None:
-                    fig_gg.add_trace(go.Scatter(
-                        x=env[0], y=env[1], mode="lines",
-                        line=dict(color=col, width=2.5),
-                        name=f"{drv} — enveloppe p95", legendgroup=drv,
-                        hoverinfo="skip",
-                    ))
-
-            fig_gg.update_xaxes(title="Accélération latérale (g) · gauche ← → droite",
-                                scaleanchor="y", scaleratio=1,
-                                zeroline=True, zerolinecolor="rgba(255,255,255,0.3)")
-            fig_gg.update_yaxes(title="Accélération longitudinale (g) · ↓ freinage / traction ↑",
-                                zeroline=True, zerolinecolor="rgba(255,255,255,0.3)")
-            fig_gg.update_layout(height=700, template="plotly_dark",
-                                 legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center"),
-                                 margin=dict(t=30, b=20, l=20, r=20))
-            plot(fig_gg)
-
-            # --- Métriques dérivées ---
-            def gg_metrics(gg):
-                a_lat, a_long = gg["a_lat"], gg["a_long"]
-                braking = a_long < -1.0                       # freinage effectif
-                trail = braking & (np.abs(a_lat) > 1.5)       # freinage en appui = trail-braking
-                neg = a_long[a_long < 0]
-                return {
-                    "g_brake": float(np.percentile(-neg, 99)) if neg.size else np.nan,
-                    "g_lat": float(np.percentile(np.abs(a_lat), 99)),
-                    "trail_pct": float(trail.sum() / braking.sum() * 100) if braking.any() else np.nan,
-                }
-
-            def _fmt(v, unit):
-                return f"{v:.2f}{unit}" if pd.notna(v) else "—"
-
-            met1, met2 = gg_metrics(gg1), gg_metrics(gg2)
-            col_a, col_b = st.columns(2)
-            for col, drv, met in [(col_a, d1, met1), (col_b, d2, met2)]:
-                with col:
-                    st.markdown(f"#### {drv}")
-                    st.metric("g freinage max (p99)", _fmt(met["g_brake"], " g"))
-                    st.metric("g latéral max (p99)", _fmt(met["g_lat"], " g"))
-                    st.metric("Trail-braking (part du freinage avec >1.5 g latéral)",
-                              f"{met['trail_pct']:.0f} %" if pd.notna(met["trail_pct"]) else "—")
-
-            with st.expander("💡 Comment lire le diagramme g-g (et limites)"):
-                st.markdown(f"""
-                **Les deux archétypes** :
-                - **V-shape (rotation)** : croix marquée — le gros du freinage se fait roues
-                  droites (branche basse pure), la rotation à basse vitesse, puis traction.
-                  Diagonales basses peu remplies, % trail-braking bas. Signature typique Verstappen.
-                - **Momentum** : diagonales basses remplies — le pilote garde du frein en entrée
-                  de virage pendant que la charge latérale monte. Enveloppe plus « ronde »,
-                  % trail-braking élevé. Signature Norris / Hamilton.
-
-                **À croiser avec** :
-                - l'onglet **🧠 Virage par virage** : % trail-braking élevé + freinages tardifs
-                  = late braker qui gère la rotation au frein. % bas + vmin élevées = momentum
-                  pur qui prépare ses entrées.
-                - l'**asymétrie gauche/droite** du nuage reflète simplement le circuit
-                  (sens de rotation, répartition des virages) — comparez la *forme*, pas
-                  l'orientation.
-                - l'**enveloppe p95** : si celle de {d1} englobe celle de {d2} dans un quadrant,
-                  {d1} exploite plus de grip dans cette phase (ou sa voiture en offre plus).
-
-                ⚠️ **Limites** : position GPS ~4-5 Hz interpolée → les valeurs absolues sont
-                indicatives (±10-15 %), le dénivelé n'est pas pris en compte (la compression
-                d'Eau Rouge gonfle localement les g) et le lissage écrête les pics très brefs.
-                La **comparaison relative** entre deux pilotes sur le même tour reste valide —
-                c'est l'usage prévu. Comme pour l'onglet virage par virage : lisez les
-                tendances, pas le centième.
-                """)
 
     # --- TAB 4 : ZOOM ---
     with tab4:
@@ -3714,82 +3565,6 @@ def page_style():
                 classique : sélectionner les deux **coéquipiers** dans la barre latérale
                 (même voiture) et regarder l'onglet *Virage par virage*.
                 """)
-
-    # --- TAB 6 : RADAR ---
-    with tab6:
-        st.markdown("Compare jusqu'à 6 pilotes en visu radar. Idéal pour repérer des archétypes opposés.")
-
-        # FIX : si d1/d2 est NOR, HAM ou ALO, la liste par défaut contenait un doublon
-        # → index dupliqué après set_index("Pilote") → df_n.loc[drv] renvoyait un
-        # DataFrame (pas de .tolist()) → AttributeError. dict.fromkeys déduplique
-        # en préservant l'ordre.
-        default_radar = list(dict.fromkeys(
-            d for d in [d1, d2, "NOR", "HAM", "ALO"] if d in drivers_in_session
-        ))[:6]
-        drivers_radar = st.multiselect(
-            "Pilotes",
-            options=drivers_in_session,
-            default=default_radar,
-            max_selections=6,
-            format_func=lambda x: driver_full.get(x, x),
-        )
-        drivers_radar = list(dict.fromkeys(drivers_radar))  # ceinture + bretelles
-
-        if len(drivers_radar) < 2:
-            st.warning("Sélectionne au moins 2 pilotes.")
-        else:
-            def sig_for(drv):
-                lap = session.laps.pick_drivers(drv).pick_fastest()
-                if lap is None or pd.isna(lap.get("LapTime")):
-                    return None
-                tel = lap.get_car_data().add_distance()
-                # FIX : mean() d'un array vide → nan, et nan est truthy, donc
-                # l'ancien `... .mean() or 0` ne protégeait rien. Garde explicite.
-                dthr = np.diff(tel["Throttle"].values)
-                rising = dthr[dthr > 0]
-                ramp = float(rising.mean()) if rising.size else 0.0
-                return {
-                    "Pilote": drv,
-                    "Vmax": float(tel["Speed"].max()),
-                    "V_min courbes": float(tel.loc[tel["Speed"] < tel["Speed"].quantile(0.30), "Speed"].median()),
-                    "Full throttle %": float((tel["Throttle"] >= 99).mean() * 100),
-                    "Coast time %": float(((tel["Throttle"] < 5) & (tel["Brake"] == 0)).mean() * 100),
-                    "Brake %": float((tel["Brake"] > 0).mean() * 100),
-                    "Throttle ramp-up": ramp,
-                }
-
-            sigs = [s for s in (sig_for(d) for d in drivers_radar) if s is not None]
-            if not sigs:
-                st.error("Aucun pilote avec données valides.")
-            else:
-                df_m = pd.DataFrame(sigs).set_index("Pilote")
-                # Normalisation 0-1
-                df_n = (df_m - df_m.min()) / (df_m.max() - df_m.min() + 1e-9)
-
-                fig = go.Figure()
-                dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
-                for k, drv in enumerate(df_n.index):
-                    vals = df_n.loc[drv].tolist()
-                    vals += vals[:1]
-                    labels = df_n.columns.tolist() + [df_n.columns[0]]
-                    fig.add_trace(go.Scatterpolar(
-                        r=vals, theta=labels, fill="toself",
-                        name=drv,
-                        # tiret différent par trace : deux coéquipiers (même
-                        # couleur équipe) restent discernables
-                        line=dict(color=driver_color(drv), width=2,
-                                  dash=dashes[k % len(dashes)]),
-                        opacity=0.7,
-                    ))
-                fig.update_layout(
-                    height=600, template="plotly_dark",
-                    polar=dict(radialaxis=dict(visible=True, range=[0, 1], showticklabels=False)),
-                    title="Signatures de style — comparaison normalisée",
-                )
-                plot(fig)
-
-                with st.expander("Valeurs brutes"):
-                    st.dataframe(df_m.round(2), width="stretch")
 
     # --- TAB RADIO : RADIOS D'ÉQUIPE ---
     with tab_radio:
