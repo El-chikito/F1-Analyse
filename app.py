@@ -14,6 +14,14 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- SUITE carte du circuit : tracé encore pointillé après le premier correctif.
+  Densité portée à 3000 points, marqueurs agrandis (4 → 7, battle map 6 → 8),
+  et surtout `track_points()` COUPE désormais le tracé au-delà de 80 m sans
+  position au lieu de relier les deux bords par une corde droite en travers du
+  circuit — une corde se lit comme un tracé réel alors qu'elle est inventée.
+  Panneau 🩺 « Densité du tracé » sous la carte : nombre de points réellement
+  tracés et part du tour couverte par des positions, pour distinguer d'un coup
+  d'œil un problème de rendu d'une source lacunaire.
 - FIX carte du circuit (« Vue circuit ») réduite à quelques marqueurs épars au
   lieu d'un tracé continu. Deux causes cumulées : `_merge_location` appariait
   chaque point de télémétrie à la position la PLUS PROCHE, si bien que des
@@ -1013,7 +1021,7 @@ def default_gp_index(sched):
     return 0
 
 
-def track_points(tel, valeurs, n=1800):
+def track_points(tel, valeurs, n=3000, trou_max=80.0):
     """Tracé dense (X, Y, valeur) pour colorier le circuit point par point.
 
     Deux problèmes se cumulaient sur les cartes : les points sans position
@@ -1026,7 +1034,15 @@ def track_points(tel, valeurs, n=1800):
 
     Interpoler sur la distance plutôt que sur le temps garde un pas
     géométrique régulier — sinon les lignes droites, avalées vite, ressortent
-    clairsemées face aux virages lents."""
+    clairsemées face aux virages lents.
+
+    `trou_max` (en mètres) coupe le tracé là où la source n'a plus de position :
+    au-delà, l'interpolation relierait deux points éloignés par une CORDE toute
+    droite en travers du circuit, qui se lit comme un tracé réel alors qu'elle
+    est inventée. Un trou visible est honnête, une corde ne l'est pas.
+
+    Renvoie (x, y, valeurs) — avec des NaN aux endroits coupés, que Plotly
+    laisse simplement vides."""
     x, y = _rotate_xy(tel["X"], tel["Y"])
     v = np.asarray(valeurs, dtype="float64")
     d = np.asarray(tel["Distance"], dtype="float64")
@@ -1040,12 +1056,22 @@ def track_points(tel, valeurs, n=1800):
     # quand la voiture est presque à l'arrêt, d'où le dédoublonnage.
     d, garde = np.unique(d, return_index=True)
     x, y, v = x[garde], y[garde], v[garde]
-    if len(d) < 2:
+    if len(d) < 2 or len(d) >= n:
         return x, y, v
-    if len(d) >= n:
-        return x, y, v
+
     grille = np.linspace(d[0], d[-1], n)
-    return np.interp(grille, d, x), np.interp(grille, d, y), np.interp(grille, d, v)
+    xi = np.interp(grille, d, x)
+    yi = np.interp(grille, d, y)
+    vi = np.interp(grille, d, v)
+
+    # Coupe les segments interpolés à travers un trou de la source
+    ecarts = np.diff(d)
+    troues = np.flatnonzero(ecarts > trou_max)
+    for i in troues:
+        dans_le_trou = (grille > d[i]) & (grille < d[i + 1])
+        xi[dans_le_trou] = np.nan
+        yi[dans_le_trou] = np.nan
+    return xi, yi, vi
 
 
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
@@ -2627,9 +2653,12 @@ def page_style():
                 subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
                 horizontal_spacing=0.04,
             )
+        densite = {}
         for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
             r, c = (i, 1) if MOBILE else (1, i)
             xr, yr, vr = track_points(tel, vals)
+            densite[(d1, d2)[i - 1]] = (int(np.isfinite(xr).sum()),
+                                        int(tel["X"].notna().sum()), len(tel))
             fig_map.add_trace(go.Scatter(
                 x=xr, y=yr,
                 mode="markers",
@@ -2637,7 +2666,7 @@ def page_style():
                     color=vr,
                     colorscale=colorscale,
                     cmin=vmin, cmax=vmax,
-                    size=4,
+                    size=7,
                     showscale=(i == 2),
                     colorbar=dict(
                         title=dict(text=color_by, side="right"),
@@ -2660,6 +2689,24 @@ def page_style():
         fig_map.update_layout(height=850 if MOBILE else 550, template="plotly_dark",
                               margin=dict(t=50, b=20, l=20, r=80))
         plot(fig_map)
+        # Densité réelle du tracé : si la carte paraît pointillée ou trouée,
+        # c'est ici qu'on voit si la source fournit assez de positions ou si
+        # c'est le rendu qui est en cause.
+        with st.expander("🩺 Densité du tracé"):
+            for code, (traces, positionnes, total) in densite.items():
+                st.write(
+                    f"**{code}** — {traces} points tracés · {positionnes}/{total} "
+                    f"points de télémétrie avec une position "
+                    f"({positionnes / total:.0%} du tour)"
+                )
+            st.caption(
+                "« points tracés » doit valoir quelques milliers pour un tracé "
+                "continu. S'il tombe au niveau du nombre de points de télémétrie, "
+                "le ré-échantillonnage ne s'applique pas. Si la part de points "
+                "positionnés est faible, c'est le flux de positions de la source "
+                "qui est lacunaire — le tracé aura alors des trous, volontairement "
+                "laissés vides plutôt que comblés par une ligne droite inventée."
+            )
 
         # --- Battle map : qui est plus rapide à chaque endroit du tracé ---
         st.markdown("---")
@@ -2694,7 +2741,7 @@ def page_style():
                 color=db,
                 colorscale=custom_scale,
                 cmin=-abs_max, cmax=abs_max,
-                size=6,
+                size=8,
                 colorbar=dict(
                     title=dict(text="Δ vitesse<br>(km/h)", side="right"),
                     thickness=12,
