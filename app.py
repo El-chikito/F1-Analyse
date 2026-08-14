@@ -14,6 +14,17 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- VUE CIRCUIT réduite à la seule carte des écarts de vitesse (« qui est plus
+  rapide, où »). Les deux tracés par pilote et la heatmap de gain de temps
+  sont retirés.
+- FIN du hachurage : le tracé est désormais un RUBAN de segments colorés
+  (`track_ribbon`) et non plus une file de marqueurs. Des marqueurs ronds
+  laissent forcément des vides entre eux quelle que soit leur densité —
+  c'était la cause de fond. Plotly ne sait pas colorier une ligne point par
+  point, mais il sait tracer plusieurs lignes : les segments sont répartis en
+  28 paliers de couleur, chaque palier devenant une trace dont les segments
+  sont séparés par des NaN. Une couche de marqueurs transparents rend
+  l'infobulle, une trace vide porte l'échelle de couleurs.
 - FIN carte du circuit : le tracé sortait en POLYGONE (segments droits, angles
   vifs) et hachuré par endroits. Deux causes, l'une dans chaque module.
   · Adaptateur : les positions étaient interpolées LINÉAIREMENT entre les
@@ -247,6 +258,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import savgol_filter
@@ -1102,6 +1114,56 @@ def track_points(tel, valeurs, n=3000, trou_max=None):
         xi[dans_le_trou] = np.nan
         yi[dans_le_trou] = np.nan
     return xi, yi, vi
+
+
+def track_ribbon(x, y, v, colorscale, vmin, vmax, n_bins=28, width=7):
+    """Tracé du circuit en RUBAN continu colorié par `v`.
+
+    Des marqueurs ronds laissent forcément des vides entre eux — d'où l'aspect
+    hachuré, quelle que soit leur densité. Plotly ne sait pas colorier une
+    ligne point par point, mais il sait tracer plusieurs lignes : on répartit
+    donc les segments en `n_bins` paliers de couleur, et chaque palier devient
+    UNE trace ligne dont les segments sont séparés par des NaN. Résultat : un
+    ruban plein, en une trentaine de traces au lieu de milliers.
+
+    Renvoie la liste des traces (segments + porte-échelle invisible)."""
+    fini = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+    bornes = np.linspace(vmin, vmax, n_bins + 1)
+    milieux = (bornes[:-1] + bornes[1:]) / 2
+    couleurs = sample_colorscale(
+        colorscale, [(m - vmin) / (vmax - vmin) if vmax > vmin else 0.5 for m in milieux])
+    # Le palier d'un segment est celui de son point de départ
+    palier = np.clip(np.digitize(v, bornes) - 1, 0, n_bins - 1)
+    # Un segment n'est traçable que si ses deux extrémités le sont : c'est ce
+    # qui préserve les coupures voulues (trous du flux de positions).
+    traçable = fini[:-1] & fini[1:]
+
+    traces = []
+    for b in range(n_bins):
+        sel = np.flatnonzero(traçable & (palier[:-1] == b))
+        if not len(sel):
+            continue
+        xs = np.empty(len(sel) * 3)
+        ys = np.empty(len(sel) * 3)
+        xs[0::3], xs[1::3], xs[2::3] = x[sel], x[sel + 1], np.nan
+        ys[0::3], ys[1::3], ys[2::3] = y[sel], y[sel + 1], np.nan
+        traces.append(go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color=couleurs[b], width=width),
+            showlegend=False, hoverinfo="skip",
+        ))
+    return traces
+
+
+def colorbar_trace(colorscale, vmin, vmax, titre):
+    """Trace vide dont le seul rôle est d'afficher l'échelle de couleurs.
+    Les traces `lines` de `track_ribbon` n'en portent pas."""
+    return go.Scatter(
+        x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
+        marker=dict(colorscale=colorscale, cmin=vmin, cmax=vmax, color=[vmin],
+                    showscale=True, opacity=0,
+                    colorbar=dict(title=dict(text=titre, side="right"), thickness=12)),
+    )
 
 
 RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
@@ -2656,102 +2718,21 @@ def page_style():
 
     # --- TAB MAP : VUE CIRCUIT ---
     with tab_map:
-        st.markdown("Le tracé du circuit, colorié par la **vitesse**. Repère **où** chaque pilote roule fort, où il freine, où il prend du temps.")
-
-        # Télémétrie complète avec X/Y (position GPS sur le tracé)
-        tel1_full = lap1.get_telemetry()
-        tel2_full = lap2.get_telemetry()
-
-        color_by = "Speed"
-        vals1, vals2 = _chan(tel1_full, color_by), _chan(tel2_full, color_by)
-        # Échelle commune aux deux pilotes pour comparabilité
-        vmin = float(min(vals1.min(), vals2.min()))
-        vmax = float(max(vals1.max(), vals2.max()))
-        colorscale = "Plasma"
-
-        # Côte à côte sur desktop, empilés en mode compact (sinon chaque tracé
-        # devient un timbre-poste sur un écran de téléphone)
-        if MOBILE:
-            fig_map = make_subplots(
-                rows=2, cols=1,
-                subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
-                vertical_spacing=0.06,
-            )
-        else:
-            fig_map = make_subplots(
-                rows=1, cols=2,
-                subplot_titles=(f"<b>{d1}</b>", f"<b>{d2}</b>"),
-                horizontal_spacing=0.04,
-            )
-        densite = {}
-        for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
-            r, c = (i, 1) if MOBILE else (1, i)
-            xr, yr, vr = track_points(tel, vals)
-            densite[(d1, d2)[i - 1]] = (int(np.isfinite(xr).sum()), len(xr),
-                                        int(tel["X"].notna().sum()), len(tel))
-            fig_map.add_trace(go.Scatter(
-                x=xr, y=yr,
-                mode="lines+markers",
-                # La ligne garantit un tracé continu quelle que soit la densité
-                # des marqueurs ; la couleur, elle, reste portée par les points.
-                line=dict(color="rgba(255,255,255,0.18)", width=1),
-                connectgaps=False,   # les trous coupés doivent rester des trous
-                marker=dict(
-                    color=vr,
-                    colorscale=colorscale,
-                    cmin=vmin, cmax=vmax,
-                    size=7,
-                    showscale=(i == 2),
-                    colorbar=dict(
-                        title=dict(text=color_by, side="right"),
-                        thickness=12, x=1.02,
-                    ) if i == 2 else None,
-                ),
-                showlegend=False,
-                hovertemplate=f"{color_by}: %{{marker.color:.0f}}<extra></extra>",
-            ), row=r, col=c)
-            _add_corner_labels(fig_map, row=r, col=c)
-        # Aspect ratio égal pour ne pas déformer le tracé
-        # (le subplot i utilise les axes x{i}/y{i} quelle que soit l'orientation)
-        for i in (1, 2):
-            r, c = (i, 1) if MOBILE else (1, i)
-            fig_map.update_xaxes(scaleanchor=f"y{i if i > 1 else ''}", scaleratio=1,
-                                 showticklabels=False, showgrid=False, zeroline=False,
-                                 row=r, col=c)
-            fig_map.update_yaxes(showticklabels=False, showgrid=False, zeroline=False,
-                                 row=r, col=c)
-        fig_map.update_layout(height=850 if MOBILE else 550, template="plotly_dark",
-                              margin=dict(t=50, b=20, l=20, r=80))
-        plot(fig_map)
-        # Densité réelle du tracé : si la carte paraît pointillée ou trouée,
-        # c'est ici qu'on voit si la source fournit assez de positions ou si
-        # c'est le rendu qui est en cause.
-        with st.expander("🩺 Densité du tracé"):
-            for code, (traces, grille, positionnes, total) in densite.items():
-                st.write(
-                    f"**{code}** — {traces}/{grille} points tracés "
-                    f"({grille - traces} coupés) · {positionnes}/{total} points de "
-                    f"télémétrie avec une position ({positionnes / total:.0%} du tour)"
-                )
-            st.caption(
-                "**points tracés** doit valoir quelques milliers pour un tracé "
-                "continu ; s'il tombe au niveau du nombre de points de télémétrie, "
-                "le ré-échantillonnage ne s'applique pas. **coupés** = portions "
-                "laissées vides parce que la source n'y a pas de position : "
-                "beaucoup de coupures donnent un tracé en pointillé. Une part de "
-                "points positionnés faible désigne un flux de positions lacunaire "
-                "à la source."
-            )
-
-        # --- Battle map : qui est plus rapide à chaque endroit du tracé ---
-        st.markdown("---")
-        st.markdown("#### ⚔️ Battle map — qui est plus rapide à chaque point du tracé")
+        st.markdown(
+            "Le tracé du circuit, colorié par l'**écart de vitesse** entre les deux "
+            "pilotes : où chacun est plus rapide, mètre par mètre."
+        )
         st.caption(
             f"Couleur {d1} = {d1} plus rapide à ce point · Couleur {d2} = {d2} plus rapide · "
             f"Blanc = égalité. L'intensité de la couleur = ampleur de l'écart."
         )
 
-        # Interpole la vitesse de tel2 sur la grille de distance de tel1 pour pouvoir comparer
+        # Télémétrie complète avec X/Y (position GPS sur le tracé)
+        tel1_full = lap1.get_telemetry()
+        tel2_full = lap2.get_telemetry()
+
+        # Vitesse de tel2 ramenée sur la grille de distance de tel1, sans quoi les
+        # deux tours ne sont pas comparables point à point
         tel2_speed_aligned = np.interp(
             tel1_full["Distance"].values,
             tel2_full["Distance"].values,
@@ -2759,33 +2740,32 @@ def page_style():
         )
         speed_delta = tel1_full["Speed"].values - tel2_speed_aligned
 
-        # Custom colorscale : c2 (négatif, d2 plus rapide) → blanc (0) → c1 (positif, d1 plus rapide)
+        # Échelle divergente : c2 (négatif, d2 devant) → blanc (0) → c1 (positif)
         custom_scale = [
             [0.0, hex_to_rgb_str(c2)],
             [0.5, "rgb(255,255,255)"],
             [1.0, hex_to_rgb_str(c1)],
         ]
-        # Échelle symétrique pour que 0 = blanc soit toujours au milieu
+        # Bornes symétriques pour que le blanc tombe toujours sur l'égalité
         abs_max = float(np.percentile(np.abs(speed_delta), 95))  # robuste aux outliers
 
         xb, yb, db = track_points(tel1_full, speed_delta)
-        fig_battle = go.Figure(go.Scatter(
-            x=xb, y=yb,
-            mode="lines+markers",
-            line=dict(color="rgba(255,255,255,0.18)", width=1),
-            connectgaps=False,
-            marker=dict(
-                color=db,
-                colorscale=custom_scale,
-                cmin=-abs_max, cmax=abs_max,
-                size=8,
-                colorbar=dict(
-                    title=dict(text="Δ vitesse<br>(km/h)", side="right"),
-                    thickness=12,
-                ),
-            ),
-            hovertemplate=f"Δ vitesse ({d1}−{d2}): %{{marker.color:+.1f}} km/h<extra></extra>",
+        fig_battle = go.Figure()
+        for trace in track_ribbon(xb, yb, db, custom_scale, -abs_max, abs_max,
+                                  width=9 if MOBILE else 7):
+            fig_battle.add_trace(trace)
+        # Le ruban est fait de lignes, qui ne portent ni infobulle ni échelle :
+        # une couche de marqueurs transparents rend le tap/survol, une trace
+        # vide porte la colorbar.
+        fig_battle.add_trace(go.Scatter(
+            x=xb, y=yb, mode="markers",
+            marker=dict(size=12, color="rgba(0,0,0,0)"),
+            showlegend=False,
+            customdata=db,
+            hovertemplate=f"Δ vitesse ({d1}−{d2}): %{{customdata:+.1f}} km/h<extra></extra>",
         ))
+        fig_battle.add_trace(colorbar_trace(custom_scale, -abs_max, abs_max,
+                                            "Δ vitesse<br>(km/h)"))
         _add_corner_labels(fig_battle)
         fig_battle.update_xaxes(scaleanchor="y", scaleratio=1,
                                 showticklabels=False, showgrid=False, zeroline=False)
@@ -2794,114 +2774,36 @@ def page_style():
                                  margin=dict(t=20, b=20, l=20, r=80))
         plot(fig_battle)
 
-        with st.expander("💡 Comment lire la battle map vitesse"):
+        with st.expander("💡 Comment la lire"):
             st.markdown(f"""
-            - **Zones colorées {d1}** : {d1} était plus rapide à cet endroit précis du tracé
-            - **Zones colorées {d2}** : {d2} était plus rapide
-            - **Zones blanches** : vitesses quasi identiques (égalité ou écart < 5 km/h)
-            - **L'intensité** : plus la couleur est saturée, plus l'écart est grand à cet endroit
+            - **Zones {d1}** : {d1} était plus rapide à cet endroit précis du tracé
+            - **Zones {d2}** : {d2} était plus rapide
+            - **Zones blanches** : vitesses quasi identiques
+            - **L'intensité** : plus la couleur est saturée, plus l'écart est grand
 
-            ⚠️ **Attention** : la vitesse ne dit pas tout. Un pilote peut être plus rapide à un point précis mais avoir perdu du temps juste avant. Pour ça, regarde la heatmap de gain de temps ci-dessous.
+            ⚠️ La vitesse ne dit pas tout : un pilote peut être plus rapide à un
+            point donné et avoir perdu du temps juste avant, en freinant trop tôt
+            ou en ratant son angle d'attaque. L'onglet **Delta time** montre, lui,
+            le temps réellement pris ou perdu.
             """)
 
-        # --- Heatmap de gain/perte de temps ---
-        st.markdown("---")
-        st.markdown("#### 🌡️ Heatmap du gain de temps — qui prend du temps, où exactement")
-        st.caption(
-            "Mesure le **gain de temps local** à chaque point du tracé (dérivée du delta time cumulé "
-            "par rapport à la distance, en ms par mètre). Bien plus parlant que la vitesse seule : "
-            "un pilote peut être plus rapide à un point mais avoir perdu du temps juste avant. "
-            "Ici on lit le **temps réellement gagné**, mètre par mètre."
-        )
-
-        try:
-            delta_t, ref_tel_dt, _ = delta_time(lap1, lap2)
-            dist_dt = np.asarray(ref_tel_dt["Distance"], dtype=float)
-            # Gain local en s/m : gradient PAR RAPPORT À LA DISTANCE — sinon un gain
-            # "par échantillon" est biaisé (un échantillon couvre plus de mètres à
-            # haute vitesse qu'à basse vitesse).
-            local_gain = np.gradient(np.asarray(delta_t, dtype=float), dist_dt)
-            local_gain = np.nan_to_num(local_gain, nan=0.0, posinf=0.0, neginf=0.0)
-            # Lissage léger pour atténuer le bruit
-            local_gain_smooth = uniform_filter1d(local_gain, size=15)
-
-            # FIX : delta_time() renvoie du car data SANS colonnes X/Y. Impossible de
-            # tracer ref_tel_dt["X"] directement (KeyError → l'ancienne version tombait
-            # systématiquement dans le except). On projette le gain sur la télémétrie
-            # complète de lap1, qui contient la position sur le tracé.
-            gain_ms = np.interp(tel1_full["Distance"].values, dist_dt, local_gain_smooth) * 1000
-
-            # Convention : delta = t(D2) − t(D1). delta > 0 = D1 devant (cumulé).
-            # gradient > 0 = l'avance de D1 grandit = D1 gagne du temps ici.
-            custom_scale_time = [
-                [0.0, hex_to_rgb_str(c2)],   # gradient < 0 = D2 gagne
-                [0.5, "rgb(255,255,255)"],
-                [1.0, hex_to_rgb_str(c1)],   # gradient > 0 = D1 gagne
-            ]
-            abs_max_gain = max(float(np.percentile(np.abs(gain_ms), 95)), 1e-3)  # garde-fou
-
-            xh, yh = _rotate_xy(tel1_full["X"], tel1_full["Y"])
-            fig_heat = go.Figure(go.Scatter(
-                x=xh, y=yh,
-                mode="markers",
-                marker=dict(
-                    color=gain_ms,
-                    colorscale=custom_scale_time,
-                    cmin=-abs_max_gain, cmax=abs_max_gain,
-                    size=6,
-                    colorbar=dict(
-                        title=dict(text="Gain local<br>(ms/m)", side="right"),
-                        thickness=12,
-                        tickformat=".1f",
-                    ),
-                ),
-                hovertemplate="Gain local: %{marker.color:+.2f} ms/m<extra></extra>",
-            ))
-            _add_corner_labels(fig_heat)
-            fig_heat.update_xaxes(scaleanchor="y", scaleratio=1,
-                                  showticklabels=False, showgrid=False, zeroline=False)
-            fig_heat.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
-            fig_heat.update_layout(height=600, template="plotly_dark",
-                                   margin=dict(t=20, b=20, l=20, r=80))
-            plot(fig_heat)
-
-            # Top zones de gain — dédupliquées (>=150 m entre deux zones), avec le
-            # virage le plus proche pour se repérer
-            gain_d1 = local_gain_smooth * 1000   # D1 gagne quand gradient > 0
-            gain_d2 = -gain_d1                   # D2 gagne quand gradient < 0
-            col_a, col_b = st.columns(2)
-            for col, drv, g in [(col_a, d1, gain_d1), (col_b, d2, gain_d2)]:
-                with col:
-                    st.markdown(f"**🔝 Top zones de gain pour {drv}**")
-                    idxs = _top_zones(g, dist_dt, k=3, min_sep=150.0)
-                    if not idxs:
-                        st.markdown("- Aucune zone de gain nette sur ce tour.")
-                    for i in idxs:
-                        st.markdown(
-                            f"- Distance {dist_dt[i]:.0f} m{_nearest_corner(dist_dt[i])} : "
-                            f"**+{g[i]:.1f} ms/m**"
-                        )
-
-            with st.expander("💡 Comment lire la heatmap de gain de temps"):
-                st.markdown(f"""
-                **C'est la visu la plus précise pour comprendre où la course se joue.**
-
-                - **Zone colorée {d1}** : {d1} **gagne du temps** sur ce mètre de circuit (que ce soit en étant plus rapide en vitesse ou en ayant un meilleur angle d'attaque qui ouvre la suite)
-                - **Zone colorée {d2}** : {d2} **gagne du temps** ici
-                - **Zone blanche** : ils sont à égalité sur ce micro-segment
-                - **Intensité** : ampleur du gain (en ms par **mètre** de circuit — comparable partout, y compris entre lignes droites et virages lents)
-
-                **Combo gagnant à analyser** :
-                1. Repère les **clusters** de couleur sur la heatmap (plusieurs dizaines de mètres consécutifs de même couleur)
-                2. Croise avec l'onglet **Overlay** pour comprendre **pourquoi** : freinage plus tardif ? throttle plus tôt ? vitesse mini plus haute ?
-                3. Ça te dit qu'à ce virage spécifique, ce pilote a un **avantage technique** précis
-
-                ⚠️ La différence fondamentale avec la battle map vitesse :
-                - **Battle map vitesse** : où chacun **roule plus vite** (peut être trompeur)
-                - **Heatmap gain temps** : où chacun **gagne réellement du temps** (la vérité au chrono)
-                """)
-        except Exception as e:
-            st.warning(f"Impossible de calculer la heatmap de gain : {e}")
+        # Densité réelle du tracé : si la carte paraît trouée, c'est ici qu'on
+        # voit si la source fournit assez de positions ou si c'est le rendu.
+        with st.expander("🩺 Densité du tracé"):
+            positionnes = int(tel1_full["X"].notna().sum())
+            total = len(tel1_full)
+            traces_ok = int(np.isfinite(xb).sum())
+            st.write(
+                f"**{d1}** — {traces_ok}/{len(xb)} points tracés "
+                f"({len(xb) - traces_ok} coupés) · {positionnes}/{total} points de "
+                f"télémétrie avec une position ({positionnes / total:.0%} du tour)"
+            )
+            st.caption(
+                "**coupés** = portions laissées vides parce que la source n'y a pas "
+                "de position, plutôt que comblées par une ligne droite inventée. "
+                "Une part de points positionnés faible désigne un flux de positions "
+                "lacunaire à la source."
+            )
 
     # --- TAB 2 : DELTA TIME ---
     with tab2:
