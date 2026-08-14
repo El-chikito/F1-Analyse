@@ -408,9 +408,56 @@ def test_positions_interpolees():
           f"escalier supprimé, silence long préservé ✓")
 
 
+def test_tracé_lisse():
+    """La géométrie du circuit ne doit pas ressortir en POLYGONE.
+
+    Régression : les positions étaient interpolées linéairement entre les
+    relevés de `location`, bien plus lâches que `car_data`. Le tracé affiché
+    devenait une suite de segments droits reliés par des angles vifs, là où le
+    circuit tourne. Une spline cubique passe par les mêmes points en
+    arrondissant — et aucun lissage côté app ne peut rattraper ça, des points
+    posés sur une corde y restant alignés."""
+    t0 = pd.Timestamp("2026-08-23T13:00:00")
+    n = 300
+    dates = [t0 + pd.Timedelta(milliseconds=270 * i) for i in range(n)]
+    th = np.linspace(0, 2 * np.pi, n)
+    rayon = 1000.0
+    car = pd.DataFrame({"Date": dates, "Speed": np.full(n, 200.0)})
+
+    # `location` cinq fois plus lâche que la télémétrie : le cas qui polygonait
+    idx = list(range(0, n, 15))
+    loc = pd.DataFrame({"Date": [dates[i] for i in idx],
+                        "x": rayon * np.cos(th[idx]), "y": rayon * np.sin(th[idx]),
+                        "z": np.zeros(len(idx))})
+
+    out = of1._merge_location(car.copy(), loc)
+    ecart_spline = np.nanmax(np.abs(np.hypot(out["X"], out["Y"]) - rayon))
+
+    # Référence : ce que donnait l'interpolation linéaire (les cordes)
+    ns = np.array([d.value for d in dates], dtype="float64")
+    ns_loc = np.array([dates[i].value for i in idx], dtype="float64")
+    lin = np.hypot(np.interp(ns, ns_loc, rayon * np.cos(th[idx])),
+                   np.interp(ns, ns_loc, rayon * np.sin(th[idx])))
+    ecart_lineaire = np.max(np.abs(lin - rayon))
+
+    assert ecart_spline < ecart_lineaire / 5, (
+        f"lissage insuffisant : {ecart_spline:.1f} m contre {ecart_lineaire:.1f} m "
+        "en linéaire")
+    # Pas d'oscillation : la spline reste dans l'emprise des positions connues
+    assert out["X"].max() <= loc["x"].max() + 1.0
+    assert out["X"].min() >= loc["x"].min() - 1.0
+
+    # Moins de 4 relevés : repli linéaire, sans exception
+    assert of1._merge_location(car.copy(), loc.iloc[:3])["X"].notna().any()
+
+    print(f"15) tracé lissé          : écart au circuit réel {ecart_spline:.1f} m "
+          f"contre {ecart_lineaire:.1f} m en linéaire ✓")
+
+
 if __name__ == "__main__":
     main()
     test_numerotation_manches()
     test_trafic_reseau()
     test_seances_du_weekend()
     test_positions_interpolees()
+    test_tracé_lisse()

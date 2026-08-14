@@ -14,6 +14,22 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIN carte du circuit : le tracé sortait en POLYGONE (segments droits, angles
+  vifs) et hachuré par endroits. Deux causes, l'une dans chaque module.
+  · Adaptateur : les positions étaient interpolées LINÉAIREMENT entre les
+    relevés de `location`, bien plus lâches que `car_data` — d'où les cordes.
+    Spline cubique désormais : 0,3 m d'écart au tracé réel contre 12,3 m
+    (mesuré, test 15). PCHIP, essayée d'abord, ne valait pas mieux que le
+    linéaire : monotone par morceaux, elle s'aplatit aux extrema des
+    coordonnées, exactement là où l'erreur culmine. Abscisse ramenée en
+    secondes, un horodatage en nanosecondes depuis 1970 ruinant le
+    conditionnement de la spline.
+  · App : le seuil de coupure des trous, fixe à 80 m, hachait le tracé sur les
+    lignes droites où un échantillonnage NORMAL couvre beaucoup de terrain. Il
+    se cale maintenant sur la cadence de la source (8× l'écart médian, plancher
+    120 m). Les marqueurs sont doublés d'une ligne de liaison discrète
+    (`connectgaps=False` pour que les trous coupés restent des trous), qui
+    garantit la continuité du tracé quelle que soit leur densité.
 - SUITE carte du circuit : tracé encore pointillé après le premier correctif.
   Densité portée à 3000 points, marqueurs agrandis (4 → 7, battle map 6 → 8),
   et surtout `track_points()` COUPE désormais le tracé au-delà de 80 m sans
@@ -234,6 +250,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import savgol_filter
+from scipy.interpolate import CubicSpline
 
 import fastf1
 from fastf1.utils import delta_time
@@ -1021,7 +1038,7 @@ def default_gp_index(sched):
     return 0
 
 
-def track_points(tel, valeurs, n=3000, trou_max=80.0):
+def track_points(tel, valeurs, n=3000, trou_max=None):
     """Tracé dense (X, Y, valeur) pour colorier le circuit point par point.
 
     Deux problèmes se cumulaient sur les cartes : les points sans position
@@ -1036,10 +1053,21 @@ def track_points(tel, valeurs, n=3000, trou_max=80.0):
     géométrique régulier — sinon les lignes droites, avalées vite, ressortent
     clairsemées face aux virages lents.
 
+    La géométrie est interpolée par spline cubique : entre deux relevés
+    espacés de plusieurs dizaines de mètres, une interpolation linéaire
+    dessine un POLYGONE — segments droits et angles vifs là où le circuit
+    tourne. Le résultat est borné à l'emprise des points connus, une cubique
+    pouvant osciller. Les VALEURS (vitesse) restent en linéaire : arrondir une
+    mesure n'aurait pas de sens.
+
     `trou_max` (en mètres) coupe le tracé là où la source n'a plus de position :
     au-delà, l'interpolation relierait deux points éloignés par une CORDE toute
     droite en travers du circuit, qui se lit comme un tracé réel alors qu'elle
-    est inventée. Un trou visible est honnête, une corde ne l'est pas.
+    est inventée. Un trou visible est honnête, une corde ne l'est pas. Le seuil
+    par défaut se CALE SUR LA CADENCE de la source (multiple de l'écart médian,
+    avec un plancher) : un seuil absolu trop bas hachait le tracé sur les lignes
+    droites, où un échantillonnage parfaitement normal couvre beaucoup de
+    terrain — c'est ce qui donnait un tracé en pointillé.
 
     Renvoie (x, y, valeurs) — avec des NaN aux endroits coupés, que Plotly
     laisse simplement vides."""
@@ -1060,14 +1088,16 @@ def track_points(tel, valeurs, n=3000, trou_max=80.0):
         return x, y, v
 
     grille = np.linspace(d[0], d[-1], n)
-    xi = np.interp(grille, d, x)
-    yi = np.interp(grille, d, y)
+    xi = np.clip(CubicSpline(d, x)(grille), x.min(), x.max())
+    yi = np.clip(CubicSpline(d, y)(grille), y.min(), y.max())
     vi = np.interp(grille, d, v)
 
-    # Coupe les segments interpolés à travers un trou de la source
+    # Coupe les segments interpolés à travers un vrai trou de la source. Le
+    # seuil suit la cadence : 8× l'écart médian, jamais moins de 120 m.
     ecarts = np.diff(d)
-    troues = np.flatnonzero(ecarts > trou_max)
-    for i in troues:
+    if trou_max is None:
+        trou_max = max(120.0, 8.0 * float(np.median(ecarts)))
+    for i in np.flatnonzero(ecarts > trou_max):
         dans_le_trou = (grille > d[i]) & (grille < d[i + 1])
         xi[dans_le_trou] = np.nan
         yi[dans_le_trou] = np.nan
@@ -2657,11 +2687,15 @@ def page_style():
         for i, (tel, vals) in enumerate([(tel1_full, vals1), (tel2_full, vals2)], start=1):
             r, c = (i, 1) if MOBILE else (1, i)
             xr, yr, vr = track_points(tel, vals)
-            densite[(d1, d2)[i - 1]] = (int(np.isfinite(xr).sum()),
+            densite[(d1, d2)[i - 1]] = (int(np.isfinite(xr).sum()), len(xr),
                                         int(tel["X"].notna().sum()), len(tel))
             fig_map.add_trace(go.Scatter(
                 x=xr, y=yr,
-                mode="markers",
+                mode="lines+markers",
+                # La ligne garantit un tracé continu quelle que soit la densité
+                # des marqueurs ; la couleur, elle, reste portée par les points.
+                line=dict(color="rgba(255,255,255,0.18)", width=1),
+                connectgaps=False,   # les trous coupés doivent rester des trous
                 marker=dict(
                     color=vr,
                     colorscale=colorscale,
@@ -2693,19 +2727,20 @@ def page_style():
         # c'est ici qu'on voit si la source fournit assez de positions ou si
         # c'est le rendu qui est en cause.
         with st.expander("🩺 Densité du tracé"):
-            for code, (traces, positionnes, total) in densite.items():
+            for code, (traces, grille, positionnes, total) in densite.items():
                 st.write(
-                    f"**{code}** — {traces} points tracés · {positionnes}/{total} "
-                    f"points de télémétrie avec une position "
-                    f"({positionnes / total:.0%} du tour)"
+                    f"**{code}** — {traces}/{grille} points tracés "
+                    f"({grille - traces} coupés) · {positionnes}/{total} points de "
+                    f"télémétrie avec une position ({positionnes / total:.0%} du tour)"
                 )
             st.caption(
-                "« points tracés » doit valoir quelques milliers pour un tracé "
-                "continu. S'il tombe au niveau du nombre de points de télémétrie, "
-                "le ré-échantillonnage ne s'applique pas. Si la part de points "
-                "positionnés est faible, c'est le flux de positions de la source "
-                "qui est lacunaire — le tracé aura alors des trous, volontairement "
-                "laissés vides plutôt que comblés par une ligne droite inventée."
+                "**points tracés** doit valoir quelques milliers pour un tracé "
+                "continu ; s'il tombe au niveau du nombre de points de télémétrie, "
+                "le ré-échantillonnage ne s'applique pas. **coupés** = portions "
+                "laissées vides parce que la source n'y a pas de position : "
+                "beaucoup de coupures donnent un tracé en pointillé. Une part de "
+                "points positionnés faible désigne un flux de positions lacunaire "
+                "à la source."
             )
 
         # --- Battle map : qui est plus rapide à chaque endroit du tracé ---
@@ -2736,7 +2771,9 @@ def page_style():
         xb, yb, db = track_points(tel1_full, speed_delta)
         fig_battle = go.Figure(go.Scatter(
             x=xb, y=yb,
-            mode="markers",
+            mode="lines+markers",
+            line=dict(color="rgba(255,255,255,0.18)", width=1),
+            connectgaps=False,
             marker=dict(
                 color=db,
                 colorscale=custom_scale,
