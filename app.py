@@ -14,6 +14,16 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- RUBAN en dents de scie corrigé : les segments étaient tracés un par un, et
+  leurs bouts droits dépassent en biais dès que la trajectoire tourne. Les
+  points consécutifs de même palier sont désormais regroupés en POLYLIGNES,
+  dont Plotly raccorde les sommets proprement ; chaque plage mord d'un point
+  sur la suivante pour qu'aucun liseré de fond n'apparaisse au changement de
+  couleur. Rendu linéaire assumé : la géométrie est déjà lissée en amont, et
+  deux plages lissées chacune de son côté se désaligneraient à leur jonction.
+- LÉGENDE des pilotes en pastilles colorées au-dessus de la carte, toujours
+  visibles : l'échelle de couleurs seule obligeait à retrouver qui était de
+  quel côté à chaque lecture.
 - VUE CIRCUIT réduite à la seule carte des écarts de vitesse (« qui est plus
   rapide, où »). Les deux tracés par pilote et la heatmap de gain de temps
   sont retirés.
@@ -1122,33 +1132,54 @@ def track_ribbon(x, y, v, colorscale, vmin, vmax, n_bins=28, width=7):
     Des marqueurs ronds laissent forcément des vides entre eux — d'où l'aspect
     hachuré, quelle que soit leur densité. Plotly ne sait pas colorier une
     ligne point par point, mais il sait tracer plusieurs lignes : on répartit
-    donc les segments en `n_bins` paliers de couleur, et chaque palier devient
-    UNE trace ligne dont les segments sont séparés par des NaN. Résultat : un
-    ruban plein, en une trentaine de traces au lieu de milliers.
+    donc les points en `n_bins` paliers de couleur, et chaque palier devient
+    UNE trace ligne. Résultat : un ruban plein, en une trentaine de traces au
+    lieu de milliers.
 
-    Renvoie la liste des traces (segments + porte-échelle invisible)."""
+    On trace des POLYLIGNES (suites de points consécutifs de même palier), pas
+    des segments isolés. Un segment dessiné seul a des bouts droits qui
+    dépassent en biais dès que la trajectoire tourne : mis bout à bout, ils
+    donnent un ruban en dents de scie. Dans une polyligne, Plotly raccorde les
+    sommets proprement. Chaque polyligne mord d'un point sur la suivante, sans
+    quoi un liseré du fond apparaîtrait à chaque changement de couleur.
+
+    Renvoie la liste des traces."""
     fini = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
     bornes = np.linspace(vmin, vmax, n_bins + 1)
     milieux = (bornes[:-1] + bornes[1:]) / 2
     couleurs = sample_colorscale(
         colorscale, [(m - vmin) / (vmax - vmin) if vmax > vmin else 0.5 for m in milieux])
-    # Le palier d'un segment est celui de son point de départ
     palier = np.clip(np.digitize(v, bornes) - 1, 0, n_bins - 1)
-    # Un segment n'est traçable que si ses deux extrémités le sont : c'est ce
-    # qui préserve les coupures voulues (trous du flux de positions).
-    traçable = fini[:-1] & fini[1:]
+
+    # Découpage en plages homogènes. Une plage s'arrête sur un changement de
+    # palier ou sur un point sans position — c'est ce qui préserve les
+    # coupures voulues (trous du flux de positions).
+    n_pts, i = len(x), 0
+    par_palier = {}
+    while i < n_pts:
+        if not fini[i]:
+            i += 1
+            continue
+        b, j = palier[i], i
+        while j + 1 < n_pts and fini[j + 1] and palier[j + 1] == b:
+            j += 1
+        # Recouvrement d'un point sur la plage suivante, si elle est joignable
+        fin = j + 1 if (j + 1 < n_pts and fini[j + 1]) else j
+        if fin > i:
+            par_palier.setdefault(b, []).append((i, fin))
+        i = j + 1
 
     traces = []
-    for b in range(n_bins):
-        sel = np.flatnonzero(traçable & (palier[:-1] == b))
-        if not len(sel):
-            continue
-        xs = np.empty(len(sel) * 3)
-        ys = np.empty(len(sel) * 3)
-        xs[0::3], xs[1::3], xs[2::3] = x[sel], x[sel + 1], np.nan
-        ys[0::3], ys[1::3], ys[2::3] = y[sel], y[sel + 1], np.nan
+    for b, plages in sorted(par_palier.items()):
+        xs, ys = [], []
+        for debut, fin in plages:
+            xs.extend(x[debut:fin + 1]); xs.append(np.nan)
+            ys.extend(y[debut:fin + 1]); ys.append(np.nan)
         traces.append(go.Scatter(
             x=xs, y=ys, mode="lines",
+            # Rendu linéaire volontaire : la géométrie est DÉJÀ lissée en amont
+            # (spline cubique sur les positions), et deux plages voisines
+            # lissées chacune de son côté se désaligneraient à leur jonction.
             line=dict(color=couleurs[b], width=width),
             showlegend=False, hoverinfo="skip",
         ))
@@ -2722,10 +2753,22 @@ def page_style():
             "Le tracé du circuit, colorié par l'**écart de vitesse** entre les deux "
             "pilotes : où chacun est plus rapide, mètre par mètre."
         )
-        st.caption(
-            f"Couleur {d1} = {d1} plus rapide à ce point · Couleur {d2} = {d2} plus rapide · "
-            f"Blanc = égalité. L'intensité de la couleur = ampleur de l'écart."
+        # Légende en dur au-dessus du tracé : la colorbar seule oblige à
+        # retrouver qui est de quel côté de l'échelle à chaque lecture.
+        st.markdown(
+            "<div style='display:flex;gap:10px;flex-wrap:wrap;margin:.2rem 0 .6rem'>"
+            + "".join(
+                f"<span style='background:{coul};color:{text_on(coul)};"
+                f"padding:.25rem .7rem;border-radius:999px;font-weight:700;"
+                f"font-size:.95rem'>{code} plus rapide</span>"
+                for code, coul in ((d1, c1), (d2, c2))
+            )
+            + "<span style='background:#FFFFFF;color:#111111;padding:.25rem .7rem;"
+              "border-radius:999px;font-weight:700;font-size:.95rem'>égalité</span>"
+            + "</div>",
+            unsafe_allow_html=True,
         )
+        st.caption("L'intensité de la couleur = ampleur de l'écart.")
 
         # Télémétrie complète avec X/Y (position GPS sur le tracé)
         tel1_full = lap1.get_telemetry()
