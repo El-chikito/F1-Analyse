@@ -14,6 +14,21 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- CARTE DES ÉCARTS dessinée sur le TRACÉ DE RÉFÉRENCE du circuit (MultiViewer,
+  celui des vignettes de l'accueil) au lieu du contour reconstruit depuis les
+  positions OpenF1. Ce dernier restait approximatif — quelques centaines de
+  points troués par tour, d'où des segments qui partaient dans le vide. Les
+  données OpenF1 ne fournissent plus que la COULEUR : chaque mesure est
+  rattachée au point du tracé le plus proche (moyenne quand plusieurs s'y
+  rattachent), et les endroits sans mesure sont interpolés entre voisins —
+  même couleur de part et d'autre, elle est conservée ; couleurs opposées, la
+  transition traverse l'égalité. Le bouclage est pris en compte : un trou à
+  cheval sur la ligne d'arrivée trouve un voisin de chaque côté.
+  Garde-fou : si la médiane des distances entre télémétrie et tracé dépasse
+  8 % de la diagonale du circuit, les deux ne décrivent pas la même chose
+  (repères différents) et l'app retombe sur le contour reconstruit plutôt que
+  d'afficher un tracé faux. Le panneau 🩺 indique laquelle des deux
+  géométries est utilisée.
 - FIX lissage désactivé par un seul trou : `_merge_location` n'appliquait la
   spline que si la colonne de positions était ENTIÈREMENT valide. Une seule
   valeur manquante dans le flux — courant — faisait retomber le tour entier en
@@ -283,6 +298,7 @@ from plotly.subplots import make_subplots
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import savgol_filter
 from scipy.interpolate import CubicSpline
+from scipy.spatial import cKDTree
 
 import fastf1
 from fastf1.utils import delta_time
@@ -1202,6 +1218,79 @@ def track_ribbon(x, y, v, colorscale, vmin, vmax, n_bins=28, width=7):
     return traces
 
 
+def _remplir_circulaire(s, v, longueur):
+    """Comble les valeurs manquantes le long d'un parcours FERMÉ, par
+    interpolation entre la dernière valeur connue avant et la première après.
+
+    Conséquence voulue : si les deux bords disent la même chose, tout le trou
+    le dit aussi ; s'ils se contredisent (un pilote devant avant, l'autre
+    après), la valeur passe progressivement de l'un à l'autre en traversant
+    l'égalité. La ligne d'arrivée n'est pas une frontière : les voisins d'un
+    trou peuvent se trouver de part et d'autre du bouclage."""
+    connu = np.isfinite(v)
+    if connu.all() or not connu.any():
+        return v
+    s_ok, v_ok = s[connu], v[connu]
+    # Réplique du parcours avant et après, pour que l'interpolation d'un trou
+    # à cheval sur la ligne trouve bien un voisin de chaque côté
+    s_ext = np.concatenate([s_ok - longueur, s_ok, s_ok + longueur])
+    return np.interp(s, s_ext, np.tile(v_ok, 3))
+
+
+def outline_values(trace, tel, valeurs, tolerance=0.08):
+    """Reporte des mesures de télémétrie sur le TRACÉ DE RÉFÉRENCE du circuit.
+
+    Le tracé reconstruit depuis les positions d'OpenF1 reste approximatif :
+    quelques centaines de points par tour, avec des trous, d'où des segments
+    qui « partent dans le vide ». Le tracé MultiViewer — celui des vignettes de
+    l'accueil — est dense et fidèle, et partage le repère des virages et des
+    télémétries. On dessine donc le circuit avec LUI, et on ne demande plus aux
+    données OpenF1 que la couleur.
+
+    Chaque point de télémétrie est rattaché au point du tracé le plus proche.
+    Là où plusieurs se rattachent au même endroit, on fait la MOYENNE ; là où
+    aucun ne se rattache, la couleur est interpolée entre les voisins
+    (cf. `_remplir_circulaire`).
+
+    `tolerance` est la distance maximale admise entre télémétrie et tracé,
+    exprimée en fraction de la diagonale du circuit. Au-delà, les deux ne
+    décrivent pas la même chose (repères différents) et mieux vaut renoncer
+    que d'afficher un tracé faux : renvoie alors None.
+
+    Renvoie (x, y, valeurs) prêts à tracer, ou None."""
+    if not trace:
+        return None
+    ox, oy = _rotate_xy(np.asarray(trace[0], dtype="float64"),
+                        np.asarray(trace[1], dtype="float64"))
+    ox, oy = np.asarray(ox, dtype="float64"), np.asarray(oy, dtype="float64")
+    if len(ox) < 20:
+        return None
+
+    tx, ty = _rotate_xy(tel["X"], tel["Y"])
+    tx, ty = np.asarray(tx, dtype="float64"), np.asarray(ty, dtype="float64")
+    tv = np.asarray(valeurs, dtype="float64")
+    ok = np.isfinite(tx) & np.isfinite(ty) & np.isfinite(tv)
+    tx, ty, tv = tx[ok], ty[ok], tv[ok]
+    if len(tx) < 10:
+        return None
+
+    arbre = cKDTree(np.column_stack([ox, oy]))
+    dist, idx = arbre.query(np.column_stack([tx, ty]))
+    diagonale = float(np.hypot(ox.max() - ox.min(), oy.max() - oy.min()))
+    if diagonale <= 0 or np.median(dist) > tolerance * diagonale:
+        return None  # repères incompatibles : on ne trace pas n'importe quoi
+
+    # Moyenne des mesures rattachées à chaque point du tracé
+    somme = np.bincount(idx, weights=tv, minlength=len(ox))
+    compte = np.bincount(idx, minlength=len(ox))
+    v = np.divide(somme, compte, out=np.full(len(ox), np.nan), where=compte > 0)
+
+    # Abscisse curviligne du tracé, pour interpoler les trous à distance égale
+    pas = np.hypot(np.diff(ox, append=ox[0]), np.diff(oy, append=oy[0]))
+    s = np.concatenate([[0.0], np.cumsum(pas)[:-1]])
+    return ox, oy, _remplir_circulaire(s, v, float(pas.sum()))
+
+
 def colorbar_trace(colorscale, vmin, vmax, titre):
     """Trace vide dont le seul rôle est d'afficher l'échelle de couleurs.
     Les traces `lines` de `track_ribbon` n'en portent pas."""
@@ -1761,6 +1850,20 @@ def format_weekend(debut, fin):
 
 
 @st.cache_data(show_spinner=False, ttl=7 * 24 * 3600)
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def load_outline(circuit_key, year):
+    """Tracé de référence d'un circuit (MultiViewer), mis en cache.
+
+    Sert deux usages : les vignettes de l'accueil (24 appels par affichage
+    sans cache) et la carte des écarts de l'onglet Vue circuit."""
+    if not USE_OPENF1:
+        return None  # le tracé vient de MultiViewer, via l'adaptateur OpenF1
+    try:
+        return DATA.track_outline(circuit_key, year)
+    except Exception:
+        return None
+
+
 def track_svg(circuit_key, year, largeur=220, hauteur=120):
     """Vignette SVG du tracé d'un circuit.
 
@@ -1768,12 +1871,7 @@ def track_svg(circuit_key, year, largeur=220, hauteur=120):
     toute taille et léger — 24 vignettes sur une page, des graphiques Plotly
     seraient beaucoup trop lourds sur téléphone. Renvoie None si le tracé
     n'est pas disponible (la carte s'affiche alors sans vignette)."""
-    if not USE_OPENF1:
-        return None  # le tracé vient de MultiViewer, via l'adaptateur OpenF1
-    try:
-        trace = DATA.track_outline(circuit_key, year)
-    except Exception:
-        trace = None
+    trace = load_outline(circuit_key, year)
     if not trace:
         return None
     xs, ys = trace
@@ -2808,7 +2906,18 @@ def page_style():
         # Bornes symétriques pour que le blanc tombe toujours sur l'égalité
         abs_max = float(np.percentile(np.abs(speed_delta), 95))  # robuste aux outliers
 
-        xb, yb, db = track_points(tel1_full, speed_delta)
+        # Géométrie : le tracé de référence du circuit (MultiViewer) d'abord —
+        # dense et fidèle. Les positions OpenF1 ne servent alors qu'à placer la
+        # couleur. Repli sur le tracé reconstruit depuis la télémétrie si le
+        # circuit de référence manque ou ne correspond pas.
+        sur_reference = outline_values(load_outline(ev.get("CircuitKey"),
+                                                    st.session_state.year),
+                                       tel1_full, speed_delta)
+        if sur_reference is not None:
+            xb, yb, db = sur_reference
+        else:
+            xb, yb, db = track_points(tel1_full, speed_delta)
+
         fig_battle = go.Figure()
         for trace in track_ribbon(xb, yb, db, custom_scale, -abs_max, abs_max,
                                   width=9 if MOBILE else 7):
@@ -2853,16 +2962,24 @@ def page_style():
             total = len(tel1_full)
             traces_ok = int(np.isfinite(xb).sum())
             st.write(
-                f"**{d1}** — {traces_ok}/{len(xb)} points tracés "
-                f"({len(xb) - traces_ok} coupés) · {positionnes}/{total} points de "
-                f"télémétrie avec une position ({positionnes / total:.0%} du tour)"
+                ("**Géométrie** : tracé de référence du circuit (MultiViewer), "
+                 f"{len(xb)} points." if sur_reference is not None else
+                 "**Géométrie** : reconstruite depuis les positions de la "
+                 "télémétrie — le tracé de référence du circuit est indisponible "
+                 "ou dans un repère différent, d'où un contour approximatif.")
             )
-            st.caption(
-                "**coupés** = portions laissées vides parce que la source n'y a pas "
-                "de position, plutôt que comblées par une ligne droite inventée. "
-                "Une part de points positionnés faible désigne un flux de positions "
-                "lacunaire à la source."
+            st.write(
+                f"**Couleur** — {traces_ok}/{len(xb)} points coloriés · "
+                f"{positionnes}/{total} points de télémétrie de {d1} avec une "
+                f"position ({positionnes / total:.0%} du tour)"
             )
+            if sur_reference is None:
+                st.caption(
+                    "Sur le tracé de référence, un manque de mesures se comble par "
+                    "interpolation entre les valeurs voisines. Sur le tracé "
+                    "reconstruit, il laisse un trou : mieux vaut un vide qu'une "
+                    "ligne droite inventée en travers du circuit."
+                )
 
     # --- TAB 2 : DELTA TIME ---
     with tab2:
