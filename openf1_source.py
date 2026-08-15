@@ -395,14 +395,21 @@ def _merge_location(car, loc):
     if dedans.any():
         for col in ("x", "y", "z"):
             vals = pos[col].to_numpy()
-            if len(pos) >= 4 and np.isfinite(vals).all():
-                interp = CubicSpline(t_pos, vals)(t_cible)
+            # Les relevés incomplets sont ÉCARTÉS, pas fuis : exiger une colonne
+            # entièrement valide faisait retomber tout le tour en linéaire — donc
+            # en polygone — pour une seule valeur manquante dans le flux.
+            bons = np.isfinite(vals)
+            t_bons, v_bons = t_pos[bons], vals[bons]
+            if len(t_bons) >= 4:
+                interp = CubicSpline(t_bons, v_bons)(t_cible)
                 # Une voiture ne sort pas de l'emprise du circuit : on borne
                 # pour qu'un éventuel dépassement de spline reste sans effet.
-                marge = 0.02 * (vals.max() - vals.min() or 1.0)
-                interp = np.clip(interp, vals.min() - marge, vals.max() + marge)
-            else:  # trop peu de points pour une spline : linéaire, ça suffit
-                interp = np.interp(t_cible, t_pos, vals)
+                marge = 0.02 * ((v_bons.max() - v_bons.min()) or 1.0)
+                interp = np.clip(interp, v_bons.min() - marge, v_bons.max() + marge)
+            elif len(t_bons) >= 2:  # trop peu pour une spline : linéaire
+                interp = np.interp(t_cible, t_bons, v_bons)
+            else:
+                interp = np.nan
             comble.loc[dedans, col] = interp
 
     # Garde-fou : ne rien inventer là où le flux s'est tu longtemps. Au-delà de

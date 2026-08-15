@@ -14,6 +14,16 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX lissage désactivé par un seul trou : `_merge_location` n'appliquait la
+  spline que si la colonne de positions était ENTIÈREMENT valide. Une seule
+  valeur manquante dans le flux — courant — faisait retomber le tour entier en
+  interpolation linéaire, donc en polygone, alors que le correctif précédent
+  était censé l'avoir réglé. Les relevés incomplets sont maintenant écartés un
+  par un et le reste est lissé normalement.
+- BOUTS de ligne qui « dépassent » aux virages serrés : Plotly n'expose pas de
+  bouts arrondis, et l'extrémité d'une polyligne est un rectangle qui sort en
+  biais dès que la trajectoire tourne. Un disque de même diamètre et de même
+  couleur posé sur chaque sommet arrondit bouts et coudes.
 - RUBAN en dents de scie corrigé : les segments étaient tracés un par un, et
   leurs bouts droits dépassent en biais dès que la trajectoire tourne. Les
   points consécutifs de même palier sont désormais regroupés en POLYLIGNES,
@@ -1176,11 +1186,17 @@ def track_ribbon(x, y, v, colorscale, vmin, vmax, n_bins=28, width=7):
             xs.extend(x[debut:fin + 1]); xs.append(np.nan)
             ys.extend(y[debut:fin + 1]); ys.append(np.nan)
         traces.append(go.Scatter(
-            x=xs, y=ys, mode="lines",
+            x=xs, y=ys, mode="lines+markers",
             # Rendu linéaire volontaire : la géométrie est DÉJÀ lissée en amont
             # (spline cubique sur les positions), et deux plages voisines
             # lissées chacune de son côté se désaligneraient à leur jonction.
             line=dict(color=couleurs[b], width=width),
+            # Plotly n'expose pas les bouts de ligne arrondis : les extrémités
+            # d'une polyligne sont des rectangles, qui DÉPASSENT en biais aux
+            # changements de direction (visible aux virages serrés, comme si la
+            # route sortait du tracé). Un disque de même diamètre et de même
+            # couleur à chaque sommet arrondit bouts et coudes.
+            marker=dict(color=couleurs[b], size=width, line=dict(width=0)),
             showlegend=False, hoverinfo="skip",
         ))
     return traces

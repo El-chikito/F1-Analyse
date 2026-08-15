@@ -447,11 +447,30 @@ def test_tracé_lisse():
     assert out["X"].max() <= loc["x"].max() + 1.0
     assert out["X"].min() >= loc["x"].min() - 1.0
 
+    # Un relevé incomplet ne doit pas désactiver le lissage du tour entier :
+    # la condition « colonne entièrement valide » y suffisait, et une seule
+    # valeur manquante suffisait donc à faire ressortir le polygone.
+    troue = loc.copy()
+    troue.loc[3, "x"] = np.nan
+    out_troue = of1._merge_location(car.copy(), troue)
+    ecart_troue = np.nanmax(np.abs(np.hypot(out_troue["X"], out_troue["Y"]) - rayon))
+    assert ecart_troue < ecart_lineaire / 5, (
+        f"une valeur manquante a désactivé le lissage : {ecart_troue:.1f} m")
+
+    # Une colonne z absente ne doit pas dégrader x/y
+    sans_z = loc.copy()
+    sans_z["z"] = np.nan
+    out_z = of1._merge_location(car.copy(), sans_z)
+    assert np.nanmax(np.abs(np.hypot(out_z["X"], out_z["Y"]) - rayon)) < ecart_lineaire / 5
+
     # Moins de 4 relevés : repli linéaire, sans exception
     assert of1._merge_location(car.copy(), loc.iloc[:3])["X"].notna().any()
+    # Un seul relevé : rien à interpoler, mais pas d'exception non plus
+    assert of1._merge_location(car.copy(), loc.iloc[:1])["X"].isna().all()
 
     print(f"15) tracé lissé          : écart au circuit réel {ecart_spline:.1f} m "
-          f"contre {ecart_lineaire:.1f} m en linéaire ✓")
+          f"contre {ecart_lineaire:.1f} m en linéaire, "
+          f"{ecart_troue:.1f} m avec un relevé incomplet ✓")
 
 
 if __name__ == "__main__":
