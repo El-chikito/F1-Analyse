@@ -14,10 +14,10 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
-- SÉLECTION DES PILOTES sortie de la barre latérale : elle passe en pastilles
-  (`st.pills`, sélection multiple limitée à deux) en haut de la vue
-  Comparaison, sous le bandeau de vues. La latérale ne sert plus qu'au choix
-  du week-end. Sur téléphone, il fallait l'ouvrir puis la refermer à chaque
+- SÉLECTION DES PILOTES ET DES TOURS sortie de la barre latérale : pastilles
+  (`st.pills`, sélection multiple limitée à deux) puis les deux listes de
+  tours, en haut de la vue Comparaison, sous le bandeau de vues. La latérale
+  ne sert plus qu'au choix du week-end (saison, GP, séance). Sur téléphone, il fallait l'ouvrir puis la refermer à chaque
   changement de pilote. Des pastilles plutôt que des cases à cocher dans le
   tableau : `st.data_editor` afficherait bien des cases, mais son rendu canvas
   est flou sur Retina — la raison même de `show_table`. Les lignes des deux
@@ -2445,9 +2445,6 @@ def page_style():
         c2 = "#FFD700"  # gold fallback
 
     # ============== SÉLECTION DU TOUR À ANALYSER ==============
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Tour à analyser")
-
 
     def get_lap_options(drv):
         """Retourne la liste des tours valides + descriptions + tour rapide pour le sélecteur."""
@@ -2484,7 +2481,11 @@ def page_style():
         st.error("⚠️ Un des deux pilotes n'a pas de tour valide dans cette session.")
         st.stop()
 
-    lap_n1 = st.sidebar.selectbox(
+    # Côte à côte sur grand écran, empilés sur téléphone : deux listes de tours
+    # dans une demi-largeur de mobile tronqueraient le libellé, qui porte
+    # justement le chrono et la gomme.
+    col_t1, col_t2 = (st, st) if MOBILE else st.columns(2)
+    lap_n1 = col_t1.selectbox(
         f"Tour {d1}",
         options=opts1,
         index=opts1.index(fast1),
@@ -2492,7 +2493,7 @@ def page_style():
         help="⚡ = tour le plus rapide · ⚠ = chrono jugé imprécis par FastF1 (in/out-lap, "
              "drapeau…). Tu peux choisir n'importe quel tour.",
     )
-    lap_n2 = st.sidebar.selectbox(
+    lap_n2 = col_t2.selectbox(
         f"Tour {d2}",
         options=opts2,
         index=opts2.index(fast2),
@@ -3088,7 +3089,7 @@ def page_style():
         st.markdown(
             f"Pour chaque virage : **où** chacun commence à freiner, à quelle intensité, et **quand** il remet "
             f"les gaz. C'est ici qu'on voit objectivement qui freine tard et qui sort fort. "
-            f"Analyse basée sur les tours sélectionnés dans la barre latérale."
+            f"Analyse basée sur les tours sélectionnés en haut de page."
         )
         if corners_df is None:
             st.info("FastF1 ne fournit pas la position des virages pour ce circuit.")
@@ -4287,9 +4288,9 @@ def page_timing():
 def page_analyse_session():
     """Toutes les analyses d'un week-end, en deux vues.
 
-    Le week-end se choisit dans la barre latérale, les pilotes en haut de la
-    vue Comparaison ; ces deux vues partagent la même session chargée, d'où
-    le regroupement."""
+    Le week-end se choisit dans la barre latérale ; les pilotes et leurs tours
+    en haut de la vue Comparaison. Les deux vues partagent la même session
+    chargée, d'où le regroupement."""
     if not _ensure_session():
         return
     vue = st.segmented_control(
