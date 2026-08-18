@@ -49,7 +49,16 @@ def build_fixtures():
              "headshot_url": "http://x/16.png"},
         ],
         "laps": [], "stints": [], "pit": [], "position": [],
-        "car_data": [], "location": [], "session_result": [], "starting_grid": [],
+        "car_data": [], "location": [], "starting_grid": [],
+        # `/session_result` ne porte pas de champ `status` mais trois booléens.
+        # VER voit l'arrivée, LEC abandonne : c'est ce que le graphe des
+        # positions par course doit pouvoir distinguer.
+        "session_result": [
+            {"driver_number": 1, "position": 1, "points": 25,
+             "dnf": False, "dns": False, "dsq": False},
+            {"driver_number": 16, "position": 18, "points": 0,
+             "dnf": True, "dns": False, "dsq": False},
+        ],
         "weather": [{"date": _iso(T0), "air_temperature": 24.0, "track_temperature": 41.0,
                      "humidity": 50, "wind_speed": 3.2, "rainfall": 0}],
         "race_control": [
@@ -176,7 +185,13 @@ def main():
     res = s.results
     assert {"Abbreviation", "Position", "GridPosition", "TeamName"} <= set(res.columns)
     assert len(res) == 2
-    print("10) météo/RCM/résultats  : format FastF1 ✓")
+    # Statut d'arrivée : OpenF1 n'a pas de champ `status`, seulement des
+    # booléens dnf/dns/dsq. Sans leur traduction, un abandon classé 18e était
+    # indiscernable d'une arrivée en fond de peloton.
+    statuts = dict(zip(res["Abbreviation"], res["Status"]))
+    assert statuts["VER"] == "Finished", statuts
+    assert statuts["LEC"] == "Retired", statuts
+    print("10) météo/RCM/résultats  : format FastF1, abandon distingué ✓")
 
     print("\n✅ ADAPTATEUR OPENF1 VALIDÉ (contrat figé pour app.py)")
 

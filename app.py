@@ -14,6 +14,15 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- GRAPHE « Position finale par course » retravaillé : lignes lissées (spline),
+  ligne **DNF** dédiée sous la dernière position où tous les abandons d'une
+  même course se rejoignent — la ligne d'un pilote reste donc continue au lieu
+  de s'interrompre —, et cinq écuries cochées par défaut (Ferrari, Red Bull,
+  Mercedes, Alpine, McLaren) au lieu de la grille entière.
+  Corollaire : la position officielle d'un abandon (18e, 19e…) ne compte plus
+  ni dans la moyenne ni dans les duels entre coéquipiers — ce n'est pas une
+  performance. Côté source, `_statut()` traduit les booléens `dnf`/`dns`/`dsq`
+  d'OpenF1 au format FastF1 : sans eux, aucun abandon n'était détectable.
 - NOUVEAU « Classement sur les dernières manches » en bas de la page
   Championnat : total des points pilotes sur les N dernières manches, N étant
   saisi par l'utilisateur. Une manche = un week-end complet, sprint et course
@@ -1312,6 +1321,19 @@ RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 SPRINT_POINTS = {1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1}
 
 
+def a_termine(statut):
+    """Le pilote a-t-il vu l'arrivée ? Depuis le champ Status des résultats.
+
+    Un abandon reste CLASSÉ au résultat officiel (18e, 19e…) : sans lire le
+    statut, rien ne le distingue d'une arrivée en fond de peloton. « Finished »
+    et « +N Lap(s) » sont les seules mentions d'arrivée ; tout le reste (panne,
+    accident, disqualification, non-partant) n'en est pas une. Un statut vide
+    (source qui ne le fournit pas) est considéré comme une arrivée : mieux vaut
+    manquer un abandon que d'en inventer."""
+    s = str(statut or "").strip().lower()
+    return (not s) or s == "finished" or s.startswith("+")
+
+
 def points_from_results(res, ses):
     """Points par pilote depuis une feuille de résultats FastF1.
     La colonne Points est vide pour les sessions Sprint (même trou de données
@@ -1577,6 +1599,7 @@ def season_points_before(year, round_number, session_type):
     # récoltées dans CETTE boucle plutôt que dans une seconde passe, pour ne
     # pas doubler le trafic (cf. le rate-limiting déjà rencontré).
     positions, manches, equipes, noms = {}, {}, {}, {}
+    abandons = {}  # manche -> pilotes n'ayant pas vu l'arrivée
     # Points par MANCHE (= week-end complet : sprint + course cumulés sous le
     # même numéro), pour les classements glissants sur les N dernières manches.
     pts_manche = {}
@@ -1594,7 +1617,7 @@ def season_points_before(year, round_number, session_type):
         # fin : une exception en cours de route ne laisse aucun cumul partiel,
         # donc le rejeu ne peut pas compter une manche deux fois.
         pfr = points_from_results(res, ses)
-        d_team, d_equipes, d_noms, d_pos = {}, {}, {}, {}
+        d_team, d_equipes, d_noms, d_pos, d_dnf = {}, {}, {}, {}, set()
         for _, r in res.iterrows():
             code = str(r["Abbreviation"])
             team = str(r.get("TeamName", "") or "")
@@ -1608,6 +1631,8 @@ def season_points_before(year, round_number, session_type):
                 pos = r.get("Position")
                 if pd.notna(pos) and 1 <= int(pos) <= 22:
                     d_pos[code] = int(pos)
+                if not a_termine(r.get("Status")):
+                    d_dnf.add(code)
 
         for code, p in pfr.items():
             pts[code] = pts.get(code, 0.0) + p
@@ -1621,6 +1646,8 @@ def season_points_before(year, round_number, session_type):
         noms.update(d_noms)
         for code, pos in d_pos.items():
             cb.setdefault(code, [0] * 22)[pos - 1] += 1
+        if d_dnf:
+            abandons[rnd] = sorted(d_dnf)
         if d_pos:
             positions[rnd] = d_pos
             # Nom du circuit plutôt que du GP : « Silverstone » parle
@@ -1666,7 +1693,7 @@ def season_points_before(year, round_number, session_type):
     # Dictionnaire plutôt qu'un n-uplet qui s'allonge à chaque besoin
     return {"pts": pts, "cb": cb, "team_pts": team_pts, "echecs": echecs,
             "positions": positions, "manches": manches, "equipes": equipes,
-            "noms": noms, "pts_manche": pts_manche}
+            "noms": noms, "pts_manche": pts_manche, "abandons": abandons}
 
 
 def safe_circuit_info(sess):
@@ -4422,24 +4449,48 @@ def page_championnat():
 
     # `hist` va jusqu'à la dernière manche incluse : rien à compléter.
     pos_hist = dict(hist["positions"])
+    abandons = {int(r): set(v) for r, v in hist.get("abandons", {}).items()}
     manches = dict(hist["manches"])
     equipes = dict(equipes_all)
     if not pos_hist:
         st.info("Aucune course terminée dans cette saison pour le moment.")
     else:
-        rounds = sorted(pos_hist)
-        grille = pd.DataFrame(
-            {r: pd.Series(pos_hist[r]) for r in rounds}
-        ).T.sort_index()          # lignes = manches, colonnes = pilotes
+        rounds = sorted(set(pos_hist) | set(abandons))
+        pilotes_vus = sorted({c for r in pos_hist for c in pos_hist[r]}
+                             | {c for s in abandons.values() for c in s})
+        # Positions des seules courses TERMINÉES : la place officielle d'un
+        # abandon (18e, 19e…) n'est pas une performance comparable, et fausse
+        # autant la moyenne que les duels.
+        grille = pd.DataFrame(np.nan, index=rounds, columns=pilotes_vus, dtype=float)
+        for r in rounds:
+            for c, p in pos_hist.get(r, {}).items():
+                if c not in abandons.get(r, ()):
+                    grille.loc[r, c] = float(p)
         moyennes = grille.mean(axis=0)
 
-        toutes_equipes = sorted({equipes.get(c, "—") for c in grille.columns})
+        # Les abandons vont sur une ligne dédiée SOUS la dernière position, tous
+        # au même niveau quelle que soit la manière d'abandonner : la ligne du
+        # pilote reste continue au lieu de s'interrompre, et un abandon se
+        # repère d'un coup d'œil.
+        derniere = grille.max().max()
+        niveau_dnf = int(derniere) + 1 if pd.notna(derniere) else 21
+        trace = grille.copy()
+        for r in rounds:
+            for c in abandons.get(r, ()):
+                if c in trace.columns:
+                    trace.loc[r, c] = float(niveau_dnf)
+
+        toutes_equipes = sorted({equipes.get(c, "—") for c in trace.columns})
+        # Les cinq écuries que le user suit ; les autres restent à cocher.
+        prefixes = ("Ferrari", "Red Bull", "Mercedes", "Alpine", "McLaren")
+        defaut = [e for e in toutes_equipes
+                  if any(e.startswith(p) for p in prefixes)] or toutes_equipes
         sel_equipes = st.multiselect(
-            "Écuries affichées", options=toutes_equipes, default=toutes_equipes,
+            "Écuries affichées", options=toutes_equipes, default=defaut,
             key="pos_race_teams",
             help="Filtre pour comparer deux coéquipiers sans le bruit des autres.",
         )
-        codes = [c for c in grille.columns if equipes.get(c, "—") in sel_equipes]
+        codes = [c for c in trace.columns if equipes.get(c, "—") in sel_equipes]
         codes.sort(key=lambda c: (equipes.get(c, "—"), moyennes.get(c, 99)))
 
         if not codes:
@@ -4454,19 +4505,28 @@ def page_championnat():
                 rang_dans_equipe[c] = rang_dans_equipe.get(eq, 0)
                 rang_dans_equipe[eq] = rang_dans_equipe[c] + 1
 
-            abscisses = [manches.get(r, f"R{r}") for r in grille.index]
+            abscisses = [manches.get(r, f"R{r}") for r in trace.index]
             for c in codes:
                 base = team_color(equipes.get(c, "—"))
                 nuance = base if rang_dans_equipe[c] == 0 else \
                     lighten(base, 0.35 + 0.2 * (rang_dans_equipe[c] - 1))
-                serie = grille[c]
+                serie = trace[c]
+                moy = moyennes.get(c)
+                etiquettes = ["DNF" if v == niveau_dnf else
+                              (f"P{v:.0f}" if pd.notna(v) else "—")
+                              for v in serie.values]
                 fig_pos.add_trace(go.Scatter(
                     x=abscisses, y=serie.values, mode="lines+markers",
-                    name=f"{c} · moy. P{moyennes[c]:.1f}",
-                    line=dict(color=nuance, width=2.2),
+                    name=(f"{c} · moy. P{moy:.1f}" if pd.notna(moy) else f"{c} · —"),
+                    # Lissage léger : les positions sont des entiers, une ligne
+                    # brisée les rend nerveuses à lire sur une saison entière.
+                    line=dict(color=nuance, width=2.2, shape="spline", smoothing=0.8),
                     marker=dict(size=6),
-                    connectgaps=False,  # un abandon ne doit pas être relié
-                    hovertemplate=f"<b>{c}</b><br>%{{x}}<br>P%{{y:.0f}}<extra></extra>",
+                    # Reste utile : un pilote absent d'une manche (non-partant,
+                    # remplaçant) ne doit pas voir sa ligne franchir le trou.
+                    connectgaps=False,
+                    customdata=etiquettes,
+                    hovertemplate=f"<b>{c}</b><br>%{{x}}<br>%{{customdata}}<extra></extra>",
                 ))
                 # Code pilote en bout de ligne, à droite du dernier résultat
                 # classé (un abandon en fin de saison ne doit pas le déplacer
@@ -4479,10 +4539,19 @@ def page_championnat():
                         showarrow=False, xanchor="left", xshift=10,
                         font=dict(size=11, color=nuance),
                     )
+            # Trait de séparation : la ligne DNF n'est pas une position, elle ne
+            # doit pas se lire dans la continuité du classement.
+            fig_pos.add_hline(y=niveau_dnf - 0.5, line_width=1, line_dash="dot",
+                              line_color="rgba(255,255,255,0.25)")
             fig_pos.update_layout(
                 height=560, template="plotly_dark",
                 xaxis=dict(title="Circuit", tickangle=45 if MOBILE else 30),
-                yaxis=dict(title="Position finale", autorange="reversed", dtick=1),
+                yaxis=dict(
+                    title="Position finale", autorange="reversed",
+                    tickmode="array",
+                    tickvals=list(range(1, niveau_dnf + 1)),
+                    ticktext=[str(i) for i in range(1, niveau_dnf)] + ["DNF"],
+                ),
                 hovermode="closest",
                 legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center",
                             font=dict(size=10)),
@@ -4519,9 +4588,13 @@ def page_championnat():
                     "ne compte ni comme victoire ni comme défaite dans le duel."
                 )
             st.caption(
-                "Position à l'arrivée, course par course. Les lignes s'interrompent "
-                "quand un pilote n'est pas classé (abandon, non-partant). "
-                "**moy.** = position moyenne sur ses courses classées."
+                "Position à l'arrivée, course par course. Les abandons sont posés "
+                "sur la ligne **DNF**, sous la dernière position, tous au même "
+                "niveau — un abandon au 3e tour et un abandon à deux tours de "
+                "l'arrivée s'y rejoignent. La ligne ne s'interrompt donc plus que "
+                "si le pilote n'était pas au départ. **moy.** = position moyenne "
+                "sur ses seules courses terminées : la place officielle d'un "
+                "abandon (18e, 19e…) ne mesure pas une performance."
             )
 
     # --- Classement glissant sur les N dernières manches ---

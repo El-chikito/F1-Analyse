@@ -345,6 +345,23 @@ class Telemetry(pd.DataFrame):
 _POS_TROU_MAX = pd.Timedelta(seconds=2)
 
 
+def _statut(r):
+    """Statut d'arrivée au format FastF1 (« Finished », « Retired »…).
+
+    OpenF1 n'expose pas de champ `status` mais trois booléens `dnf`/`dns`/`dsq`
+    dans `/session_result`. Les lire est indispensable : sans eux, l'app ne
+    peut pas distinguer un pilote arrivé 18e d'un pilote classé 18e après
+    abandon — leur position au classement officiel est la même."""
+    if r.get("dsq"):
+        return "Disqualified"
+    if r.get("dns"):
+        return "Did not start"
+    if r.get("dnf"):
+        return "Retired"
+    brut = str(r.get("status") or "").strip()
+    return brut or "Finished"
+
+
 def _merge_location(car, loc):
     """Ajoute les positions X/Y/Z aux points de télémétrie, par interpolation
     temporelle. Les deux flux ont des cadences différentes et `location` a des
@@ -891,7 +908,7 @@ class Session:
                     "DriverNumber": str(num), "Abbreviation": info["Abbreviation"],
                     "FullName": info["FullName"], "TeamName": info["TeamName"],
                     "Position": r.get("position"), "GridPosition": grid.get(num, np.nan),
-                    "Points": r.get("points"), "Status": r.get("status") or "",
+                    "Points": r.get("points"), "Status": _statut(r),
                     "Time": pd.NaT, "Q1": pd.NaT, "Q2": pd.NaT, "Q3": pd.NaT,
                 })
         else:
