@@ -4563,7 +4563,9 @@ def page_championnat():
             "Pilote": _full_name(code),
             "_code": code,
             "Points": f"{cumul[code]:g}",
-            "Au général": f"P{gen}" if gen else "–",
+            # Position ET points du général réunis : sans les points, on voit
+            # qu'un pilote gagne des places sans savoir de combien il revient.
+            "Au général": (f"P{gen} · {after.get(code, 0):g} pts" if gen else "–"),
             "Δ": ("–" if not delta else (f"+{delta}" if delta > 0 else f"−{abs(delta)}")),
             "_delta": delta or 0,
         })
@@ -4589,8 +4591,9 @@ def page_championnat():
         f"{'s' if len(retenues) > 1 else ''} manche"
         f"{'s' if len(retenues) > 1 else ''}** : "
         + " · ".join(noms_manches)
-        + ". **Au général** = place au championnat complet, **Δ** = places gagnées "
-        "(vert) ou perdues (rouge) sur cette fenêtre par rapport au général. "
+        + ". **Points** = total sur la fenêtre seule · **Au général** = place et "
+        "total au championnat complet · **Δ** = places gagnées (vert) ou perdues "
+        "(rouge) sur cette fenêtre par rapport au général. "
         "Sprint et course d'un même week-end comptent pour une seule manche. "
         "Les égalités de points sont départagées par le classement général, sans "
         "countback : sur quelques manches, il n'aurait guère de sens."
