@@ -14,6 +14,14 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- SÉLECTION DES PILOTES sortie de la barre latérale : elle passe en pastilles
+  (`st.pills`, sélection multiple limitée à deux) en haut de la vue
+  Comparaison, sous le bandeau de vues. La latérale ne sert plus qu'au choix
+  du week-end. Sur téléphone, il fallait l'ouvrir puis la refermer à chaque
+  changement de pilote. Des pastilles plutôt que des cases à cocher dans le
+  tableau : `st.data_editor` afficherait bien des cases, mais son rendu canvas
+  est flou sur Retina — la raison même de `show_table`. Les lignes des deux
+  pilotes restent surlignées dans le classement de la session.
 - GRAPHE « Position finale par course » retravaillé : lignes lissées (spline),
   ligne **DNF** dédiée sous la dernière position où tous les abandons d'une
   même course se rejoignent — la ligne d'un pilote reste donc continue au lieu
@@ -2396,31 +2404,40 @@ def page_style():
     créés que lorsqu'elle est active."""
     if not _ensure_session():
         return
-    # --- Sélection des pilotes ---
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Pilotes à comparer")
+    # --- Sélection des pilotes, en haut de page ---
+    # Sous le bandeau de vues plutôt que dans la barre latérale : la latérale
+    # sert au choix du week-end, et sur téléphone il fallait l'ouvrir puis la
+    # refermer à chaque changement de pilote. Des pastilles plutôt qu'un
+    # tableau à cocher : `st.data_editor` afficherait bien des cases, mais son
+    # rendu canvas est flou sur les écrans Retina (voir `show_table`).
+    if len(drivers_in_session) < 2:
+        st.info("Cette session ne contient pas deux pilotes à comparer.")
+        return
     default_d1 = "VER" if "VER" in drivers_in_session else drivers_in_session[0]
     default_d2 = "LEC" if "LEC" in drivers_in_session else drivers_in_session[1]
     if default_d2 == default_d1:
         default_d2 = next(x for x in drivers_in_session if x != default_d1)
-    d1 = st.sidebar.selectbox(
-        "Pilote 1",
-        options=drivers_in_session,
-        index=drivers_in_session.index(default_d1),
-        format_func=lambda x: driver_full.get(x, x),
-    )
-    d2 = st.sidebar.selectbox(
-        "Pilote 2",
-        options=drivers_in_session,
-        index=drivers_in_session.index(default_d2),
-        format_func=lambda x: driver_full.get(x, x),
-    )
+
+    choix = st.pills(
+        "Pilotes à comparer", options=drivers_in_session, selection_mode="multi",
+        default=[default_d1, default_d2], key="pilotes_compares",
+        format_func=lambda x: x if MOBILE else driver_full.get(x, x),
+        help="Deux pilotes exactement. Une pastille déjà sélectionnée se "
+             "désélectionne d'un second appui.",
+    ) or []
 
     # Le même pilote deux fois crée un index dupliqué (Signatures) et des
-    # colonnes de merge en double (pace tour par tour) → on bloque proprement.
-    if d1 == d2:
-        st.warning("⚠️ Sélectionne deux pilotes **différents** dans la barre latérale pour comparer.")
+    # colonnes de merge en double (pace tour par tour) : d'où deux pilotes
+    # DISTINCTS exigés, ce que la sélection multiple garantit déjà.
+    if len(choix) != 2:
+        st.info(
+            f"👆 Sélectionne **deux** pilotes à comparer "
+            f"({len(choix)} sélectionné{'s' if len(choix) > 1 else ''})."
+        )
         st.stop()
+    # Ordre stable : l'ordre d'affichage du plateau, pas l'ordre des appuis —
+    # sinon les couleurs et les colonnes s'inversent d'un clic à l'autre.
+    d1, d2 = sorted(choix, key=drivers_in_session.index)
 
     c1, c2 = driver_color(d1), driver_color(d2)
     # S'assure que les deux couleurs sont différentes
@@ -2562,7 +2579,7 @@ def page_style():
             )
             st.caption(
                 f"👉 Les lignes surlignées correspondent aux pilotes sélectionnés ({d1} et {d2}). "
-                f"Change-les dans la barre latérale pour voir une autre comparaison."
+                f"Change-les avec les pastilles en haut de page pour voir une autre comparaison."
             )
 
     # ============== BRIEFING CIRCUIT ==============
@@ -3764,7 +3781,7 @@ def page_style():
                   à dominante rapide (Suzuka, Silverstone) = circuit qui lui convient.
 
                 ⚠️ Ce benchmark mélange **voiture + pilote**. Pour isoler le pilote, l'astuce
-                classique : sélectionner les deux **coéquipiers** dans la barre latérale
+                classique : sélectionner les deux **coéquipiers** en haut de page
                 (même voiture) et regarder l'onglet *Virage par virage*.
                 """)
 
@@ -4270,8 +4287,9 @@ def page_timing():
 def page_analyse_session():
     """Toutes les analyses d'un week-end, en deux vues.
 
-    La sélection de session et de pilotes vit dans la barre latérale ; ces
-    deux vues partagent la même session chargée, d'où le regroupement."""
+    Le week-end se choisit dans la barre latérale, les pilotes en haut de la
+    vue Comparaison ; ces deux vues partagent la même session chargée, d'où
+    le regroupement."""
     if not _ensure_session():
         return
     vue = st.segmented_control(
