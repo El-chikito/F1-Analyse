@@ -14,6 +14,12 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- NOUVEAU « Classement sur les dernières manches » en bas de la page
+  Championnat : total des points pilotes sur les N dernières manches, N étant
+  saisi par l'utilisateur. Une manche = un week-end complet, sprint et course
+  cumulés. Colonnes « Au général » et « Δ » pour voir ce que la fenêtre change.
+  Les points par manche sont collectés dans la boucle qui calcule déjà les
+  cumuls (`pts_manche`) : aucune requête supplémentaire.
 - CARTE DES ÉCARTS dessinée sur le TRACÉ DE RÉFÉRENCE du circuit (MultiViewer,
   celui des vignettes de l'accueil) au lieu du contour reconstruit depuis les
   positions OpenF1. Ce dernier restait approximatif — quelques centaines de
@@ -1571,6 +1577,9 @@ def season_points_before(year, round_number, session_type):
     # récoltées dans CETTE boucle plutôt que dans une seconde passe, pour ne
     # pas doubler le trafic (cf. le rate-limiting déjà rencontré).
     positions, manches, equipes, noms = {}, {}, {}, {}
+    # Points par MANCHE (= week-end complet : sprint + course cumulés sous le
+    # même numéro), pour les classements glissants sur les N dernières manches.
+    pts_manche = {}
 
     def _cumuler(rnd, ses, ev_row):
         """Ajoute une session au cumul. Isolée pour pouvoir être REJOUÉE : un
@@ -1602,6 +1611,10 @@ def season_points_before(year, round_number, session_type):
 
         for code, p in pfr.items():
             pts[code] = pts.get(code, 0.0) + p
+            # Sprint et course d'un même week-end tombent sur le même `rnd` :
+            # ils s'additionnent donc naturellement.
+            manche = pts_manche.setdefault(rnd, {})
+            manche[code] = manche.get(code, 0.0) + p
         for team, p in d_team.items():
             team_pts[team] = team_pts.get(team, 0.0) + p
         equipes.update(d_equipes)
@@ -1653,7 +1666,7 @@ def season_points_before(year, round_number, session_type):
     # Dictionnaire plutôt qu'un n-uplet qui s'allonge à chaque besoin
     return {"pts": pts, "cb": cb, "team_pts": team_pts, "echecs": echecs,
             "positions": positions, "manches": manches, "equipes": equipes,
-            "noms": noms}
+            "noms": noms, "pts_manche": pts_manche}
 
 
 def safe_circuit_info(sess):
@@ -4510,6 +4523,78 @@ def page_championnat():
                 "quand un pilote n'est pas classé (abandon, non-partant). "
                 "**moy.** = position moyenne sur ses courses classées."
             )
+
+    # --- Classement glissant sur les N dernières manches ---
+    st.markdown("---")
+    st.markdown("#### 🔁 Classement sur les dernières manches")
+
+    pts_manche = hist.get("pts_manche", {})
+    manches_dispo = sorted(pts_manche)
+    if not manches_dispo:
+        st.info("Aucune manche comptabilisée pour le moment.")
+        return
+
+    n_max = len(manches_dispo)
+    n_manches = st.number_input(
+        "Nombre de dernières manches", min_value=1, max_value=n_max,
+        value=min(4, n_max), step=1, key="glissant_n",
+        help="Une manche = un week-end complet : quand il y a un sprint, ses "
+             "points s'ajoutent à ceux de la course.",
+    )
+    retenues = manches_dispo[-int(n_manches):]
+
+    # Cumul sur la fenêtre. Les pilotes sans le moindre point y figurent aussi
+    # (à 0) : les faire disparaître laisserait croire qu'ils n'ont pas couru.
+    cumul = {c: 0.0 for c in noms_all}
+    for rnd in retenues:
+        for code, p in pts_manche[rnd].items():
+            cumul[code] = cumul.get(code, 0.0) + p
+
+    # Rang au général, pour montrer ce que la fenêtre change
+    rang_general = {d: rk_a[d] for d in rk_a}
+    ordre = sorted(cumul, key=lambda c: (-cumul[c], rang_general.get(c, 99), c))
+
+    lignes = []
+    for i, code in enumerate(ordre, start=1):
+        gen = rang_general.get(code)
+        delta = (gen - i) if gen else None
+        lignes.append({
+            "Pos": i,
+            "Pilote": _full_name(code),
+            "_code": code,
+            "Points": f"{cumul[code]:g}",
+            "Au général": f"P{gen}" if gen else "–",
+            "Δ": ("–" if not delta else (f"+{delta}" if delta > 0 else f"−{abs(delta)}")),
+            "_delta": delta or 0,
+        })
+    dgl = pd.DataFrame(lignes)
+    disp_g = dgl[["Pos", "Pilote", "Points", "Au général", "Δ"]]
+    styles_g = pd.DataFrame("", index=disp_g.index, columns=disp_g.columns)
+    for i in disp_g.index:
+        colr = driver_color(dgl["_code"].iloc[i])
+        styles_g.loc[i, "Pilote"] = (f"background-color: {colr}; color: {text_on(colr)}; "
+                                     f"font-weight: bold; border-radius: 6px")
+        dlt = dgl["_delta"].iloc[i]
+        if dlt > 0:
+            styles_g.loc[i, "Δ"] = "color: #4ADE80; font-weight: bold"
+        elif dlt < 0:
+            styles_g.loc[i, "Δ"] = "color: #F87171; font-weight: bold"
+    show_table(disp_g.style.apply(lambda _: styles_g, axis=None),
+               height=min(40 * (len(disp_g) + 1) + 3, 780),
+               force_html=True, mono=True)
+
+    noms_manches = [f"{r}. {hist['manches'].get(r, f'manche {r}')}" for r in retenues]
+    st.caption(
+        f"Classement fictif si l'on ne comptait que les **{len(retenues)} dernière"
+        f"{'s' if len(retenues) > 1 else ''} manche"
+        f"{'s' if len(retenues) > 1 else ''}** : "
+        + " · ".join(noms_manches)
+        + ". **Au général** = place au championnat complet, **Δ** = places gagnées "
+        "(vert) ou perdues (rouge) sur cette fenêtre par rapport au général. "
+        "Sprint et course d'un même week-end comptent pour une seule manche. "
+        "Les égalités de points sont départagées par le classement général, sans "
+        "countback : sur quelques manches, il n'aurait guère de sens."
+    )
 
 
 # ============== NAVIGATION ==============
