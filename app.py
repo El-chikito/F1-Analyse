@@ -14,6 +14,20 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX BLOQUANT : une session refusait de se charger dès qu'un seul tour
+  n'avait pas de date de départ. `_add_positions` passait `LapStartDate` à
+  `merge_asof`, qui refuse une clé nulle (« Merge keys contain null values on
+  left side ») — et OpenF1 ne date pas toujours le départ d'un tour. Les tours
+  non datés sont désormais écartés du rapprochement, avec réaffectation par
+  rang d'origine (merge_asof trie par date, l'ordre des lignes ne suit plus
+  celui des tours). Ils restent sans position ; le reste du tableau vit.
+- DIAGNOSTIC honnête sur la source utilisée : en mode OpenF1, le panneau
+  sondait les serveurs F1 et concluait « IP filtrée, changez d'hébergeur »,
+  alors que ces serveurs ne sont PAS la source des données et que leur blocage
+  est justement ce qu'OpenF1 contourne. Un contresens qui envoyait chercher la
+  panne très loin de sa cause. `_openf1_diagnostic()` teste maintenant l'API
+  OpenF1 et vérifie que la séance demandée y est publiée — distinguant « pas
+  encore publiée » d'un bug de l'app.
 - SÉLECTION DES PILOTES ET DES TOURS sortie de la barre latérale : pastilles
   (`st.pills`, sélection multiple limitée à deux) puis les deux listes de
   tours, en haut de la vue Comparaison, sous le bandeau de vues. La latérale
@@ -602,6 +616,49 @@ def _capture_fastf1_logs():
         yield records
     finally:
         logger.removeHandler(handler)
+
+
+def _openf1_diagnostic(annee, gp, session_type):
+    """Diagnostic quand la source active est OpenF1 : l'API répond-elle, et la
+    séance demandée y figure-t-elle ?
+
+    Sonder les serveurs F1 dans ce mode n'apprend rien — ils sont bloqués, on
+    le sait, et c'est précisément pourquoi on utilise OpenF1. La vraie question
+    est de savoir si la séance existe côté OpenF1 (pas encore publiée ?) ou si
+    elle existe mais que l'app échoue à l'exploiter (bug)."""
+    import requests
+
+    lines = []
+    try:
+        r = requests.get(f"{DATA.BASE_URL}/meetings", params={"year": int(annee)},
+                         timeout=15)
+        ok = r.status_code == 200
+        lines.append(f"- {'✅' if ok else '⛔'} **API OpenF1** : HTTP {r.status_code}")
+        if not ok:
+            return lines
+    except Exception as exc:
+        return [f"- ❌ **API OpenF1** injoignable : {type(exc).__name__}"]
+
+    try:
+        ev = DATA.get_event_schedule(int(annee), include_testing=False)
+        ligne = ev[ev["EventName"] == gp]
+        if ligne.empty:
+            lines.append(f"- ⛔ **{gp}** absent du calendrier OpenF1 {annee}")
+            return lines
+        seances = [s for s in (ligne.iloc[0].get(f"Session{i}") for i in range(1, 6)) if s]
+        lines.append(f"- ✅ **{gp}** trouvé · séances publiées : "
+                     + (", ".join(str(s) for s in seances) or "aucune"))
+        attendue = DATA.CODE_TO_NAME.get(session_type, session_type)
+        presente = any(str(s).lower() == attendue.lower() for s in seances)
+        lines.append(
+            f"- {'✅' if presente else '⛔'} séance demandée (**{attendue}**) : "
+            + ("listée par OpenF1" if presente else
+               "PAS encore publiée — les données arrivent en général peu après "
+               "la fin de la séance")
+        )
+    except Exception as exc:
+        lines.append(f"- ⚠️ calendrier OpenF1 illisible : {type(exc).__name__} — {exc}")
+    return lines
 
 
 def _network_diagnostic():
@@ -2162,8 +2219,31 @@ def _prepare_session():
         with st.expander("🩺 Diagnostic — pourquoi ça échoue", expanded=True):
             details = getattr(e, "details", [])
             if details:
-                st.markdown("**Ce que FastF1 a signalé pendant le chargement :**")
+                st.markdown("**Message d'erreur exact :**")
                 st.code("\n".join(details[:15]))
+
+            # Le diagnostic réseau ci-dessous teste les serveurs de FastF1. En
+            # mode OpenF1 ils ne sont PAS la source des données : les sonder
+            # affichait « IP filtrée, changez d'hébergeur » alors que le
+            # blocage venait d'ailleurs — un contresens qui envoie chercher
+            # très loin d'où est le problème.
+            if USE_OPENF1:
+                st.markdown("**Source utilisée : OpenF1** (l'app n'interroge "
+                            "PAS les serveurs F1, dont le blocage est déjà connu "
+                            "et contourné).")
+                with st.spinner("Test d'OpenF1…"):
+                    for line in _openf1_diagnostic(st.session_state.year,
+                                                   st.session_state.gp_name,
+                                                   st.session_state.session_type):
+                        st.markdown(line)
+                st.caption(
+                    "Si OpenF1 répond et que la séance est listée, l'échec ne "
+                    "vient pas du réseau mais du traitement des données — c'est "
+                    "un bug de l'app, pas de l'hébergement. Copie le message "
+                    "d'erreur ci-dessus."
+                )
+                return False
+
             st.markdown("**Joignabilité des serveurs depuis l'hébergeur :**")
             with st.spinner("Test des serveurs…"):
                 for line in _network_diagnostic():

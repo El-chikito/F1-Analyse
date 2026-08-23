@@ -762,12 +762,27 @@ class Session:
             m = laps["DriverNumber"] == str(num)
             if not m.any():
                 continue
-            grp = grp.sort_values("date")
+            grp = grp.sort_values("date").dropna(subset=["date"])
+            if grp.empty:
+                continue
             ends = laps.loc[m, "LapStartDate"] + laps.loc[m, "LapTime"].fillna(pd.Timedelta(0))
-            merged = pd.merge_asof(
-                pd.DataFrame({"date": ends.values}).sort_values("date"),
-                grp[["date", "position"]], on="date", direction="backward")
-            laps.loc[m, "Position"] = merged["position"].values
+            # `merge_asof` REFUSE une clé nulle (« Merge keys contain null values
+            # on left side ») : or OpenF1 ne date pas toujours le départ d'un
+            # tour, et un seul `LapStartDate` manquant faisait échouer le
+            # chargement de la session ENTIÈRE. On écarte donc ces tours, quitte
+            # à les laisser sans position — le reste du tableau est utilisable.
+            rang = np.arange(len(ends))
+            gauche = (pd.DataFrame({"date": ends.to_numpy(), "_rang": rang})
+                      .dropna(subset=["date"]).sort_values("date"))
+            if gauche.empty:
+                continue
+            merged = pd.merge_asof(gauche, grp[["date", "position"]],
+                                   on="date", direction="backward")
+            # Réaffectation par rang d'origine : `merge_asof` a trié par date,
+            # l'ordre des lignes ne correspond plus à celui des tours.
+            valeurs = np.full(len(ends), np.nan)
+            valeurs[merged["_rang"].to_numpy()] = merged["position"].to_numpy(dtype="float64")
+            laps.loc[m, "Position"] = valeurs
 
     def _add_track_status(self, laps):
         """TrackStatus approximé depuis les messages de direction de course.

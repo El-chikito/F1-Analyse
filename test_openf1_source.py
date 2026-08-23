@@ -367,6 +367,56 @@ def test_seances_du_weekend():
     print("13) séances du week-end  : Session1..5 chronologiques, sprint sans FP2/FP3 ✓")
 
 
+def test_tour_sans_horodatage():
+    """Un tour sans date de départ ne doit pas faire échouer la session.
+
+    Régression constatée en production, le jour du GP : `_add_positions`
+    passait `LapStartDate` à `merge_asof`, qui refuse une clé nulle
+    (« Merge keys contain null values on left side »). OpenF1 ne date pas
+    toujours le départ d'un tour — et un seul tour non daté suffisait à rendre
+    la session entière inchargeable, l'app renvoyant alors vers un diagnostic
+    réseau qui n'avait rien à voir."""
+    t0 = pd.Timestamp("2026-08-22T14:00:00")
+    laps = pd.DataFrame({
+        "DriverNumber": ["1", "1", "1"],
+        "LapNumber": [1, 2, 3],
+        "LapStartDate": [pd.NaT,                                # non daté
+                         t0 + pd.Timedelta(seconds=90),
+                         t0 + pd.Timedelta(seconds=180)],
+        "LapTime": [pd.Timedelta(seconds=90)] * 3,
+    })
+    of1._get = lambda endpoint, **p: ([
+        {"driver_number": 1, "position": 1,
+         "date": (t0 + pd.Timedelta(seconds=100)).isoformat() + "+00:00"},
+        {"driver_number": 1, "position": 2,
+         "date": (t0 + pd.Timedelta(seconds=200)).isoformat() + "+00:00"},
+    ] if endpoint == "position" else [])
+
+    faux = type("S", (), {})()
+    faux.session_key = 1
+    of1.Session._add_positions(faux, laps)          # ne doit pas lever
+
+    # Les tours datés gardent la bonne position, malgré le tri interne par date
+    assert laps.loc[1, "Position"] == 1, laps["Position"].tolist()
+    assert laps.loc[2, "Position"] == 2, laps["Position"].tolist()
+    # Le tour non daté reste sans position, sans décaler les autres
+    assert pd.isna(laps.loc[0, "Position"])
+
+    # Aucun tour daté du tout : tableau sans position, session chargeable
+    vierge = laps.copy()
+    vierge["LapStartDate"] = pd.NaT
+    vierge["Position"] = np.nan
+    of1.Session._add_positions(faux, vierge)
+    assert vierge["Position"].isna().all()
+
+    # Flux de positions vide ou non daté : pas d'exception non plus
+    for recs in ([], [{"driver_number": 1, "date": None, "position": 1}]):
+        of1._get = lambda endpoint, _r=recs, **p: _r if endpoint == "position" else []
+        of1.Session._add_positions(faux, laps.copy())
+
+    print("16) tour sans horodatage : session chargeable, positions non décalées ✓")
+
+
 def test_positions_interpolees():
     """Positions X/Y : interpolation temporelle, pas d'appariement au plus proche.
 
@@ -495,3 +545,4 @@ if __name__ == "__main__":
     test_seances_du_weekend()
     test_positions_interpolees()
     test_tracé_lisse()
+    test_tour_sans_horodatage()
