@@ -14,6 +14,14 @@ par use_container_width=True.
 
 Changements vs version précédente
 ---------------------------------
+- FIX sprint absent du sélecteur (constaté sur Zandvoort 2026) :
+  `load_schedule` ne conservait que cinq colonnes du calendrier et coupait
+  `Session1..Session5` ET `EventFormat`, qui portent le programme du week-end.
+  `sessions_of_event` retombait donc sur le programme d'un week-end classique
+  — sprint et shootout disparus, essais 2 et 3 proposés alors qu'ils n'ont pas
+  lieu. Les colonnes de programme sont conservées (celles qu'une source ne
+  fournit pas sont simplement ignorées). L'accueil passe par `load_schedule`
+  au lieu de retélécharger le calendrier hors cache.
 - FIX BLOQUANT : une session refusait de se charger dès qu'un seul tour
   n'avait pas de date de départ. `_add_positions` passait `LapStartDate` à
   `merge_asof`, qui refuse une clé nulle (« Merge keys contain null values on
@@ -1603,11 +1611,27 @@ def style_sig(tel, name):
 
 
 # ============== CACHED LOADERS ==============
+# Colonnes conservées du calendrier. `Session1..Session5` et `EventFormat`
+# portent le PROGRAMME du week-end : les couper faisait retomber
+# `sessions_of_event` sur le programme d'un week-end classique, qui n'a ni
+# sprint ni shootout — le sprint de Zandvoort 2026 avait ainsi disparu du
+# sélecteur, remplacé par des essais 2 et 3 qui n'existent pas ce week-end-là.
+COLONNES_CALENDRIER = (
+    "RoundNumber", "EventName", "Country", "Location", "EventDate",
+    "EventFormat", "Session1", "Session2", "Session3", "Session4", "Session5",
+    "CircuitKey", "DateStart", "DateEnd",
+)
+
+
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def load_schedule(year):
-    """Charge le calendrier d'une année (FastF1 ou OpenF1 selon la source)."""
+    """Charge le calendrier d'une année (FastF1 ou OpenF1 selon la source).
+
+    Les colonnes absentes de la source sont ignorées : FastF1 et l'adaptateur
+    OpenF1 n'exposent pas exactement les mêmes (CircuitKey, DateStart/End sont
+    propres à OpenF1)."""
     sched = DATA.get_event_schedule(year, include_testing=False)
-    return sched[["RoundNumber", "EventName", "Country", "Location", "EventDate"]]
+    return sched[[c for c in COLONNES_CALENDRIER if c in sched.columns]]
 
 
 @st.cache_resource(show_spinner=False, ttl=24 * 3600, max_entries=3)
@@ -2401,7 +2425,9 @@ isolée.*
 
     try:
         with st.spinner("Chargement du calendrier…"):
-            sched = DATA.get_event_schedule(annee, include_testing=False)
+            # `load_schedule` plutôt que la source directe : même contenu, mais
+            # en cache, alors que l'accueil est la page la plus visitée.
+            sched = load_schedule(annee)
     except Exception as exc:
         st.error(f"Calendrier indisponible : {exc}")
         return
